@@ -1,6 +1,10 @@
 # github-helpers
 
-GitHub maintenance toolkit — a single CLI for common GitHub bulk operations.
+[![Release](https://img.shields.io/github/v/release/maxgfr/github-helpers)](https://github.com/maxgfr/github-helpers/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Homebrew](https://img.shields.io/badge/homebrew-maxgfr%2Ftap-orange)](https://github.com/maxgfr/homebrew-tap)
+
+GitHub maintenance toolkit — a single CLI for common GitHub bulk operations. Pure bash, zero dependencies beyond `gh` and `jq`.
 
 ## Install
 
@@ -21,6 +25,21 @@ chmod +x /usr/local/bin/github-helpers
 - [jq](https://jqlang.github.io/jq/) — JSON processor
 
 ## Commands
+
+| Command | Description |
+|---|---|
+| [`unstar`](#unstar--clean-up-your-github-stars) | Filter & bulk-unstar repos |
+| [`cleanup-forks`](#cleanup-forks--remove-unmodified-forks) | Delete forks with 0 commits ahead |
+| [`cleanup-branches`](#cleanup-branches--delete-merged-or-stale-branches) | Delete merged/stale remote branches |
+| [`archive-repos`](#archive-repos--archive-inactive-repos) | Batch archive inactive repos |
+| [`repo-audit`](#repo-audit--scan-repos-for-common-issues) | Check for missing LICENSE, README, etc. |
+| [`stats`](#stats--github-profile-stats) | Dashboard: repos, stars, languages |
+| [`workflow-status`](#workflow-status--ci-workflow-overview) | Latest CI status across repos |
+| [`clone-org`](#clone-org--clone-all-repos-from-a-github-org-or-user) | Clone/pull all repos from an org or user |
+| [`bulk-topic`](#bulk-topic--add-or-remove-topics-in-batch) | Add/remove topics in batch |
+| [`sync-labels`](#sync-labels--sync-issue-labels-from-a-template-repo) | Sync issue labels across repos |
+
+---
 
 ### Cleanup & maintenance
 
@@ -101,6 +120,8 @@ github-helpers archive-repos --org my-company --inactive-months 12 -y
 | `--language LANG` | Filter by language |
 | `--topic TOPIC` | Filter by topic |
 
+---
+
 ### Audit & visibility
 
 #### `repo-audit` — Scan repos for common issues
@@ -144,6 +165,8 @@ github-helpers workflow-status --limit 50
 | `--user NAME` / `--org NAME` | Target (default: authenticated user) |
 | `--limit N` | Max repos to scan (default: 30) |
 | `--failed` | Show only repos with failed workflows |
+
+---
 
 ### Bulk operations
 
@@ -198,15 +221,34 @@ github-helpers sync-labels --from maxgfr/template --org my-company -y
 | `--to OWNER/REPO` | Single target repo |
 | `--org NAME` / `--user NAME` | Apply to all repos |
 
+---
+
 ### Common flags
+
+All commands support these flags:
 
 | Flag | Description |
 |---|---|
-| `--no-color` | Disable colored output |
+| `--no-color` | Disable colored output (also respects `NO_COLOR` env var) |
 | `--dry-run` | Preview changes without applying |
 | `-y, --yes` | Skip confirmation prompt |
 | `-v, --verbose` | Detailed output |
 | `-h, --help` | Show help |
+
+## Contributing
+
+```bash
+git clone https://github.com/maxgfr/github-helpers.git
+cd github-helpers
+chmod +x script.sh
+./script.sh --help
+```
+
+This project uses [semantic-release](https://semantic-release.gitbook.io/) — commit messages drive versioning:
+
+- `feat: ...` → minor bump (1.x.0)
+- `fix: ...` → patch bump (1.0.x)
+- `feat!: ...` or `BREAKING CHANGE:` → major bump (x.0.0)
 
 ## License
 
