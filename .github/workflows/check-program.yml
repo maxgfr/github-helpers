@@ -122,3 +122,8 @@ jobs:
           if ./script.sh unstar --dry-run 2>/dev/null; then
             echo "Should have failed" && exit 1
           fi
+
+      - name: Run unit tests
+        run: |
+          chmod +x test.sh
+          ./test.sh

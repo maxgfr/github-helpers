@@ -5,7 +5,12 @@
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_PATH="$(dirname "$(readlink -f "$0")")/github-helpers"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+if [ -f "$SCRIPT_DIR/script.sh" ]; then
+  SCRIPT_PATH="$SCRIPT_DIR/script.sh"
+else
+  SCRIPT_PATH="$SCRIPT_DIR/github-helpers"
+fi
 PASS=0 FAIL=0 TOTAL=0
 
 RED=$'\033[0;31m' GREEN=$'\033[0;32m' YELLOW=$'\033[1;33m'
