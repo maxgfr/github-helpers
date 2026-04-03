@@ -11,9 +11,8 @@ brew install maxgfr/tap/github-helpers
 Or manually:
 
 ```bash
-git clone https://github.com/maxgfr/github-helpers.git
-chmod +x github-helpers/script.sh
-cp github-helpers/script.sh /usr/local/bin/github-helpers
+curl -fsSL https://raw.githubusercontent.com/maxgfr/github-helpers/main/script.sh -o /usr/local/bin/github-helpers
+chmod +x /usr/local/bin/github-helpers
 ```
 
 ### Requirements
@@ -23,7 +22,9 @@ cp github-helpers/script.sh /usr/local/bin/github-helpers
 
 ## Commands
 
-### `unstar` — Clean up your GitHub stars
+### Cleanup & maintenance
+
+#### `unstar` — Clean up your GitHub stars
 
 Filter and bulk-unstar repos by last commit date, last push date, or archived status.
 
@@ -39,80 +40,170 @@ github-helpers unstar --from unstar-repos.txt
 github-helpers unstar --archived -y
 ```
 
-**Filters** (combine as many as needed):
-
 | Flag | Description |
 |---|---|
 | `--commit-before DATE` | Last commit was before this date (YYYY-MM-DD) |
-| `--commit-after DATE` | Last commit was after this date (YYYY-MM-DD) |
-| `--activity-before DATE` | Last push was before this date (YYYY-MM-DD) |
-| `--activity-after DATE` | Last push was after this date (YYYY-MM-DD) |
-| `--archived` | Only archived repos |
-| `--not-archived` | Only non-archived repos |
-
-**Logic**:
-
-| Flag | Description |
-|---|---|
+| `--commit-after DATE` | Last commit was after this date |
+| `--activity-before DATE` | Last push was before this date |
+| `--activity-after DATE` | Last push was after this date |
+| `--archived` / `--not-archived` | Filter by archive status |
 | `--any` | Match if ANY filter hits (OR, **default**) |
 | `--all` | Match if ALL filters hit (AND) |
-
-**I/O**:
-
-| Flag | Description |
-|---|---|
 | `--dry-run` | Preview only, saves list to file |
 | `--out FILE` | Output file (default: `unstar-repos.txt`) |
 | `--from FILE` | Unstar from a previous dry-run file |
 
-### `clone-org` — Clone all repos from a GitHub org or user
+#### `cleanup-forks` — Remove unmodified forks
+
+Delete forks with 0 commits ahead of the parent repo.
 
 ```bash
-# List all repos in an org (dry-run)
-github-helpers clone-org --org my-company --dry-run
-
-# Clone all non-archived repos via SSH
-github-helpers clone-org --org my-company --ssh --not-archived
-
-# Clone from a user account, only Go source repos
-github-helpers clone-org --user octocat --source --language Go
-
-# Clone into a specific directory, pull existing repos
-github-helpers clone-org --org my-company --dir ~/projects --pull
-
-# Clone only public repos, no confirmation
-github-helpers clone-org --org my-company --visibility public -y
+github-helpers cleanup-forks --dry-run
+github-helpers cleanup-forks -y
 ```
 
-**Target** (one required):
+#### `cleanup-branches` — Delete merged or stale branches
+
+Clean up remote branches across one or many repos.
+
+```bash
+# Merged branches on a single repo
+github-helpers cleanup-branches --repo maxgfr/my-repo --dry-run
+
+# Stale branches (no commit in 90 days) across an org
+github-helpers cleanup-branches --org my-company --stale-days 90 --dry-run
+
+# Exclude release branches
+github-helpers cleanup-branches --user maxgfr --exclude "release|hotfix" --dry-run
+```
 
 | Flag | Description |
 |---|---|
-| `--org NAME` | GitHub organization name |
-| `--user NAME` | GitHub username |
+| `--repo OWNER/REPO` | Single repository |
+| `--org NAME` / `--user NAME` | All repos in org or user |
+| `--merged` | Delete only merged branches (default) |
+| `--stale-days N` | Delete branches with no commits in N days |
+| `--exclude PATTERN` | Exclude branches matching regex |
 
-**Options**:
+#### `archive-repos` — Archive inactive repos
+
+Batch archive repos with no push activity in N months.
+
+```bash
+github-helpers archive-repos --inactive-months 24 --dry-run
+github-helpers archive-repos --org my-company --inactive-months 12 -y
+```
 
 | Flag | Description |
 |---|---|
+| `--user NAME` / `--org NAME` | Target (default: authenticated user) |
+| `--inactive-months N` | Inactivity threshold (default: 12) |
+| `--language LANG` | Filter by language |
+| `--topic TOPIC` | Filter by topic |
+
+### Audit & visibility
+
+#### `repo-audit` — Scan repos for common issues
+
+Check repos for missing LICENSE, README, description, or topics.
+
+```bash
+github-helpers repo-audit
+github-helpers repo-audit --org my-company
+github-helpers repo-audit --language Shell -v
+```
+
+| Flag | Description |
+|---|---|
+| `--user NAME` / `--org NAME` | Target (default: authenticated user) |
+| `--language LANG` | Filter by language |
+| `--topic TOPIC` | Filter by topic |
+| `--limit N` | Max repos to scan |
+
+#### `stats` — GitHub profile stats
+
+Quick dashboard: repo count, total stars/forks, top languages, most starred, least active.
+
+```bash
+github-helpers stats
+github-helpers stats --org my-company
+```
+
+#### `workflow-status` — CI workflow overview
+
+See the latest CI run status for all your repos at a glance.
+
+```bash
+github-helpers workflow-status
+github-helpers workflow-status --org my-company --failed
+github-helpers workflow-status --limit 50
+```
+
+| Flag | Description |
+|---|---|
+| `--user NAME` / `--org NAME` | Target (default: authenticated user) |
+| `--limit N` | Max repos to scan (default: 30) |
+| `--failed` | Show only repos with failed workflows |
+
+### Bulk operations
+
+#### `clone-org` — Clone all repos from a GitHub org or user
+
+```bash
+github-helpers clone-org --org my-company --ssh --not-archived
+github-helpers clone-org --user octocat --source --language Go
+github-helpers clone-org --org my-company --dir ~/projects --pull
+```
+
+| Flag | Description |
+|---|---|
+| `--org NAME` / `--user NAME` | Target (one required) |
 | `--dir PATH` | Clone destination (default: `.`) |
 | `--ssh` | Clone via SSH instead of HTTPS |
 | `--pull` | Pull existing repos instead of skipping |
-| `--archived` | Only archived repos |
-| `--not-archived` | Only non-archived repos |
-| `--fork` | Only forked repos |
-| `--source` | Only non-fork (source) repos |
+| `--archived` / `--not-archived` | Filter by archive status |
+| `--fork` / `--source` | Filter by fork status |
 | `--visibility TYPE` | `public`, `private`, or `internal` |
 | `--language LANG` | Filter by primary language |
 | `--topic TOPIC` | Filter by topic |
 | `--limit N` | Max repos to clone |
-| `--dry-run` | List repos without cloning |
+
+#### `bulk-topic` — Add or remove topics in batch
+
+```bash
+github-helpers bulk-topic --add shell --language Shell --dry-run
+github-helpers bulk-topic --remove deprecated --topic deprecated -y
+github-helpers bulk-topic --add cli --pattern "^maxgfr/(git-|package-)" --dry-run
+```
+
+| Flag | Description |
+|---|---|
+| `--add TOPIC` | Add topic to matching repos |
+| `--remove TOPIC` | Remove topic from matching repos |
+| `--user NAME` / `--org NAME` | Target (default: authenticated user) |
+| `--language LANG` | Filter by language |
+| `--topic TOPIC` | Filter by existing topic |
+| `--pattern PATTERN` | Filter by name (grep regex) |
+
+#### `sync-labels` — Sync issue labels from a template repo
+
+```bash
+github-helpers sync-labels --from maxgfr/template --to maxgfr/my-repo --dry-run
+github-helpers sync-labels --from maxgfr/template --org my-company -y
+```
+
+| Flag | Description |
+|---|---|
+| `--from OWNER/REPO` | Source repo with template labels |
+| `--to OWNER/REPO` | Single target repo |
+| `--org NAME` / `--user NAME` | Apply to all repos |
 
 ### Common flags
 
 | Flag | Description |
 |---|---|
 | `--no-color` | Disable colored output |
+| `--dry-run` | Preview changes without applying |
 | `-y, --yes` | Skip confirmation prompt |
 | `-v, --verbose` | Detailed output |
 | `-h, --help` | Show help |

@@ -3,7 +3,9 @@ set -euo pipefail
 
 # =============================================================================
 # github-helpers — GitHub maintenance toolkit
-# Subcommands: unstar, clone-org
+# Subcommands: unstar, clone-org, cleanup-forks, cleanup-branches,
+#              archive-repos, repo-audit, stats, bulk-topic,
+#              workflow-status, sync-labels
 # =============================================================================
 
 VERSION="1.1.0"
@@ -70,8 +72,21 @@ ${BOLD}USAGE${NC}
   github-helpers <command> [options]
 
 ${BOLD}COMMANDS${NC}
-  unstar        Clean up your GitHub stars (filter & bulk-unstar)
-  clone-org     Clone all repos from a GitHub org or user
+  ${BOLD}Cleanup & maintenance${NC}
+  unstar              Clean up your GitHub stars (filter & bulk-unstar)
+  cleanup-forks       Remove forks you never modified (0 commits ahead)
+  cleanup-branches    Delete merged or stale remote branches
+  archive-repos       Archive inactive repos in batch
+
+  ${BOLD}Audit & visibility${NC}
+  repo-audit          Scan repos for missing LICENSE, README, description, topics
+  stats               Quick GitHub profile stats dashboard
+  workflow-status     Overview of latest CI workflow runs
+
+  ${BOLD}Bulk operations${NC}
+  clone-org           Clone all repos from a GitHub org or user
+  bulk-topic          Add or remove topics across multiple repos
+  sync-labels         Sync issue labels from a template repo
 
 ${BOLD}FLAGS${NC}
   --no-color    Disable colored output
@@ -80,6 +95,10 @@ ${BOLD}FLAGS${NC}
 
 ${BOLD}EXAMPLES${NC}
   github-helpers unstar --archived --dry-run
+  github-helpers cleanup-forks --dry-run
+  github-helpers stats --org my-company
+  github-helpers repo-audit --language Shell
+  github-helpers bulk-topic --add cli --language Shell --dry-run
   github-helpers clone-org --org my-company --ssh --pull
 
 Run ${BOLD}github-helpers <command> --help${NC} for command-specific help.
@@ -817,6 +836,1008 @@ cmd_clone_org_main() {
 }
 
 # =============================================================================
+# COMMAND: cleanup-forks
+# =============================================================================
+
+cmd_cleanup_forks_usage() {
+  cat <<EOF
+${BOLD}github-helpers cleanup-forks${NC} ${DIM}v${VERSION}${NC} — Remove forks you never modified
+
+${BOLD}USAGE${NC}
+  github-helpers cleanup-forks [options]
+
+${BOLD}OPTIONS${NC}
+  --dry-run               List forks without deleting
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output (commits ahead/behind)
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers cleanup-forks --dry-run
+  github-helpers cleanup-forks -y
+EOF
+  exit 0
+}
+
+cmd_cleanup_forks_main() {
+  local dry_run=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run)    dry_run=true; shift ;;
+      -y|--yes)     AUTO_YES=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)    cmd_cleanup_forks_usage ;;
+      *) die "cleanup-forks: unknown option: $1" ;;
+    esac
+  done
+
+  preflight_check
+  local USERNAME
+  USERNAME=$(get_username)
+
+  echo -e "${BOLD}${CYAN}Cleanup Forks${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  User: ${BOLD}${USERNAME}${NC}"
+  if $dry_run; then
+    echo -e "  Mode: ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  echo -e "${DIM}Fetching forked repos...${NC}"
+  local forks_json
+  forks_json=$(gh repo list "$USERNAME" --fork --json nameWithOwner,parent --limit 9999 2>/dev/null) || {
+    die "Failed to list forks"
+  }
+
+  local total
+  total=$(echo "$forks_json" | jq 'length')
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No forks found.${NC}"
+    exit 0
+  fi
+
+  echo -e "Found ${BOLD}${total}${NC} forks. Checking for unmodified ones..."
+  echo ""
+
+  local -a deletable=()
+  local idx=0
+
+  while IFS=$'\t' read -r nwo parent; do
+    idx=$((idx + 1))
+    local prefix="${DIM}[${idx}/${total}]${NC}"
+
+    # Check if fork is ahead of parent
+    local comparison
+    comparison=$(gh api "repos/${nwo}/compare/HEAD...HEAD" --jq '.ahead_by' 2>/dev/null || echo "")
+
+    # Use the parent's default branch for comparison
+    local ahead=0
+    comparison=$(gh api "repos/${nwo}" --jq '.parent.full_name as $p | .default_branch as $b | "\($p):\($b)"' 2>/dev/null || echo "")
+    if [ -n "$comparison" ]; then
+      local parent_ref="${comparison}"
+      ahead=$(gh api "repos/${nwo}/compare/${parent_ref}...${USERNAME}:HEAD" --jq '.ahead_by' 2>/dev/null || echo "-1")
+    fi
+
+    if [ "$ahead" = "0" ]; then
+      deletable+=("$nwo")
+      echo -e "  ${prefix} ${YELLOW}UNMODIFIED${NC}  ${nwo} ${DIM}(0 commits ahead)${NC}"
+    else
+      if $VERBOSE; then
+        echo -e "  ${prefix} ${GREEN}MODIFIED${NC}    ${nwo} ${DIM}(${ahead} commits ahead)${NC}"
+      fi
+    fi
+  done < <(echo "$forks_json" | jq -r '.[] | [.nameWithOwner, (.parent.nameWithOwner // "")] | @tsv')
+
+  echo ""
+
+  if [ ${#deletable[@]} -eq 0 ]; then
+    echo -e "${GREEN}All forks have modifications. Nothing to clean up!${NC}"
+    exit 0
+  fi
+
+  echo -e "${YELLOW}Found ${#deletable[@]} unmodified forks${NC}"
+
+  if $dry_run; then
+    echo ""
+    echo -e "${YELLOW}DRY RUN — no forks were deleted.${NC}"
+    echo -e "Unmodified forks:"
+    for repo in "${deletable[@]}"; do
+      echo -e "  ${DIM}•${NC} $repo"
+    done
+    exit 0
+  fi
+
+  echo ""
+  if ! $AUTO_YES; then
+    read -rp "Delete ${#deletable[@]} unmodified forks? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+  fi
+
+  local deleted=0 fail=0
+  for repo in "${deletable[@]}"; do
+    if gh repo delete "$repo" --yes 2>/dev/null; then
+      deleted=$((deleted + 1))
+      echo -e "  ${GREEN}DELETED${NC}  $repo"
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC}   $repo"
+    fi
+  done
+
+  echo ""
+  echo -e "${GREEN}Done!${NC} Deleted: ${BOLD}${deleted}${NC}, Failed: ${BOLD}${fail}${NC}"
+}
+
+# =============================================================================
+# COMMAND: archive-repos
+# =============================================================================
+
+cmd_archive_repos_usage() {
+  cat <<EOF
+${BOLD}github-helpers archive-repos${NC} ${DIM}v${VERSION}${NC} — Archive inactive repos in batch
+
+${BOLD}USAGE${NC}
+  github-helpers archive-repos [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --inactive-months N     Repos with no push in N months (default: 12)
+  --language LANG         Filter by primary language
+  --topic TOPIC           Filter by topic
+  --dry-run               List repos without archiving
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers archive-repos --inactive-months 24 --dry-run
+  github-helpers archive-repos --org my-company --inactive-months 12 -y
+EOF
+  exit 0
+}
+
+cmd_archive_repos_main() {
+  local target="" target_type="" inactive_months=12 language="" topic="" dry_run=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)             target="$2"; target_type="user"; shift 2 ;;
+      --org)              target="$2"; target_type="org"; shift 2 ;;
+      --inactive-months)  inactive_months="$2"; shift 2 ;;
+      --language)         language="$2"; shift 2 ;;
+      --topic)            topic="$2"; shift 2 ;;
+      --dry-run)          dry_run=true; shift ;;
+      -y|--yes)           AUTO_YES=true; shift ;;
+      -v|--verbose)       VERBOSE=true; shift ;;
+      -h|--help)          cmd_archive_repos_usage ;;
+      *) die "archive-repos: unknown option: $1" ;;
+    esac
+  done
+
+  preflight_check
+
+  if [ -z "$target" ]; then
+    target=$(get_username)
+    target_type="user"
+  fi
+
+  local cutoff_date
+  cutoff_date=$(date -v-"${inactive_months}"m +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+    date -d "${inactive_months} months ago" --iso-8601=seconds 2>/dev/null || \
+    die "Cannot compute date. Provide --inactive-months as a number.")
+
+  echo -e "${BOLD}${CYAN}Archive Repos${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Target:   ${BOLD}${target}${NC}"
+  echo -e "  Inactive: ${BOLD}>${inactive_months} months${NC} (before ${cutoff_date%%T*})"
+  if $dry_run; then
+    echo -e "  Mode:     ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  echo -e "${DIM}Fetching repos...${NC}"
+  local -a flags=("--json" "nameWithOwner,pushedAt,isArchived" "--no-archived" "--source" "--limit" "9999")
+  [ -n "$language" ] && flags+=("--language" "$language")
+  [ -n "$topic" ]    && flags+=("--topic" "$topic")
+
+  local repos_json
+  repos_json=$(gh repo list "$target" "${flags[@]}" 2>/dev/null) || die "Failed to list repos"
+
+  # Filter by inactivity
+  local inactive_json
+  inactive_json=$(echo "$repos_json" | jq --arg cutoff "$cutoff_date" '[.[] | select(.pushedAt < $cutoff)]')
+
+  local total
+  total=$(echo "$inactive_json" | jq 'length')
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No inactive repos found. Everything is active!${NC}"
+    exit 0
+  fi
+
+  echo -e "${YELLOW}Found ${total} inactive repos${NC}"
+  echo ""
+
+  echo -e "${BOLD}Repos to archive:${NC}"
+  echo "$inactive_json" | jq -r '.[] | [.nameWithOwner, .pushedAt] | @tsv' | \
+    while IFS=$'\t' read -r nwo pushed; do
+      echo -e "  ${DIM}•${NC} ${nwo} ${DIM}(last push: ${pushed%%T*})${NC}"
+    done
+  echo ""
+
+  if $dry_run; then
+    echo -e "${YELLOW}DRY RUN — no repos were archived.${NC}"
+    exit 0
+  fi
+
+  if ! $AUTO_YES; then
+    read -rp "Archive ${total} repos? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+  fi
+
+  local archived=0 fail=0
+  echo "$inactive_json" | jq -r '.[].nameWithOwner' | while IFS= read -r nwo; do
+    if gh repo archive "$nwo" --yes 2>/dev/null; then
+      archived=$((archived + 1))
+      echo -e "  ${GREEN}ARCHIVED${NC}  $nwo"
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC}    $nwo"
+    fi
+  done
+
+  echo ""
+  echo -e "${GREEN}Done!${NC}"
+}
+
+# =============================================================================
+# COMMAND: repo-audit
+# =============================================================================
+
+cmd_repo_audit_usage() {
+  cat <<EOF
+${BOLD}github-helpers repo-audit${NC} ${DIM}v${VERSION}${NC} — Scan repos for common issues
+
+${BOLD}USAGE${NC}
+  github-helpers repo-audit [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --language LANG         Filter by primary language
+  --topic TOPIC           Filter by topic
+  --limit N               Max repos to scan (default: all)
+  -v, --verbose           Show passing checks too
+  -h, --help              Show this help
+
+${BOLD}CHECKS${NC}
+  - Missing description
+  - Missing LICENSE file
+  - Missing README file
+  - No default branch protection
+  - No topics assigned
+
+${BOLD}EXAMPLES${NC}
+  github-helpers repo-audit
+  github-helpers repo-audit --org my-company
+  github-helpers repo-audit --language Shell -v
+EOF
+  exit 0
+}
+
+cmd_repo_audit_main() {
+  local target="" target_type="" language="" topic="" limit=9999
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)      target="$2"; target_type="user"; shift 2 ;;
+      --org)       target="$2"; target_type="org"; shift 2 ;;
+      --language)  language="$2"; shift 2 ;;
+      --topic)     topic="$2"; shift 2 ;;
+      --limit)     limit="$2"; shift 2 ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)   cmd_repo_audit_usage ;;
+      *) die "repo-audit: unknown option: $1" ;;
+    esac
+  done
+
+  preflight_check
+
+  if [ -z "$target" ]; then
+    target=$(get_username)
+    target_type="user"
+  fi
+
+  echo -e "${BOLD}${CYAN}Repo Audit${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Target: ${BOLD}${target}${NC}"
+  echo ""
+
+  echo -e "${DIM}Fetching repos...${NC}"
+  local -a flags=("--json" "nameWithOwner,description,licenseInfo,hasWikiEnabled,repositoryTopics,defaultBranchRef" "--source" "--no-archived" "--limit" "$limit")
+  [ -n "$language" ] && flags+=("--language" "$language")
+  [ -n "$topic" ]    && flags+=("--topic" "$topic")
+
+  local repos_json
+  repos_json=$(gh repo list "$target" "${flags[@]}" 2>/dev/null) || die "Failed to list repos"
+
+  local total
+  total=$(echo "$repos_json" | jq 'length')
+
+  echo -e "Scanning ${BOLD}${total}${NC} repos..."
+  echo ""
+
+  local issues_total=0 repos_with_issues=0
+
+  echo "$repos_json" | jq -c '.[]' | while IFS= read -r repo; do
+    local nwo desc license topics
+    nwo=$(echo "$repo" | jq -r '.nameWithOwner')
+    desc=$(echo "$repo" | jq -r '.description // ""')
+    license=$(echo "$repo" | jq -r '.licenseInfo.spdxId // ""')
+    topics=$(echo "$repo" | jq -r '.repositoryTopics | length')
+
+    local -a warnings=()
+
+    [ -z "$desc" ] && warnings+=("no description")
+    [ -z "$license" ] || [ "$license" = "NOASSERTION" ] && warnings+=("no license")
+    [ "$topics" -eq 0 ] && warnings+=("no topics")
+
+    # Check README via API
+    local has_readme
+    has_readme=$(gh api "repos/${nwo}/readme" --jq '.name' 2>/dev/null || echo "")
+    [ -z "$has_readme" ] && warnings+=("no README")
+
+    if [ ${#warnings[@]} -gt 0 ]; then
+      repos_with_issues=$((repos_with_issues + 1))
+      issues_total=$((issues_total + ${#warnings[@]}))
+      local warning_str
+      warning_str=$(IFS=', '; echo "${warnings[*]}")
+      echo -e "  ${YELLOW}!${NC} ${BOLD}${nwo}${NC} — ${warning_str}"
+    elif $VERBOSE; then
+      echo -e "  ${GREEN}✓${NC} ${nwo}"
+    fi
+  done
+
+  echo ""
+  echo -e "${BOLD}Audit complete.${NC}"
+}
+
+# =============================================================================
+# COMMAND: stats
+# =============================================================================
+
+cmd_stats_usage() {
+  cat <<EOF
+${BOLD}github-helpers stats${NC} ${DIM}v${VERSION}${NC} — Quick GitHub profile stats
+
+${BOLD}USAGE${NC}
+  github-helpers stats [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers stats
+  github-helpers stats --org my-company
+EOF
+  exit 0
+}
+
+cmd_stats_main() {
+  local target="" target_type=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user) target="$2"; target_type="user"; shift 2 ;;
+      --org)  target="$2"; target_type="org"; shift 2 ;;
+      -h|--help) cmd_stats_usage ;;
+      *) die "stats: unknown option: $1" ;;
+    esac
+  done
+
+  preflight_check
+
+  if [ -z "$target" ]; then
+    target=$(get_username)
+    target_type="user"
+  fi
+
+  echo -e "${BOLD}${CYAN}GitHub Stats${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Target: ${BOLD}${target}${NC}"
+  echo ""
+
+  echo -e "${DIM}Fetching repos...${NC}"
+  local repos_json
+  repos_json=$(gh repo list "$target" --json nameWithOwner,stargazerCount,forkCount,primaryLanguage,isArchived,isFork,pushedAt --limit 9999 --source 2>/dev/null) || die "Failed to list repos"
+
+  local total stars forks archived languages most_starred least_active
+  total=$(echo "$repos_json" | jq 'length')
+  stars=$(echo "$repos_json" | jq '[.[].stargazerCount] | add // 0')
+  forks=$(echo "$repos_json" | jq '[.[].forkCount] | add // 0')
+  archived=$(echo "$repos_json" | jq '[.[] | select(.isArchived)] | length')
+
+  echo ""
+  echo -e "  ${BOLD}Repos:${NC}     $total (${archived} archived)"
+  echo -e "  ${BOLD}Stars:${NC}     $stars"
+  echo -e "  ${BOLD}Forks:${NC}     $forks"
+  echo ""
+
+  echo -e "  ${BOLD}Top languages:${NC}"
+  echo "$repos_json" | jq -r '[.[] | .primaryLanguage.name // "None"] | group_by(.) | map({lang: .[0], count: length}) | sort_by(-.count) | .[:8][] | "    \(.count)\t\(.lang)"' | \
+    while IFS=$'\t' read -r count lang; do
+      printf "    ${CYAN}%-4s${NC} %s\n" "$count" "$lang"
+    done
+  echo ""
+
+  echo -e "  ${BOLD}Most starred:${NC}"
+  echo "$repos_json" | jq -r 'sort_by(-.stargazerCount) | .[:5][] | "    \(.stargazerCount)\t\(.nameWithOwner)"' | \
+    while IFS=$'\t' read -r count nwo; do
+      printf "    ${YELLOW}★ %-4s${NC} %s\n" "$count" "$nwo"
+    done
+  echo ""
+
+  echo -e "  ${BOLD}Least active (source, non-archived):${NC}"
+  echo "$repos_json" | jq -r '[.[] | select(.isArchived | not)] | sort_by(.pushedAt) | .[:5][] | "    \(.pushedAt[:10])\t\(.nameWithOwner)"' | \
+    while IFS=$'\t' read -r date nwo; do
+      echo -e "    ${DIM}${date}${NC}  ${nwo}"
+    done
+  echo ""
+}
+
+# =============================================================================
+# COMMAND: bulk-topic
+# =============================================================================
+
+cmd_bulk_topic_usage() {
+  cat <<EOF
+${BOLD}github-helpers bulk-topic${NC} ${DIM}v${VERSION}${NC} — Add or remove topics in batch
+
+${BOLD}USAGE${NC}
+  github-helpers bulk-topic --add TOPIC [options]
+  github-helpers bulk-topic --remove TOPIC [options]
+
+${BOLD}ACTION${NC} (one required)
+  --add TOPIC             Add topic to matching repos
+  --remove TOPIC          Remove topic from matching repos
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --language LANG         Filter repos by language
+  --topic TOPIC           Filter repos by existing topic
+  --pattern PATTERN       Filter repos by name pattern (grep regex)
+  --dry-run               Preview changes without applying
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers bulk-topic --add shell --language Shell --dry-run
+  github-helpers bulk-topic --remove deprecated --topic deprecated -y
+  github-helpers bulk-topic --add cli --pattern "^maxgfr/(git-|package-)" --dry-run
+EOF
+  exit 0
+}
+
+cmd_bulk_topic_main() {
+  local action="" topic_value="" target="" target_type="" language="" filter_topic="" pattern="" dry_run=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --add)       action="add"; topic_value="$2"; shift 2 ;;
+      --remove)    action="remove"; topic_value="$2"; shift 2 ;;
+      --user)      target="$2"; target_type="user"; shift 2 ;;
+      --org)       target="$2"; target_type="org"; shift 2 ;;
+      --language)  language="$2"; shift 2 ;;
+      --topic)     filter_topic="$2"; shift 2 ;;
+      --pattern)   pattern="$2"; shift 2 ;;
+      --dry-run)   dry_run=true; shift ;;
+      -y|--yes)    AUTO_YES=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)   cmd_bulk_topic_usage ;;
+      *) die "bulk-topic: unknown option: $1" ;;
+    esac
+  done
+
+  [ -z "$action" ] && die "bulk-topic: --add or --remove is required"
+  [ -z "$topic_value" ] && die "bulk-topic: topic value is required"
+
+  preflight_check
+
+  if [ -z "$target" ]; then
+    target=$(get_username)
+    target_type="user"
+  fi
+
+  echo -e "${BOLD}${CYAN}Bulk Topic${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Action: ${BOLD}${action} '${topic_value}'${NC}"
+  echo -e "  Target: ${BOLD}${target}${NC}"
+  if $dry_run; then
+    echo -e "  Mode:   ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  local -a flags=("--json" "nameWithOwner,repositoryTopics" "--limit" "9999" "--source" "--no-archived")
+  [ -n "$language" ]     && flags+=("--language" "$language")
+  [ -n "$filter_topic" ] && flags+=("--topic" "$filter_topic")
+
+  local repos_json
+  repos_json=$(gh repo list "$target" "${flags[@]}" 2>/dev/null) || die "Failed to list repos"
+
+  # Apply pattern filter
+  if [ -n "$pattern" ]; then
+    repos_json=$(echo "$repos_json" | jq --arg p "$pattern" '[.[] | select(.nameWithOwner | test($p))]')
+  fi
+
+  local total
+  total=$(echo "$repos_json" | jq 'length')
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No repos matched your filters.${NC}"
+    exit 0
+  fi
+
+  echo -e "Found ${BOLD}${total}${NC} repos"
+  echo ""
+
+  # Filter: for --add, skip repos that already have the topic; for --remove, skip repos without it
+  local filtered_repos
+  if [ "$action" = "add" ]; then
+    filtered_repos=$(echo "$repos_json" | jq --arg t "$topic_value" '[.[] | select([.repositoryTopics[].name] | index($t) | not)]')
+  else
+    filtered_repos=$(echo "$repos_json" | jq --arg t "$topic_value" '[.[] | select([.repositoryTopics[].name] | index($t))]')
+  fi
+
+  local count
+  count=$(echo "$filtered_repos" | jq 'length')
+
+  if [ "$count" -eq 0 ]; then
+    echo -e "${GREEN}No repos need changes.${NC}"
+    exit 0
+  fi
+
+  echo -e "${YELLOW}${count} repos to update:${NC}"
+  echo "$filtered_repos" | jq -r '.[].nameWithOwner' | while IFS= read -r nwo; do
+    echo -e "  ${DIM}•${NC} $nwo"
+  done
+  echo ""
+
+  if $dry_run; then
+    echo -e "${YELLOW}DRY RUN — no changes made.${NC}"
+    exit 0
+  fi
+
+  if ! $AUTO_YES; then
+    read -rp "${action^} topic '${topic_value}' on ${count} repos? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+  fi
+
+  local success=0 fail=0
+  echo "$filtered_repos" | jq -r '.[].nameWithOwner' | while IFS= read -r nwo; do
+    if gh repo edit "$nwo" --"${action}-topic" "$topic_value" 2>/dev/null; then
+      success=$((success + 1))
+      echo -e "  ${GREEN}OK${NC}     $nwo"
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC} $nwo"
+    fi
+  done
+
+  echo ""
+  echo -e "${GREEN}Done!${NC}"
+}
+
+# =============================================================================
+# COMMAND: cleanup-branches
+# =============================================================================
+
+cmd_cleanup_branches_usage() {
+  cat <<EOF
+${BOLD}github-helpers cleanup-branches${NC} ${DIM}v${VERSION}${NC} — Delete merged/stale remote branches
+
+${BOLD}USAGE${NC}
+  github-helpers cleanup-branches --repo OWNER/REPO [options]
+  github-helpers cleanup-branches --org NAME [options]
+  github-helpers cleanup-branches --user NAME [options]
+
+${BOLD}TARGET${NC} (one required)
+  --repo OWNER/REPO       Single repository
+  --org NAME              All repos in organization
+  --user NAME             All repos for user
+
+${BOLD}OPTIONS${NC}
+  --merged                Delete only merged branches (default)
+  --stale-days N          Delete branches with no commits in N days
+  --exclude PATTERN       Exclude branches matching pattern (grep regex)
+  --dry-run               List branches without deleting
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers cleanup-branches --repo maxgfr/my-repo --dry-run
+  github-helpers cleanup-branches --org my-company --merged --exclude "release|hotfix" --dry-run
+  github-helpers cleanup-branches --user maxgfr --stale-days 90 -y
+EOF
+  exit 0
+}
+
+cmd_cleanup_branches_for_repo() {
+  local nwo="$1" mode="$2" stale_days="$3" exclude="$4" dry_run="$5"
+
+  # Get default branch
+  local default_branch
+  default_branch=$(gh api "repos/${nwo}" --jq '.default_branch' 2>/dev/null) || return 1
+
+  # List remote branches
+  local branches_json
+  branches_json=$(gh api "repos/${nwo}/branches" --paginate --jq '.[] | select(.name != "'"$default_branch"'") | .name' 2>/dev/null) || return 1
+
+  local -a to_delete=()
+
+  while IFS= read -r branch; do
+    [ -z "$branch" ] && continue
+
+    # Exclude pattern
+    if [ -n "$exclude" ] && echo "$branch" | grep -qE "$exclude"; then
+      $VERBOSE && echo -e "    ${DIM}SKIP${NC} $branch ${DIM}(excluded)${NC}"
+      continue
+    fi
+
+    local should_delete=false
+
+    if [ "$mode" = "merged" ]; then
+      # Check if branch is merged into default
+      local comparison
+      comparison=$(gh api "repos/${nwo}/compare/${default_branch}...${branch}" --jq '.ahead_by' 2>/dev/null || echo "-1")
+      if [ "$comparison" = "0" ]; then
+        should_delete=true
+      fi
+    fi
+
+    if [ "$mode" = "stale" ] && [ -n "$stale_days" ]; then
+      local last_commit_date
+      last_commit_date=$(gh api "repos/${nwo}/branches/${branch}" --jq '.commit.commit.committer.date' 2>/dev/null || echo "")
+      if [ -n "$last_commit_date" ]; then
+        local cutoff_ts last_ts
+        cutoff_ts=$(date -v-"${stale_days}"d +%s 2>/dev/null || date -d "${stale_days} days ago" +%s 2>/dev/null)
+        last_ts=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$last_commit_date" +%s 2>/dev/null || date -d "$last_commit_date" +%s 2>/dev/null)
+        if [ -n "$cutoff_ts" ] && [ -n "$last_ts" ] && [ "$last_ts" -lt "$cutoff_ts" ]; then
+          should_delete=true
+        fi
+      fi
+    fi
+
+    if $should_delete; then
+      to_delete+=("$branch")
+      echo -e "    ${YELLOW}DELETE${NC} $branch"
+    elif $VERBOSE; then
+      echo -e "    ${DIM}KEEP${NC}   $branch"
+    fi
+  done <<< "$branches_json"
+
+  if [ ${#to_delete[@]} -eq 0 ]; then
+    $VERBOSE && echo -e "    ${GREEN}No branches to delete${NC}"
+    return 0
+  fi
+
+  if $dry_run; then
+    return 0
+  fi
+
+  for branch in "${to_delete[@]}"; do
+    if gh api --method DELETE "repos/${nwo}/git/refs/heads/${branch}" 2>/dev/null; then
+      $VERBOSE && echo -e "    ${GREEN}DELETED${NC} $branch"
+    else
+      echo -e "    ${RED}FAILED${NC}  $branch"
+    fi
+  done
+}
+
+cmd_cleanup_branches_main() {
+  local target="" target_type="" mode="merged" stale_days="" exclude="" dry_run=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)        target="$2"; target_type="repo"; shift 2 ;;
+      --org)         target="$2"; target_type="org"; shift 2 ;;
+      --user)        target="$2"; target_type="user"; shift 2 ;;
+      --merged)      mode="merged"; shift ;;
+      --stale-days)  mode="stale"; stale_days="$2"; shift 2 ;;
+      --exclude)     exclude="$2"; shift 2 ;;
+      --dry-run)     dry_run=true; shift ;;
+      -y|--yes)      AUTO_YES=true; shift ;;
+      -v|--verbose)  VERBOSE=true; shift ;;
+      -h|--help)     cmd_cleanup_branches_usage ;;
+      *) die "cleanup-branches: unknown option: $1" ;;
+    esac
+  done
+
+  [ -z "$target" ] && die "cleanup-branches: --repo, --org or --user is required"
+
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}Cleanup Branches${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Target: ${BOLD}${target}${NC}"
+  echo -e "  Mode:   ${BOLD}${mode}${NC}"
+  if $dry_run; then
+    echo -e "  Run:    ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  if [ "$target_type" = "repo" ]; then
+    echo -e "  ${BOLD}${target}${NC}"
+    cmd_cleanup_branches_for_repo "$target" "$mode" "$stale_days" "$exclude" "$dry_run"
+  else
+    local repos_json
+    repos_json=$(gh repo list "$target" --json nameWithOwner --source --no-archived --limit 9999 2>/dev/null) || die "Failed to list repos"
+
+    local total
+    total=$(echo "$repos_json" | jq 'length')
+    echo -e "Scanning ${BOLD}${total}${NC} repos..."
+    echo ""
+
+    echo "$repos_json" | jq -r '.[].nameWithOwner' | while IFS= read -r nwo; do
+      echo -e "  ${BOLD}${nwo}${NC}"
+      cmd_cleanup_branches_for_repo "$nwo" "$mode" "$stale_days" "$exclude" "$dry_run"
+    done
+  fi
+
+  echo ""
+  if $dry_run; then
+    echo -e "${YELLOW}DRY RUN — no branches were deleted.${NC}"
+  else
+    echo -e "${GREEN}Done!${NC}"
+  fi
+}
+
+# =============================================================================
+# COMMAND: workflow-status
+# =============================================================================
+
+cmd_workflow_status_usage() {
+  cat <<EOF
+${BOLD}github-helpers workflow-status${NC} ${DIM}v${VERSION}${NC} — Overview of CI workflow runs
+
+${BOLD}USAGE${NC}
+  github-helpers workflow-status [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --limit N               Max repos to scan (default: 30)
+  --failed                Show only repos with failed workflows
+  -v, --verbose           Show all workflows, not just latest
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers workflow-status
+  github-helpers workflow-status --org my-company --failed
+  github-helpers workflow-status --limit 50 -v
+EOF
+  exit 0
+}
+
+cmd_workflow_status_main() {
+  local target="" target_type="" limit=30 failed_only=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)      target="$2"; target_type="user"; shift 2 ;;
+      --org)       target="$2"; target_type="org"; shift 2 ;;
+      --limit)     limit="$2"; shift 2 ;;
+      --failed)    failed_only=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)   cmd_workflow_status_usage ;;
+      *) die "workflow-status: unknown option: $1" ;;
+    esac
+  done
+
+  preflight_check
+
+  if [ -z "$target" ]; then
+    target=$(get_username)
+    target_type="user"
+  fi
+
+  echo -e "${BOLD}${CYAN}Workflow Status${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Target: ${BOLD}${target}${NC}"
+  echo ""
+
+  local repos_json
+  repos_json=$(gh repo list "$target" --json nameWithOwner --source --no-archived --limit "$limit" 2>/dev/null) || die "Failed to list repos"
+
+  local total
+  total=$(echo "$repos_json" | jq 'length')
+  echo -e "${DIM}Checking ${total} repos...${NC}"
+  echo ""
+
+  printf "  ${BOLD}%-40s %-12s %-12s %s${NC}\n" "Repository" "Status" "Branch" "Workflow"
+  printf "  %-40s %-12s %-12s %s\n" "────────────────────────────────────────" "────────────" "────────────" "────────────────"
+
+  echo "$repos_json" | jq -r '.[].nameWithOwner' | while IFS= read -r nwo; do
+    # Get latest workflow run
+    local run_json
+    run_json=$(gh api "repos/${nwo}/actions/runs?per_page=1" --jq '.workflow_runs[0] // empty' 2>/dev/null || echo "")
+
+    if [ -z "$run_json" ]; then
+      if ! $failed_only; then
+        printf "  %-40s ${DIM}%-12s${NC}\n" "$nwo" "no workflows"
+      fi
+      continue
+    fi
+
+    local status conclusion branch workflow_name
+    status=$(echo "$run_json" | jq -r '.status')
+    conclusion=$(echo "$run_json" | jq -r '.conclusion // "pending"')
+    branch=$(echo "$run_json" | jq -r '.head_branch')
+    workflow_name=$(echo "$run_json" | jq -r '.name')
+
+    local status_display=""
+    case "$conclusion" in
+      success)    status_display="${GREEN}✓ success${NC}" ;;
+      failure)    status_display="${RED}✗ failure${NC}" ;;
+      cancelled)  status_display="${YELLOW}○ cancelled${NC}" ;;
+      pending)    status_display="${CYAN}◌ pending${NC}" ;;
+      *)          status_display="${DIM}? ${conclusion}${NC}" ;;
+    esac
+
+    if $failed_only && [ "$conclusion" != "failure" ]; then
+      continue
+    fi
+
+    printf "  %-40s $(echo -e "$status_display")%-3s %-12s %s\n" "$nwo" "" "$branch" "$workflow_name"
+  done
+
+  echo ""
+}
+
+# =============================================================================
+# COMMAND: sync-labels
+# =============================================================================
+
+cmd_sync_labels_usage() {
+  cat <<EOF
+${BOLD}github-helpers sync-labels${NC} ${DIM}v${VERSION}${NC} — Sync labels from a template repo
+
+${BOLD}USAGE${NC}
+  github-helpers sync-labels --from OWNER/REPO --to OWNER/REPO [options]
+  github-helpers sync-labels --from OWNER/REPO --org NAME [options]
+
+${BOLD}OPTIONS${NC}
+  --from OWNER/REPO       Source repo with template labels
+  --to OWNER/REPO         Single target repo
+  --org NAME              Apply to all repos in org
+  --user NAME             Apply to all repos for user
+  --dry-run               Preview changes without applying
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers sync-labels --from maxgfr/template --to maxgfr/my-repo --dry-run
+  github-helpers sync-labels --from maxgfr/template --org my-company -y
+EOF
+  exit 0
+}
+
+cmd_sync_labels_main() {
+  local from_repo="" to_repo="" to_target="" to_type="" dry_run=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)      from_repo="$2"; shift 2 ;;
+      --to)        to_repo="$2"; to_type="repo"; shift 2 ;;
+      --org)       to_target="$2"; to_type="org"; shift 2 ;;
+      --user)      to_target="$2"; to_type="user"; shift 2 ;;
+      --dry-run)   dry_run=true; shift ;;
+      -y|--yes)    AUTO_YES=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)   cmd_sync_labels_usage ;;
+      *) die "sync-labels: unknown option: $1" ;;
+    esac
+  done
+
+  [ -z "$from_repo" ] && die "sync-labels: --from is required"
+  [ -z "$to_repo" ] && [ -z "$to_target" ] && die "sync-labels: --to, --org, or --user is required"
+
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}Sync Labels${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  From: ${BOLD}${from_repo}${NC}"
+  if $dry_run; then
+    echo -e "  Mode: ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  # Fetch source labels
+  echo -e "${DIM}Fetching labels from ${from_repo}...${NC}"
+  local source_labels
+  source_labels=$(gh api "repos/${from_repo}/labels" --paginate --jq '.[] | {name, color, description}' 2>/dev/null) || die "Failed to fetch labels from ${from_repo}"
+
+  local label_count
+  label_count=$(echo "$source_labels" | jq -s 'length')
+  echo -e "Found ${BOLD}${label_count}${NC} labels"
+  echo ""
+
+  # Build target list
+  local -a targets=()
+  if [ "$to_type" = "repo" ]; then
+    targets=("$to_repo")
+  else
+    local repos_json
+    repos_json=$(gh repo list "$to_target" --json nameWithOwner --source --no-archived --limit 9999 2>/dev/null) || die "Failed to list repos"
+    while IFS= read -r nwo; do
+      [ "$nwo" = "$from_repo" ] && continue
+      targets+=("$nwo")
+    done < <(echo "$repos_json" | jq -r '.[].nameWithOwner')
+  fi
+
+  echo -e "Target repos: ${BOLD}${#targets[@]}${NC}"
+
+  if $dry_run; then
+    echo ""
+    echo -e "${BOLD}Labels to sync:${NC}"
+    echo "$source_labels" | jq -rs '.[] | "  • \(.name) (#\(.color))"'
+    echo ""
+    echo -e "${YELLOW}DRY RUN — no labels were synced.${NC}"
+    exit 0
+  fi
+
+  if ! $AUTO_YES; then
+    read -rp "Sync ${label_count} labels to ${#targets[@]} repos? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+  fi
+
+  echo ""
+  for target_nwo in "${targets[@]}"; do
+    echo -e "  ${BOLD}${target_nwo}${NC}"
+
+    echo "$source_labels" | jq -c '.' | while IFS= read -r label; do
+      local name color desc
+      name=$(echo "$label" | jq -r '.name')
+      color=$(echo "$label" | jq -r '.color')
+      desc=$(echo "$label" | jq -r '.description // ""')
+
+      # Try to update existing, create if not found
+      if gh api --method PATCH "repos/${target_nwo}/labels/${name}" \
+        -f color="$color" -f description="$desc" &>/dev/null; then
+        $VERBOSE && echo -e "    ${CYAN}UPDATED${NC} $name"
+      elif gh api --method POST "repos/${target_nwo}/labels" \
+        -f name="$name" -f color="$color" -f description="$desc" &>/dev/null; then
+        $VERBOSE && echo -e "    ${GREEN}CREATED${NC} $name"
+      else
+        echo -e "    ${RED}FAILED${NC}  $name"
+      fi
+    done
+  done
+
+  echo ""
+  echo -e "${GREEN}Done!${NC}"
+}
+
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -842,6 +1863,14 @@ main() {
   case "$command" in
     unstar)                cmd_unstar_main "$@" ;;
     clone-org)             cmd_clone_org_main "$@" ;;
+    cleanup-forks)         cmd_cleanup_forks_main "$@" ;;
+    cleanup-branches)      cmd_cleanup_branches_main "$@" ;;
+    archive-repos)         cmd_archive_repos_main "$@" ;;
+    repo-audit|audit)      cmd_repo_audit_main "$@" ;;
+    stats)                 cmd_stats_main "$@" ;;
+    bulk-topic)            cmd_bulk_topic_main "$@" ;;
+    workflow-status|ci)    cmd_workflow_status_main "$@" ;;
+    sync-labels)           cmd_sync_labels_main "$@" ;;
     version|-V|--version)  echo "github-helpers v${VERSION}" ;;
     help|-h|--help)        usage ;;
     *)

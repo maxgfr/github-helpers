@@ -30,6 +30,30 @@ jobs:
       - name: Test clone-org help
         run: ./script.sh clone-org --help
 
+      - name: Test cleanup-forks help
+        run: ./script.sh cleanup-forks --help
+
+      - name: Test cleanup-branches help
+        run: ./script.sh cleanup-branches --help
+
+      - name: Test archive-repos help
+        run: ./script.sh archive-repos --help
+
+      - name: Test repo-audit help
+        run: ./script.sh repo-audit --help
+
+      - name: Test stats help
+        run: ./script.sh stats --help
+
+      - name: Test bulk-topic help
+        run: ./script.sh bulk-topic --help
+
+      - name: Test workflow-status help
+        run: ./script.sh workflow-status --help
+
+      - name: Test sync-labels help
+        run: ./script.sh sync-labels --help
+
       - name: Test unknown command fails
         run: |
           if ./script.sh nonexistent 2>/dev/null; then
