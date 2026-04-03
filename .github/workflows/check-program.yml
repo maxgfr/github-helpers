@@ -1,0 +1,49 @@
+name: Check Program
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+jobs:
+  test-script:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify dependencies available
+        run: |
+          gh --version
+          jq --version
+
+      - name: Test top-level help
+        run: |
+          chmod +x script.sh
+          ./script.sh --help
+
+      - name: Test version
+        run: ./script.sh --version
+
+      - name: Test unstar help
+        run: ./script.sh unstar --help
+
+      - name: Test clone-org help
+        run: ./script.sh clone-org --help
+
+      - name: Test unknown command fails
+        run: |
+          if ./script.sh nonexistent 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test clone-org requires --org
+        run: |
+          if ./script.sh clone-org --dry-run 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test unstar requires filter
+        run: |
+          if ./script.sh unstar --dry-run 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
