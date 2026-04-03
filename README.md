@@ -545,22 +545,6 @@ All commands support these flags:
 | `-y, --yes` | Skip confirmation prompt |
 | `-v, --verbose` | Detailed output |
 | `-h, --help` | Show help |
-
-## Contributing
-
-```bash
-git clone https://github.com/maxgfr/github-helpers.git
-cd github-helpers
-chmod +x script.sh
-./script.sh --help
-```
-
-This project uses [semantic-release](https://semantic-release.gitbook.io/) — commit messages drive versioning:
-
-- `feat: ...` → minor bump (1.x.0)
-- `fix: ...` → patch bump (1.0.x)
-- `feat!: ...` or `BREAKING CHANGE:` → major bump (x.0.0)
-
 ## License
 
 MIT
