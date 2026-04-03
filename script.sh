@@ -38,6 +38,7 @@ disable_colors() {
 # ── Shared state ─────────────────────────────────────────────────────────────
 AUTO_YES=false
 VERBOSE=false
+DRY_RUN=false
 
 # =============================================================================
 # SHARED UTILITIES
@@ -46,6 +47,10 @@ VERBOSE=false
 die() {
   echo -e "${RED}Error: $1${NC}" >&2
   exit 1
+}
+
+need_arg() {
+  [ -n "${2:-}" ] || die "$1 requires a value"
 }
 
 preflight_check() {
@@ -141,7 +146,7 @@ FILTER_ARCHIVED=""
 FILTER_MODE="any"
 FROM_FILE=""
 OUT_FILE="unstar-repos.txt"
-DRY_RUN=false
+SAVE_LIST=false
 
 cmd_unstar_usage() {
   cat <<EOF
@@ -165,7 +170,9 @@ ${BOLD}LOGIC${NC}
 
 ${BOLD}I/O${NC}
   --dry-run               Preview only — saves list to file, no unstar
-  --out FILE              Output file for dry-run list (default: unstar-repos.txt)
+  --out FILE              Save matched repos to FILE (default: unstar-repos.txt)
+                          Implies --save-list when used without --dry-run
+  --save-list             Save the matched repos list (even without --dry-run)
   --from FILE             Skip fetch — unstar repos from a previous dry-run file
 
 ${BOLD}FLAGS${NC}
@@ -201,16 +208,17 @@ cmd_unstar_parse_args() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --commit-before)   FILTER_COMMIT_BEFORE="${2}T00:00:00Z"; shift 2 ;;
-      --commit-after)    FILTER_COMMIT_AFTER="${2}T00:00:00Z";  shift 2 ;;
-      --activity-before) FILTER_ACTIVITY_BEFORE="${2}T00:00:00Z"; shift 2 ;;
-      --activity-after)  FILTER_ACTIVITY_AFTER="${2}T00:00:00Z"; shift 2 ;;
+      --commit-before)   need_arg "--commit-before" "${2:-}"; FILTER_COMMIT_BEFORE="${2}T00:00:00Z"; shift 2 ;;
+      --commit-after)    need_arg "--commit-after" "${2:-}"; FILTER_COMMIT_AFTER="${2}T00:00:00Z";  shift 2 ;;
+      --activity-before) need_arg "--activity-before" "${2:-}"; FILTER_ACTIVITY_BEFORE="${2}T00:00:00Z"; shift 2 ;;
+      --activity-after)  need_arg "--activity-after" "${2:-}"; FILTER_ACTIVITY_AFTER="${2}T00:00:00Z"; shift 2 ;;
       --archived)        FILTER_ARCHIVED="true";  shift ;;
       --not-archived)    FILTER_ARCHIVED="false"; shift ;;
       --any)             FILTER_MODE="any"; shift ;;
       --all)             FILTER_MODE="all"; shift ;;
-      --from)            FROM_FILE="$2"; shift 2 ;;
-      --out)             OUT_FILE="$2"; shift 2 ;;
+      --from)            need_arg "--from" "${2:-}"; FROM_FILE="$2"; shift 2 ;;
+      --out)             need_arg "--out" "${2:-}"; OUT_FILE="$2"; SAVE_LIST=true; shift 2 ;;
+      --save-list)       SAVE_LIST=true; shift ;;
       --dry-run)         DRY_RUN=true;  shift ;;
       -y|--yes)          AUTO_YES=true; shift ;;
       -v|--verbose)      VERBOSE=true;  shift ;;
@@ -262,6 +270,7 @@ cmd_unstar_matches_filters() {
       REASONS+=("archived")
     elif [ "$FILTER_ARCHIVED" = "false" ] && [ "$archived" != "true" ]; then
       passed=$((passed + 1))
+      REASONS+=("not archived")
     fi
   fi
 
@@ -479,18 +488,15 @@ cmd_unstar_main() {
   echo ""
 
   # ── Fetch all starred repos ──────────────────────────────────────────────
-  local DATAFILE
   DATAFILE=$(mktemp)
-  trap 'rm -f "$DATAFILE"' EXIT
+  trap 'rm -f "${DATAFILE:-}" "${MATCHFILE:-}"' EXIT
 
   echo -e "${DIM}Fetching starred repos...${NC}"
   cmd_unstar_fetch_starred_repos "$USERNAME" > "$DATAFILE"
   echo ""
 
   # ── Apply filters ────────────────────────────────────────────────────────
-  local MATCHFILE
   MATCHFILE=$(mktemp)
-  trap 'rm -f "$DATAFILE" "$MATCHFILE"' EXIT
 
   local total_fetched=0 matched=0 skipped=0
 
@@ -529,14 +535,20 @@ cmd_unstar_main() {
   echo -e "${YELLOW}Found ${total} repos matching your filters${NC} (scanned ${total_fetched}, skipped ${skipped})"
   echo ""
 
-  # Save sorted list to output file
-  sort -u "$MATCHFILE" | grep '.' > "$OUT_FILE"
+  # Save sorted list — write to OUT_FILE if dry-run or --save-list/--out
+  if $DRY_RUN || $SAVE_LIST; then
+    RESULTFILE="$OUT_FILE"
+  else
+    RESULTFILE=$(mktemp)
+    trap 'rm -f "${DATAFILE:-}" "${MATCHFILE:-}" "${RESULTFILE:-}"' EXIT
+  fi
+  sort -u "$MATCHFILE" | grep '.' > "$RESULTFILE"
 
   if ! $VERBOSE; then
     echo -e "${BOLD}Repos to unstar:${NC}"
     while IFS= read -r repo; do
       echo -e "  ${DIM}•${NC} $repo"
-    done < "$OUT_FILE"
+    done < "$RESULTFILE"
     echo ""
   fi
 
@@ -555,7 +567,6 @@ cmd_unstar_main() {
     read -rp "Unstar all $total repos? [y/N] " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
       echo "Cancelled."
-      echo -e "List saved to: ${BOLD}${OUT_FILE}${NC}"
       exit 0
     fi
   fi
@@ -573,10 +584,13 @@ cmd_unstar_main() {
     if [ $((progress % 25)) -eq 0 ] && [ "$progress" -gt 0 ]; then
       echo -e "  ${DIM}[${progress}/${total}]...${NC}"
     fi
-  done < "$OUT_FILE"
+  done < "$RESULTFILE"
 
   echo ""
   echo -e "${GREEN}Done!${NC} Unstarred: ${BOLD}${count}${NC}, Failed: ${BOLD}${failed}${NC}"
+  if $SAVE_LIST; then
+    echo -e "List saved to: ${BOLD}${OUT_FILE}${NC}"
+  fi
 }
 
 # =============================================================================
@@ -652,19 +666,19 @@ cmd_clone_org_parse_args() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --org)           CLONE_ORG_TARGET="$2"; CLONE_ORG_TARGET_TYPE="org"; shift 2 ;;
-      --user)          CLONE_ORG_TARGET="$2"; CLONE_ORG_TARGET_TYPE="user"; shift 2 ;;
-      --dir)           CLONE_ORG_DIR="$2"; shift 2 ;;
+      --org)           need_arg "--org" "${2:-}"; CLONE_ORG_TARGET="$2"; CLONE_ORG_TARGET_TYPE="org"; shift 2 ;;
+      --user)          need_arg "--user" "${2:-}"; CLONE_ORG_TARGET="$2"; CLONE_ORG_TARGET_TYPE="user"; shift 2 ;;
+      --dir)           need_arg "--dir" "${2:-}"; CLONE_ORG_DIR="$2"; shift 2 ;;
       --ssh)           CLONE_ORG_SSH=true; shift ;;
       --pull)          CLONE_ORG_PULL=true; shift ;;
       --archived)      CLONE_ORG_ARCHIVED="true"; shift ;;
       --not-archived)  CLONE_ORG_ARCHIVED="false"; shift ;;
       --fork)          CLONE_ORG_FORK="true"; shift ;;
       --source)        CLONE_ORG_FORK="false"; shift ;;
-      --visibility)    CLONE_ORG_VISIBILITY="$2"; shift 2 ;;
-      --language)      CLONE_ORG_LANGUAGE="$2"; shift 2 ;;
-      --topic)         CLONE_ORG_TOPIC="$2"; shift 2 ;;
-      --limit)         CLONE_ORG_LIMIT="$2"; shift 2 ;;
+      --visibility)    need_arg "--visibility" "${2:-}"; CLONE_ORG_VISIBILITY="$2"; shift 2 ;;
+      --language)      need_arg "--language" "${2:-}"; CLONE_ORG_LANGUAGE="$2"; shift 2 ;;
+      --topic)         need_arg "--topic" "${2:-}"; CLONE_ORG_TOPIC="$2"; shift 2 ;;
+      --limit)         need_arg "--limit" "${2:-}"; CLONE_ORG_LIMIT="$2"; shift 2 ;;
       --dry-run)       CLONE_ORG_DRY_RUN=true; shift ;;
       -y|--yes)        AUTO_YES=true; shift ;;
       -v|--verbose)    VERBOSE=true; shift ;;
@@ -802,9 +816,8 @@ cmd_clone_org_main() {
   mkdir -p "$CLONE_ORG_DIR"
 
   # ── Clone loop ──────────────────────────────────────────────────────────
-  local repo_list
   repo_list=$(mktemp)
-  trap 'rm -f "$repo_list"' EXIT
+  trap 'rm -f "${repo_list:-}"' EXIT
 
   echo "$repos_json" | jq -r '.[] | [.nameWithOwner, .sshUrl, .name] | @tsv' > "$repo_list"
 
@@ -1029,11 +1042,11 @@ cmd_archive_repos_main() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --user)             target="$2"; target_type="user"; shift 2 ;;
-      --org)              target="$2"; target_type="org"; shift 2 ;;
-      --inactive-months)  inactive_months="$2"; shift 2 ;;
-      --language)         language="$2"; shift 2 ;;
-      --topic)            topic="$2"; shift 2 ;;
+      --user)             need_arg "--user" "${2:-}"; target="$2"; target_type="user"; shift 2 ;;
+      --org)              need_arg "--org" "${2:-}"; target="$2"; target_type="org"; shift 2 ;;
+      --inactive-months)  need_arg "--inactive-months" "${2:-}"; inactive_months="$2"; shift 2 ;;
+      --language)         need_arg "--language" "${2:-}"; language="$2"; shift 2 ;;
+      --topic)            need_arg "--topic" "${2:-}"; topic="$2"; shift 2 ;;
       --dry-run)          dry_run=true; shift ;;
       -y|--yes)           AUTO_YES=true; shift ;;
       -v|--verbose)       VERBOSE=true; shift ;;
@@ -1107,7 +1120,7 @@ cmd_archive_repos_main() {
   fi
 
   local archived=0 fail=0
-  echo "$inactive_json" | jq -r '.[].nameWithOwner' | while IFS= read -r nwo; do
+  while IFS= read -r nwo; do
     if gh repo archive "$nwo" --yes 2>/dev/null; then
       archived=$((archived + 1))
       echo -e "  ${GREEN}ARCHIVED${NC}  $nwo"
@@ -1115,10 +1128,10 @@ cmd_archive_repos_main() {
       fail=$((fail + 1))
       echo -e "  ${RED}FAILED${NC}    $nwo"
     fi
-  done
+  done < <(echo "$inactive_json" | jq -r '.[].nameWithOwner')
 
   echo ""
-  echo -e "${GREEN}Done!${NC}"
+  echo -e "${GREEN}Done!${NC} Archived: ${BOLD}${archived}${NC}, Failed: ${BOLD}${fail}${NC}"
 }
 
 # =============================================================================
@@ -1161,11 +1174,11 @@ cmd_repo_audit_main() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --user)      target="$2"; target_type="user"; shift 2 ;;
-      --org)       target="$2"; target_type="org"; shift 2 ;;
-      --language)  language="$2"; shift 2 ;;
-      --topic)     topic="$2"; shift 2 ;;
-      --limit)     limit="$2"; shift 2 ;;
+      --user)      need_arg "--user" "${2:-}"; target="$2"; target_type="user"; shift 2 ;;
+      --org)       need_arg "--org" "${2:-}"; target="$2"; target_type="org"; shift 2 ;;
+      --language)  need_arg "--language" "${2:-}"; language="$2"; shift 2 ;;
+      --topic)     need_arg "--topic" "${2:-}"; topic="$2"; shift 2 ;;
+      --limit)     need_arg "--limit" "${2:-}"; limit="$2"; shift 2 ;;
       -v|--verbose) VERBOSE=true; shift ;;
       -h|--help)   cmd_repo_audit_usage ;;
       *) die "repo-audit: unknown option: $1" ;;
@@ -1261,8 +1274,8 @@ cmd_stats_main() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --user) target="$2"; target_type="user"; shift 2 ;;
-      --org)  target="$2"; target_type="org"; shift 2 ;;
+      --user) need_arg "--user" "${2:-}"; target="$2"; target_type="user"; shift 2 ;;
+      --org)  need_arg "--org" "${2:-}"; target="$2"; target_type="org"; shift 2 ;;
       -h|--help) cmd_stats_usage ;;
       *) die "stats: unknown option: $1" ;;
     esac
@@ -1358,13 +1371,13 @@ cmd_bulk_topic_main() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --add)       action="add"; topic_value="$2"; shift 2 ;;
-      --remove)    action="remove"; topic_value="$2"; shift 2 ;;
-      --user)      target="$2"; target_type="user"; shift 2 ;;
-      --org)       target="$2"; target_type="org"; shift 2 ;;
-      --language)  language="$2"; shift 2 ;;
-      --topic)     filter_topic="$2"; shift 2 ;;
-      --pattern)   pattern="$2"; shift 2 ;;
+      --add)       need_arg "--add" "${2:-}"; action="add"; topic_value="$2"; shift 2 ;;
+      --remove)    need_arg "--remove" "${2:-}"; action="remove"; topic_value="$2"; shift 2 ;;
+      --user)      need_arg "--user" "${2:-}"; target="$2"; target_type="user"; shift 2 ;;
+      --org)       need_arg "--org" "${2:-}"; target="$2"; target_type="org"; shift 2 ;;
+      --language)  need_arg "--language" "${2:-}"; language="$2"; shift 2 ;;
+      --topic)     need_arg "--topic" "${2:-}"; filter_topic="$2"; shift 2 ;;
+      --pattern)   need_arg "--pattern" "${2:-}"; pattern="$2"; shift 2 ;;
       --dry-run)   dry_run=true; shift ;;
       -y|--yes)    AUTO_YES=true; shift ;;
       -v|--verbose) VERBOSE=true; shift ;;
@@ -1451,7 +1464,7 @@ cmd_bulk_topic_main() {
   fi
 
   local success=0 fail=0
-  echo "$filtered_repos" | jq -r '.[].nameWithOwner' | while IFS= read -r nwo; do
+  while IFS= read -r nwo; do
     if gh repo edit "$nwo" --"${action}-topic" "$topic_value" 2>/dev/null; then
       success=$((success + 1))
       echo -e "  ${GREEN}OK${NC}     $nwo"
@@ -1459,10 +1472,10 @@ cmd_bulk_topic_main() {
       fail=$((fail + 1))
       echo -e "  ${RED}FAILED${NC} $nwo"
     fi
-  done
+  done < <(echo "$filtered_repos" | jq -r '.[].nameWithOwner')
 
   echo ""
-  echo -e "${GREEN}Done!${NC}"
+  echo -e "${GREEN}Done!${NC} Success: ${BOLD}${success}${NC}, Failed: ${BOLD}${fail}${NC}"
 }
 
 # =============================================================================
@@ -1577,12 +1590,12 @@ cmd_cleanup_branches_main() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)        target="$2"; target_type="repo"; shift 2 ;;
-      --org)         target="$2"; target_type="org"; shift 2 ;;
-      --user)        target="$2"; target_type="user"; shift 2 ;;
+      --repo)        need_arg "--repo" "${2:-}"; target="$2"; target_type="repo"; shift 2 ;;
+      --org)         need_arg "--org" "${2:-}"; target="$2"; target_type="org"; shift 2 ;;
+      --user)        need_arg "--user" "${2:-}"; target="$2"; target_type="user"; shift 2 ;;
       --merged)      mode="merged"; shift ;;
-      --stale-days)  mode="stale"; stale_days="$2"; shift 2 ;;
-      --exclude)     exclude="$2"; shift 2 ;;
+      --stale-days)  need_arg "--stale-days" "${2:-}"; mode="stale"; stale_days="$2"; shift 2 ;;
+      --exclude)     need_arg "--exclude" "${2:-}"; exclude="$2"; shift 2 ;;
       --dry-run)     dry_run=true; shift ;;
       -y|--yes)      AUTO_YES=true; shift ;;
       -v|--verbose)  VERBOSE=true; shift ;;
@@ -1662,9 +1675,9 @@ cmd_workflow_status_main() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --user)      target="$2"; target_type="user"; shift 2 ;;
-      --org)       target="$2"; target_type="org"; shift 2 ;;
-      --limit)     limit="$2"; shift 2 ;;
+      --user)      need_arg "--user" "${2:-}"; target="$2"; target_type="user"; shift 2 ;;
+      --org)       need_arg "--org" "${2:-}"; target="$2"; target_type="org"; shift 2 ;;
+      --limit)     need_arg "--limit" "${2:-}"; limit="$2"; shift 2 ;;
       --failed)    failed_only=true; shift ;;
       -v|--verbose) VERBOSE=true; shift ;;
       -h|--help)   cmd_workflow_status_usage ;;
@@ -1766,10 +1779,10 @@ cmd_sync_labels_main() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --from)      from_repo="$2"; shift 2 ;;
-      --to)        to_repo="$2"; to_type="repo"; shift 2 ;;
-      --org)       to_target="$2"; to_type="org"; shift 2 ;;
-      --user)      to_target="$2"; to_type="user"; shift 2 ;;
+      --from)      need_arg "--from" "${2:-}"; from_repo="$2"; shift 2 ;;
+      --to)        need_arg "--to" "${2:-}"; to_repo="$2"; to_type="repo"; shift 2 ;;
+      --org)       need_arg "--org" "${2:-}"; to_target="$2"; to_type="org"; shift 2 ;;
+      --user)      need_arg "--user" "${2:-}"; to_target="$2"; to_type="user"; shift 2 ;;
       --dry-run)   dry_run=true; shift ;;
       -y|--yes)    AUTO_YES=true; shift ;;
       -v|--verbose) VERBOSE=true; shift ;;
@@ -1844,7 +1857,9 @@ cmd_sync_labels_main() {
       desc=$(echo "$label" | jq -r '.description // ""')
 
       # Try to update existing, create if not found
-      if gh api --method PATCH "repos/${target_nwo}/labels/${name}" \
+      local encoded_name
+      encoded_name=$(printf '%s' "$name" | jq -sRr @uri)
+      if gh api --method PATCH "repos/${target_nwo}/labels/${encoded_name}" \
         -f color="$color" -f description="$desc" &>/dev/null; then
         $VERBOSE && echo -e "    ${CYAN}UPDATED${NC} $name"
       elif gh api --method POST "repos/${target_nwo}/labels" \
@@ -1892,8 +1907,8 @@ EOF
 cmd_export_stars_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --format)    EXPORT_STARS_FORMAT="$2"; shift 2 ;;
-      --out)       EXPORT_STARS_OUT="$2"; shift 2 ;;
+      --format)    need_arg "--format" "${2:-}"; EXPORT_STARS_FORMAT="$2"; shift 2 ;;
+      --out)       need_arg "--out" "${2:-}"; EXPORT_STARS_OUT="$2"; shift 2 ;;
       -v|--verbose) VERBOSE=true; shift ;;
       -h|--help)   cmd_export_stars_usage ;;
       *) die "export-stars: unknown option: $1" ;;
@@ -2080,11 +2095,11 @@ EOF
 cmd_rename_default_branch_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --from)      RENAME_BRANCH_FROM="$2"; shift 2 ;;
-      --to)        RENAME_BRANCH_TO="$2"; shift 2 ;;
-      --user)      RENAME_BRANCH_TARGET="$2"; RENAME_BRANCH_TARGET_TYPE="user"; shift 2 ;;
-      --org)       RENAME_BRANCH_TARGET="$2"; RENAME_BRANCH_TARGET_TYPE="org"; shift 2 ;;
-      --repo)      RENAME_BRANCH_REPO="$2"; shift 2 ;;
+      --from)      need_arg "--from" "${2:-}"; RENAME_BRANCH_FROM="$2"; shift 2 ;;
+      --to)        need_arg "--to" "${2:-}"; RENAME_BRANCH_TO="$2"; shift 2 ;;
+      --user)      need_arg "--user" "${2:-}"; RENAME_BRANCH_TARGET="$2"; RENAME_BRANCH_TARGET_TYPE="user"; shift 2 ;;
+      --org)       need_arg "--org" "${2:-}"; RENAME_BRANCH_TARGET="$2"; RENAME_BRANCH_TARGET_TYPE="org"; shift 2 ;;
+      --repo)      need_arg "--repo" "${2:-}"; RENAME_BRANCH_REPO="$2"; shift 2 ;;
       --dry-run)   DRY_RUN=true; shift ;;
       -y|--yes)    AUTO_YES=true; shift ;;
       -v|--verbose) VERBOSE=true; shift ;;
@@ -2167,7 +2182,7 @@ cmd_rename_default_branch_main() {
   fi
 
   local success=0 fail=0
-  echo "$matching_json" | jq -r '.[].nameWithOwner' | while IFS= read -r nwo; do
+  while IFS= read -r nwo; do
     # Rename the branch
     if gh api -X POST "repos/${nwo}/branches/${RENAME_BRANCH_FROM}/rename" \
       -f new_name="$RENAME_BRANCH_TO" &>/dev/null; then
@@ -2183,10 +2198,10 @@ cmd_rename_default_branch_main() {
       fail=$((fail + 1))
       echo -e "  ${RED}FAILED${NC}   ${nwo}"
     fi
-  done
+  done < <(echo "$matching_json" | jq -r '.[].nameWithOwner')
 
   echo ""
-  echo -e "${GREEN}Done!${NC}"
+  echo -e "${GREEN}Done!${NC} Success: ${BOLD}${success}${NC}, Failed: ${BOLD}${fail}${NC}"
 }
 
 # =============================================================================
@@ -2226,10 +2241,10 @@ EOF
 cmd_secret_audit_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --user)      SECRET_AUDIT_TARGET="$2"; SECRET_AUDIT_TARGET_TYPE="user"; shift 2 ;;
-      --org)       SECRET_AUDIT_TARGET="$2"; SECRET_AUDIT_TARGET_TYPE="org"; shift 2 ;;
-      --repo)      SECRET_AUDIT_REPO="$2"; shift 2 ;;
-      --limit)     SECRET_AUDIT_LIMIT="$2"; shift 2 ;;
+      --user)      need_arg "--user" "${2:-}"; SECRET_AUDIT_TARGET="$2"; SECRET_AUDIT_TARGET_TYPE="user"; shift 2 ;;
+      --org)       need_arg "--org" "${2:-}"; SECRET_AUDIT_TARGET="$2"; SECRET_AUDIT_TARGET_TYPE="org"; shift 2 ;;
+      --repo)      need_arg "--repo" "${2:-}"; SECRET_AUDIT_REPO="$2"; shift 2 ;;
+      --limit)     need_arg "--limit" "${2:-}"; SECRET_AUDIT_LIMIT="$2"; shift 2 ;;
       -v|--verbose) VERBOSE=true; shift ;;
       -h|--help)   cmd_secret_audit_usage ;;
       *) die "secret-audit: unknown option: $1" ;;
@@ -2376,9 +2391,9 @@ EOF
 cmd_license_check_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --user)       LICENSE_CHECK_TARGET="$2"; LICENSE_CHECK_TARGET_TYPE="user"; shift 2 ;;
-      --org)        LICENSE_CHECK_TARGET="$2"; LICENSE_CHECK_TARGET_TYPE="org"; shift 2 ;;
-      --template)   LICENSE_CHECK_TEMPLATE="$2"; shift 2 ;;
+      --user)       need_arg "--user" "${2:-}"; LICENSE_CHECK_TARGET="$2"; LICENSE_CHECK_TARGET_TYPE="user"; shift 2 ;;
+      --org)        need_arg "--org" "${2:-}"; LICENSE_CHECK_TARGET="$2"; LICENSE_CHECK_TARGET_TYPE="org"; shift 2 ;;
+      --template)   need_arg "--template" "${2:-}"; LICENSE_CHECK_TEMPLATE="$2"; shift 2 ;;
       --add)        LICENSE_CHECK_ADD=true; shift ;;
       --dry-run)    DRY_RUN=true; shift ;;
       -y|--yes)     AUTO_YES=true; shift ;;
@@ -2500,10 +2515,10 @@ cmd_license_check_main() {
   fi
 
   local encoded_body
-  encoded_body=$(echo -n "$license_body" | base64)
+  encoded_body=$(echo -n "$license_body" | base64 | tr -d '\n')
 
   local success=0 fail=0
-  echo "$missing_repos" | while IFS= read -r nwo; do
+  while IFS= read -r nwo; do
     [ -z "$nwo" ] && continue
     if gh api -X PUT "repos/${nwo}/contents/LICENSE" \
       -f message="Add ${LICENSE_CHECK_TEMPLATE} license" \
@@ -2514,10 +2529,10 @@ cmd_license_check_main() {
       fail=$((fail + 1))
       echo -e "  ${RED}FAILED${NC}  ${nwo}"
     fi
-  done
+  done <<< "$missing_repos"
 
   echo ""
-  echo -e "${GREEN}Done!${NC}"
+  echo -e "${GREEN}Done!${NC} Added: ${BOLD}${success}${NC}, Failed: ${BOLD}${fail}${NC}"
 }
 
 # =============================================================================
@@ -2561,10 +2576,10 @@ EOF
 cmd_dependabot_enable_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --user)        DEPENDABOT_TARGET="$2"; DEPENDABOT_TARGET_TYPE="user"; shift 2 ;;
-      --org)         DEPENDABOT_TARGET="$2"; DEPENDABOT_TARGET_TYPE="org"; shift 2 ;;
-      --ecosystems)  DEPENDABOT_ECOSYSTEMS="$2"; shift 2 ;;
-      --schedule)    DEPENDABOT_SCHEDULE="$2"; shift 2 ;;
+      --user)        need_arg "--user" "${2:-}"; DEPENDABOT_TARGET="$2"; DEPENDABOT_TARGET_TYPE="user"; shift 2 ;;
+      --org)         need_arg "--org" "${2:-}"; DEPENDABOT_TARGET="$2"; DEPENDABOT_TARGET_TYPE="org"; shift 2 ;;
+      --ecosystems)  need_arg "--ecosystems" "${2:-}"; DEPENDABOT_ECOSYSTEMS="$2"; shift 2 ;;
+      --schedule)    need_arg "--schedule" "${2:-}"; DEPENDABOT_SCHEDULE="$2"; shift 2 ;;
       --dry-run)     DRY_RUN=true; shift ;;
       -y|--yes)      AUTO_YES=true; shift ;;
       -v|--verbose)  VERBOSE=true; shift ;;
@@ -2658,7 +2673,7 @@ cmd_dependabot_enable_main() {
   local -a enable_repos=()
   local -a enable_ecosystems=()
 
-  echo "$repos_json" | jq -c '.[]' | while IFS= read -r repo; do
+  while IFS= read -r repo; do
     local nwo lang
     nwo=$(echo "$repo" | jq -r '.nameWithOwner')
     lang=$(echo "$repo" | jq -r '.primaryLanguage.name // empty')
@@ -2701,7 +2716,7 @@ cmd_dependabot_enable_main() {
 
     # Store for later processing
     echo "${nwo}|${eco_list}" >> /tmp/gh-dependabot-enable-list.$$
-  done
+  done < <(echo "$repos_json" | jq -c '.[]')
 
   echo ""
 
@@ -2740,7 +2755,7 @@ cmd_dependabot_enable_main() {
     config_content=$(cmd_dependabot_enable_build_config "$DEPENDABOT_SCHEDULE" "${ecosystems[@]}")
 
     local encoded_content
-    encoded_content=$(echo -e "$config_content" | base64)
+    encoded_content=$(echo -e "$config_content" | base64 | tr -d '\n')
 
     if gh api -X PUT "repos/${nwo}/contents/.github/dependabot.yml" \
       -f message="Enable Dependabot updates" \
@@ -2806,11 +2821,11 @@ EOF
 cmd_mirror_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)      MIRROR_REPO="$2"; shift 2 ;;
-      --user)      MIRROR_TARGET="$2"; MIRROR_TARGET_TYPE="user"; shift 2 ;;
-      --org)       MIRROR_TARGET="$2"; MIRROR_TARGET_TYPE="org"; shift 2 ;;
-      --target)    MIRROR_URL_TEMPLATE="$2"; shift 2 ;;
-      --dir)       MIRROR_DIR="$2"; shift 2 ;;
+      --repo)      need_arg "--repo" "${2:-}"; MIRROR_REPO="$2"; shift 2 ;;
+      --user)      need_arg "--user" "${2:-}"; MIRROR_TARGET="$2"; MIRROR_TARGET_TYPE="user"; shift 2 ;;
+      --org)       need_arg "--org" "${2:-}"; MIRROR_TARGET="$2"; MIRROR_TARGET_TYPE="org"; shift 2 ;;
+      --target)    need_arg "--target" "${2:-}"; MIRROR_URL_TEMPLATE="$2"; shift 2 ;;
+      --dir)       need_arg "--dir" "${2:-}"; MIRROR_DIR="$2"; shift 2 ;;
       --dry-run)   DRY_RUN=true; shift ;;
       -y|--yes)    AUTO_YES=true; shift ;;
       -v|--verbose) VERBOSE=true; shift ;;
@@ -2898,7 +2913,7 @@ cmd_mirror_main() {
   mkdir -p "$MIRROR_DIR"
 
   local success=0 fail=0
-  echo "$repo_list_json" | jq -r '.[] | "\(.nameWithOwner)\t\(.name)"' | while IFS=$'\t' read -r nwo repo_name; do
+  while IFS=$'\t' read -r nwo repo_name; do
     [ -z "$nwo" ] && continue
 
     local target_url="${MIRROR_URL_TEMPLATE//\{name\}/$repo_name}"
@@ -2927,10 +2942,10 @@ cmd_mirror_main() {
 
     # Cleanup
     rm -rf "$clone_path"
-  done
+  done < <(echo "$repo_list_json" | jq -r '.[] | "\(.nameWithOwner)\t\(.name)"')
 
   echo ""
-  echo -e "${GREEN}Done!${NC}"
+  echo -e "${GREEN}Done!${NC} Mirrored: ${BOLD}${success}${NC}, Failed: ${BOLD}${fail}${NC}"
 }
 
 # =============================================================================
@@ -2974,10 +2989,10 @@ EOF
 cmd_release_cleanup_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)       RELEASE_CLEANUP_REPO="$2"; shift 2 ;;
-      --user)       RELEASE_CLEANUP_TARGET="$2"; RELEASE_CLEANUP_TARGET_TYPE="user"; shift 2 ;;
-      --org)        RELEASE_CLEANUP_TARGET="$2"; RELEASE_CLEANUP_TARGET_TYPE="org"; shift 2 ;;
-      --keep)       RELEASE_CLEANUP_KEEP="$2"; shift 2 ;;
+      --repo)       need_arg "--repo" "${2:-}"; RELEASE_CLEANUP_REPO="$2"; shift 2 ;;
+      --user)       need_arg "--user" "${2:-}"; RELEASE_CLEANUP_TARGET="$2"; RELEASE_CLEANUP_TARGET_TYPE="user"; shift 2 ;;
+      --org)        need_arg "--org" "${2:-}"; RELEASE_CLEANUP_TARGET="$2"; RELEASE_CLEANUP_TARGET_TYPE="org"; shift 2 ;;
+      --keep)       need_arg "--keep" "${2:-}"; RELEASE_CLEANUP_KEEP="$2"; shift 2 ;;
       --pre-only)   RELEASE_CLEANUP_PRE_ONLY=true; shift ;;
       --dry-run)    DRY_RUN=true; shift ;;
       -y|--yes)     AUTO_YES=true; shift ;;
@@ -3096,9 +3111,8 @@ cmd_release_cleanup_main() {
 
   # First pass: collect info about what will be deleted
   local total_to_delete=0
-  local tmpfile
   tmpfile=$(mktemp)
-  trap 'rm -f "$tmpfile"' EXIT
+  trap 'rm -f "${tmpfile:-}"' EXIT
 
   while IFS= read -r nwo; do
     [ -z "$nwo" ] && continue
@@ -3197,11 +3211,11 @@ EOF
 cmd_vulnerability_check_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)      VULN_CHECK_REPO="$2"; shift 2 ;;
-      --user)      VULN_CHECK_TARGET="$2"; VULN_CHECK_TARGET_TYPE="user"; shift 2 ;;
-      --org)       VULN_CHECK_TARGET="$2"; VULN_CHECK_TARGET_TYPE="org"; shift 2 ;;
-      --severity)  VULN_CHECK_SEVERITY="$2"; shift 2 ;;
-      --limit)     VULN_CHECK_LIMIT="$2"; shift 2 ;;
+      --repo)      need_arg "--repo" "${2:-}"; VULN_CHECK_REPO="$2"; shift 2 ;;
+      --user)      need_arg "--user" "${2:-}"; VULN_CHECK_TARGET="$2"; VULN_CHECK_TARGET_TYPE="user"; shift 2 ;;
+      --org)       need_arg "--org" "${2:-}"; VULN_CHECK_TARGET="$2"; VULN_CHECK_TARGET_TYPE="org"; shift 2 ;;
+      --severity)  need_arg "--severity" "${2:-}"; VULN_CHECK_SEVERITY="$2"; shift 2 ;;
+      --limit)     need_arg "--limit" "${2:-}"; VULN_CHECK_LIMIT="$2"; shift 2 ;;
       -v|--verbose) VERBOSE=true; shift ;;
       -h|--help)   cmd_vulnerability_check_usage ;;
       *) die "vulnerability-check: unknown option: $1" ;;
@@ -3351,11 +3365,11 @@ EOF
 cmd_branch_protection_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)                   BRANCH_PROT_REPO="$2"; shift 2 ;;
-      --user)                   BRANCH_PROT_TARGET="$2"; BRANCH_PROT_TARGET_TYPE="user"; shift 2 ;;
-      --org)                    BRANCH_PROT_TARGET="$2"; BRANCH_PROT_TARGET_TYPE="org"; shift 2 ;;
+      --repo)                   need_arg "--repo" "${2:-}"; BRANCH_PROT_REPO="$2"; shift 2 ;;
+      --user)                   need_arg "--user" "${2:-}"; BRANCH_PROT_TARGET="$2"; BRANCH_PROT_TARGET_TYPE="user"; shift 2 ;;
+      --org)                    need_arg "--org" "${2:-}"; BRANCH_PROT_TARGET="$2"; BRANCH_PROT_TARGET_TYPE="org"; shift 2 ;;
       --enforce)                BRANCH_PROT_ENFORCE=true; shift ;;
-      --require-reviews)        BRANCH_PROT_REVIEWS="$2"; shift 2 ;;
+      --require-reviews)        need_arg "--require-reviews" "${2:-}"; BRANCH_PROT_REVIEWS="$2"; shift 2 ;;
       --require-status-checks)  BRANCH_PROT_STATUS_CHECKS=true; shift ;;
       --allow-force-push)       BRANCH_PROT_NO_FORCE_PUSH=false; shift ;;
       --dry-run)                DRY_RUN=true; shift ;;
@@ -3403,9 +3417,8 @@ cmd_branch_protection_main() {
   echo ""
 
   local total_repos=0 protected=0 unprotected=0
-  local tmpfile
   tmpfile=$(mktemp)
-  trap 'rm -f "$tmpfile"' EXIT
+  trap 'rm -f "${tmpfile:-}"' EXIT
 
   while IFS= read -r nwo; do
     [ -z "$nwo" ] && continue
@@ -3543,14 +3556,14 @@ EOF
 cmd_stale_issues_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)      STALE_ISSUES_REPO="$2"; shift 2 ;;
-      --user)      STALE_ISSUES_TARGET="$2"; STALE_ISSUES_TARGET_TYPE="user"; shift 2 ;;
-      --org)       STALE_ISSUES_TARGET="$2"; STALE_ISSUES_TARGET_TYPE="org"; shift 2 ;;
-      --days)      STALE_ISSUES_DAYS="$2"; shift 2 ;;
-      --type)      STALE_ISSUES_TYPE="$2"; shift 2 ;;
-      --label)     STALE_ISSUES_LABEL="$2"; shift 2 ;;
+      --repo)      need_arg "--repo" "${2:-}"; STALE_ISSUES_REPO="$2"; shift 2 ;;
+      --user)      need_arg "--user" "${2:-}"; STALE_ISSUES_TARGET="$2"; STALE_ISSUES_TARGET_TYPE="user"; shift 2 ;;
+      --org)       need_arg "--org" "${2:-}"; STALE_ISSUES_TARGET="$2"; STALE_ISSUES_TARGET_TYPE="org"; shift 2 ;;
+      --days)      need_arg "--days" "${2:-}"; STALE_ISSUES_DAYS="$2"; shift 2 ;;
+      --type)      need_arg "--type" "${2:-}"; STALE_ISSUES_TYPE="$2"; shift 2 ;;
+      --label)     need_arg "--label" "${2:-}"; STALE_ISSUES_LABEL="$2"; shift 2 ;;
       --close)     STALE_ISSUES_CLOSE=true; shift ;;
-      --comment)   STALE_ISSUES_COMMENT="$2"; shift 2 ;;
+      --comment)   need_arg "--comment" "${2:-}"; STALE_ISSUES_COMMENT="$2"; shift 2 ;;
       --dry-run)   DRY_RUN=true; shift ;;
       -y|--yes)    AUTO_YES=true; shift ;;
       -v|--verbose) VERBOSE=true; shift ;;
@@ -3752,11 +3765,11 @@ EOF
 cmd_bulk_settings_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --user)                   BULK_SETTINGS_TARGET="$2"; BULK_SETTINGS_TARGET_TYPE="user"; shift 2 ;;
-      --org)                    BULK_SETTINGS_TARGET="$2"; BULK_SETTINGS_TARGET_TYPE="org"; shift 2 ;;
-      --language)               BULK_SETTINGS_LANGUAGE="$2"; shift 2 ;;
-      --topic)                  BULK_SETTINGS_TOPIC="$2"; shift 2 ;;
-      --pattern)                BULK_SETTINGS_PATTERN="$2"; shift 2 ;;
+      --user)                   need_arg "--user" "${2:-}"; BULK_SETTINGS_TARGET="$2"; BULK_SETTINGS_TARGET_TYPE="user"; shift 2 ;;
+      --org)                    need_arg "--org" "${2:-}"; BULK_SETTINGS_TARGET="$2"; BULK_SETTINGS_TARGET_TYPE="org"; shift 2 ;;
+      --language)               need_arg "--language" "${2:-}"; BULK_SETTINGS_LANGUAGE="$2"; shift 2 ;;
+      --topic)                  need_arg "--topic" "${2:-}"; BULK_SETTINGS_TOPIC="$2"; shift 2 ;;
+      --pattern)                need_arg "--pattern" "${2:-}"; BULK_SETTINGS_PATTERN="$2"; shift 2 ;;
       --enable-wiki)            BULK_SETTINGS_WIKI=true; shift ;;
       --disable-wiki)           BULK_SETTINGS_WIKI=false; shift ;;
       --enable-issues)          BULK_SETTINGS_ISSUES=true; shift ;;
@@ -3914,10 +3927,10 @@ EOF
 cmd_webhook_audit_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)      WEBHOOK_AUDIT_REPO="$2"; shift 2 ;;
-      --user)      WEBHOOK_AUDIT_TARGET="$2"; WEBHOOK_AUDIT_TARGET_TYPE="user"; shift 2 ;;
-      --org)       WEBHOOK_AUDIT_TARGET="$2"; WEBHOOK_AUDIT_TARGET_TYPE="org"; shift 2 ;;
-      --limit)     WEBHOOK_AUDIT_LIMIT="$2"; shift 2 ;;
+      --repo)      need_arg "--repo" "${2:-}"; WEBHOOK_AUDIT_REPO="$2"; shift 2 ;;
+      --user)      need_arg "--user" "${2:-}"; WEBHOOK_AUDIT_TARGET="$2"; WEBHOOK_AUDIT_TARGET_TYPE="user"; shift 2 ;;
+      --org)       need_arg "--org" "${2:-}"; WEBHOOK_AUDIT_TARGET="$2"; WEBHOOK_AUDIT_TARGET_TYPE="org"; shift 2 ;;
+      --limit)     need_arg "--limit" "${2:-}"; WEBHOOK_AUDIT_LIMIT="$2"; shift 2 ;;
       -v|--verbose) VERBOSE=true; shift ;;
       -h|--help)   cmd_webhook_audit_usage ;;
       *) die "webhook-audit: unknown option: $1" ;;
@@ -4053,11 +4066,11 @@ EOF
 cmd_cleanup_packages_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --user)      CLEANUP_PKG_TARGET="$2"; CLEANUP_PKG_TARGET_TYPE="user"; shift 2 ;;
-      --org)       CLEANUP_PKG_TARGET="$2"; CLEANUP_PKG_TARGET_TYPE="org"; shift 2 ;;
-      --type)      CLEANUP_PKG_TYPE="$2"; shift 2 ;;
-      --package)   CLEANUP_PKG_PACKAGE="$2"; shift 2 ;;
-      --keep)      CLEANUP_PKG_KEEP="$2"; shift 2 ;;
+      --user)      need_arg "--user" "${2:-}"; CLEANUP_PKG_TARGET="$2"; CLEANUP_PKG_TARGET_TYPE="user"; shift 2 ;;
+      --org)       need_arg "--org" "${2:-}"; CLEANUP_PKG_TARGET="$2"; CLEANUP_PKG_TARGET_TYPE="org"; shift 2 ;;
+      --type)      need_arg "--type" "${2:-}"; CLEANUP_PKG_TYPE="$2"; shift 2 ;;
+      --package)   need_arg "--package" "${2:-}"; CLEANUP_PKG_PACKAGE="$2"; shift 2 ;;
+      --keep)      need_arg "--keep" "${2:-}"; CLEANUP_PKG_KEEP="$2"; shift 2 ;;
       --dry-run)   DRY_RUN=true; shift ;;
       -y|--yes)    AUTO_YES=true; shift ;;
       -v|--verbose) VERBOSE=true; shift ;;
@@ -4210,10 +4223,10 @@ EOF
 cmd_collaborator_audit_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --org)        COLLAB_AUDIT_TARGET="$2"; COLLAB_AUDIT_TARGET_TYPE="org"; shift 2 ;;
-      --user)       COLLAB_AUDIT_TARGET="$2"; COLLAB_AUDIT_TARGET_TYPE="user"; shift 2 ;;
-      --permission) COLLAB_AUDIT_PERMISSION="$2"; shift 2 ;;
-      --limit)      COLLAB_AUDIT_LIMIT="$2"; shift 2 ;;
+      --org)        need_arg "--org" "${2:-}"; COLLAB_AUDIT_TARGET="$2"; COLLAB_AUDIT_TARGET_TYPE="org"; shift 2 ;;
+      --user)       need_arg "--user" "${2:-}"; COLLAB_AUDIT_TARGET="$2"; COLLAB_AUDIT_TARGET_TYPE="user"; shift 2 ;;
+      --permission) need_arg "--permission" "${2:-}"; COLLAB_AUDIT_PERMISSION="$2"; shift 2 ;;
+      --limit)      need_arg "--limit" "${2:-}"; COLLAB_AUDIT_LIMIT="$2"; shift 2 ;;
       -v|--verbose) VERBOSE=true; shift ;;
       -h|--help)    cmd_collaborator_audit_usage ;;
       *) die "collaborator-audit: unknown option: $1" ;;
@@ -4336,11 +4349,11 @@ EOF
 cmd_repo_template_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --from)            REPO_TEMPLATE_FROM="$2"; shift 2 ;;
-      --user)            REPO_TEMPLATE_TARGET="$2"; REPO_TEMPLATE_TARGET_TYPE="user"; shift 2 ;;
-      --org)             REPO_TEMPLATE_TARGET="$2"; REPO_TEMPLATE_TARGET_TYPE="org"; shift 2 ;;
-      --language)        REPO_TEMPLATE_LANGUAGE="$2"; shift 2 ;;
-      --topic)           REPO_TEMPLATE_TOPIC="$2"; shift 2 ;;
+      --from)            need_arg "--from" "${2:-}"; REPO_TEMPLATE_FROM="$2"; shift 2 ;;
+      --user)            need_arg "--user" "${2:-}"; REPO_TEMPLATE_TARGET="$2"; REPO_TEMPLATE_TARGET_TYPE="user"; shift 2 ;;
+      --org)             need_arg "--org" "${2:-}"; REPO_TEMPLATE_TARGET="$2"; REPO_TEMPLATE_TARGET_TYPE="org"; shift 2 ;;
+      --language)        need_arg "--language" "${2:-}"; REPO_TEMPLATE_LANGUAGE="$2"; shift 2 ;;
+      --topic)           need_arg "--topic" "${2:-}"; REPO_TEMPLATE_TOPIC="$2"; shift 2 ;;
       --sync-settings)   REPO_TEMPLATE_SYNC_SETTINGS=true; shift ;;
       --sync-labels)     REPO_TEMPLATE_SYNC_LABELS=true; shift ;;
       --sync-protection) REPO_TEMPLATE_SYNC_PROTECTION=true; shift ;;
@@ -4578,13 +4591,13 @@ EOF
 cmd_pr_cleanup_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)           PR_CLEANUP_REPO="$2"; shift 2 ;;
-      --user)           PR_CLEANUP_TARGET="$2"; PR_CLEANUP_TARGET_TYPE="user"; shift 2 ;;
-      --org)            PR_CLEANUP_TARGET="$2"; PR_CLEANUP_TARGET_TYPE="org"; shift 2 ;;
-      --days)           PR_CLEANUP_DAYS="$2"; shift 2 ;;
+      --repo)           need_arg "--repo" "${2:-}"; PR_CLEANUP_REPO="$2"; shift 2 ;;
+      --user)           need_arg "--user" "${2:-}"; PR_CLEANUP_TARGET="$2"; PR_CLEANUP_TARGET_TYPE="user"; shift 2 ;;
+      --org)            need_arg "--org" "${2:-}"; PR_CLEANUP_TARGET="$2"; PR_CLEANUP_TARGET_TYPE="org"; shift 2 ;;
+      --days)           need_arg "--days" "${2:-}"; PR_CLEANUP_DAYS="$2"; shift 2 ;;
       --draft-only)     PR_CLEANUP_DRAFT_ONLY=true; shift ;;
       --close)          PR_CLEANUP_CLOSE=true; shift ;;
-      --comment)        PR_CLEANUP_COMMENT="$2"; shift 2 ;;
+      --comment)        need_arg "--comment" "${2:-}"; PR_CLEANUP_COMMENT="$2"; shift 2 ;;
       --delete-branch)  PR_CLEANUP_DELETE_BRANCH=true; shift ;;
       --dry-run)        DRY_RUN=true; shift ;;
       -y|--yes)         AUTO_YES=true; shift ;;
@@ -4761,11 +4774,11 @@ EOF
 cmd_activity_report_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --user)    ACTIVITY_REPORT_TARGET="$2"; ACTIVITY_REPORT_TARGET_TYPE="user"; shift 2 ;;
-      --org)     ACTIVITY_REPORT_TARGET="$2"; ACTIVITY_REPORT_TARGET_TYPE="org"; shift 2 ;;
-      --since)   ACTIVITY_REPORT_SINCE="$2"; shift 2 ;;
-      --until)   ACTIVITY_REPORT_UNTIL="$2"; shift 2 ;;
-      --format)  ACTIVITY_REPORT_FORMAT="$2"; shift 2 ;;
+      --user)    need_arg "--user" "${2:-}"; ACTIVITY_REPORT_TARGET="$2"; ACTIVITY_REPORT_TARGET_TYPE="user"; shift 2 ;;
+      --org)     need_arg "--org" "${2:-}"; ACTIVITY_REPORT_TARGET="$2"; ACTIVITY_REPORT_TARGET_TYPE="org"; shift 2 ;;
+      --since)   need_arg "--since" "${2:-}"; ACTIVITY_REPORT_SINCE="$2"; shift 2 ;;
+      --until)   need_arg "--until" "${2:-}"; ACTIVITY_REPORT_UNTIL="$2"; shift 2 ;;
+      --format)  need_arg "--format" "${2:-}"; ACTIVITY_REPORT_FORMAT="$2"; shift 2 ;;
       -h|--help) cmd_activity_report_usage ;;
       *) die "activity-report: unknown option: $1" ;;
     esac
