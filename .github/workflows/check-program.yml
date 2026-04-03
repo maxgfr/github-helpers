@@ -75,6 +75,36 @@ jobs:
       - name: Test release-cleanup help
         run: ./script.sh release-cleanup --help
 
+      - name: Test vulnerability-check help
+        run: ./script.sh vulnerability-check --help
+
+      - name: Test branch-protection help
+        run: ./script.sh branch-protection --help
+
+      - name: Test stale-issues help
+        run: ./script.sh stale-issues --help
+
+      - name: Test bulk-settings help
+        run: ./script.sh bulk-settings --help
+
+      - name: Test webhook-audit help
+        run: ./script.sh webhook-audit --help
+
+      - name: Test cleanup-packages help
+        run: ./script.sh cleanup-packages --help
+
+      - name: Test collaborator-audit help
+        run: ./script.sh collaborator-audit --help
+
+      - name: Test repo-template help
+        run: ./script.sh repo-template --help
+
+      - name: Test pr-cleanup help
+        run: ./script.sh pr-cleanup --help
+
+      - name: Test activity-report help
+        run: ./script.sh activity-report --help
+
       - name: Test unknown command fails
         run: |
           if ./script.sh nonexistent 2>/dev/null; then

@@ -7,7 +7,11 @@ set -euo pipefail
 #              archive-repos, repo-audit, stats, bulk-topic,
 #              workflow-status, sync-labels, export-stars,
 #              rename-default-branch, secret-audit, license-check,
-#              dependabot-enable, mirror, release-cleanup
+#              dependabot-enable, mirror, release-cleanup,
+#              vulnerability-check, branch-protection, stale-issues,
+#              bulk-settings, webhook-audit, cleanup-packages,
+#              collaborator-audit, repo-template, pr-cleanup,
+#              activity-report
 # =============================================================================
 
 VERSION="1.3.0"
@@ -80,6 +84,9 @@ ${BOLD}COMMANDS${NC}
   cleanup-branches    Delete merged or stale remote branches
   archive-repos       Archive inactive repos in batch
   release-cleanup     Delete old releases
+  pr-cleanup          Find and close abandoned pull requests
+  cleanup-packages    Delete old GitHub Package versions
+  stale-issues        Find and close stale issues/PRs
 
   ${BOLD}Audit & visibility${NC}
   repo-audit          Scan repos for missing LICENSE, README, description, topics
@@ -87,6 +94,11 @@ ${BOLD}COMMANDS${NC}
   workflow-status     Overview of latest CI workflow runs
   secret-audit        List secrets and env vars across repos
   license-check       Check and add LICENSE files
+  vulnerability-check Audit Dependabot vulnerability alerts
+  branch-protection   Audit or enforce branch protection rules
+  webhook-audit       List webhooks across repos
+  collaborator-audit  Audit outside collaborators and permissions
+  activity-report     Generate activity summary for a period
 
   ${BOLD}Bulk operations${NC}
   clone-org           Clone all repos from a GitHub org or user
@@ -96,6 +108,8 @@ ${BOLD}COMMANDS${NC}
   rename-default-branch  Rename default branch across repos
   dependabot-enable   Enable Dependabot on repos
   mirror              Mirror repos to another remote
+  bulk-settings       Apply repo settings in batch
+  repo-template       Sync settings from a template repo
 
 ${BOLD}FLAGS${NC}
   --no-color    Disable colored output
@@ -3146,6 +3160,1733 @@ cmd_release_cleanup_main() {
 }
 
 # =============================================================================
+# COMMAND: vulnerability-check
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+VULN_CHECK_TARGET=""
+VULN_CHECK_TARGET_TYPE=""
+VULN_CHECK_REPO=""
+VULN_CHECK_SEVERITY=""
+VULN_CHECK_LIMIT=9999
+
+cmd_vulnerability_check_usage() {
+  cat <<EOF
+${BOLD}github-helpers vulnerability-check${NC} ${DIM}v${VERSION}${NC} — Audit Dependabot vulnerability alerts
+
+${BOLD}USAGE${NC}
+  github-helpers vulnerability-check [options]
+
+${BOLD}OPTIONS${NC}
+  --repo OWNER/REPO       Single repo
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --severity LEVEL        Filter: critical, high, medium, low
+  --limit N               Max repos to scan (default: all)
+  -v, --verbose           Show individual alert details
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers vulnerability-check
+  github-helpers vulnerability-check --org my-company --severity critical
+  github-helpers vulnerability-check --repo myuser/myrepo -v
+EOF
+  exit 0
+}
+
+cmd_vulnerability_check_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)      VULN_CHECK_REPO="$2"; shift 2 ;;
+      --user)      VULN_CHECK_TARGET="$2"; VULN_CHECK_TARGET_TYPE="user"; shift 2 ;;
+      --org)       VULN_CHECK_TARGET="$2"; VULN_CHECK_TARGET_TYPE="org"; shift 2 ;;
+      --severity)  VULN_CHECK_SEVERITY="$2"; shift 2 ;;
+      --limit)     VULN_CHECK_LIMIT="$2"; shift 2 ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)   cmd_vulnerability_check_usage ;;
+      *) die "vulnerability-check: unknown option: $1" ;;
+    esac
+  done
+}
+
+cmd_vulnerability_check_main() {
+  cmd_vulnerability_check_parse_args "$@"
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}Vulnerability Check${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+
+  local repo_list
+  if [ -n "$VULN_CHECK_REPO" ]; then
+    repo_list="$VULN_CHECK_REPO"
+    echo -e "  Repo: ${BOLD}${VULN_CHECK_REPO}${NC}"
+  else
+    if [ -z "$VULN_CHECK_TARGET" ]; then
+      VULN_CHECK_TARGET=$(get_username)
+      VULN_CHECK_TARGET_TYPE="user"
+    fi
+    echo -e "  Target: ${BOLD}${VULN_CHECK_TARGET}${NC}"
+    [ -n "$VULN_CHECK_SEVERITY" ] && echo -e "  Severity: ${BOLD}${VULN_CHECK_SEVERITY}${NC}"
+    echo ""
+    echo -e "${DIM}Fetching repos...${NC}"
+    repo_list=$(gh repo list "$VULN_CHECK_TARGET" --json nameWithOwner --source --no-archived --limit "${VULN_CHECK_LIMIT:-9999}" 2>/dev/null \
+      | jq -r '.[].nameWithOwner') || die "Failed to list repos"
+  fi
+  echo ""
+
+  local total_repos=0 repos_with_vulns=0
+  local total_critical=0 total_high=0 total_medium=0 total_low=0
+
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    total_repos=$((total_repos + 1))
+
+    local query="state=open&per_page=100"
+    [ -n "$VULN_CHECK_SEVERITY" ] && query="${query}&severity=${VULN_CHECK_SEVERITY}"
+
+    local alerts_json
+    alerts_json=$(gh api "repos/${nwo}/dependabot/alerts?${query}" 2>/dev/null) || {
+      $VERBOSE && echo -e "  ${DIM}${nwo}: alerts not enabled or no access${NC}"
+      continue
+    }
+
+    local alert_count
+    alert_count=$(echo "$alerts_json" | jq 'if type == "array" then length else 0 end')
+
+    if [ "$alert_count" -eq 0 ]; then
+      $VERBOSE && echo -e "  ${GREEN}✓${NC} ${nwo}"
+      continue
+    fi
+
+    repos_with_vulns=$((repos_with_vulns + 1))
+
+    local critical high medium low
+    critical=$(echo "$alerts_json" | jq '[.[] | select(.security_vulnerability.severity == "critical")] | length')
+    high=$(echo "$alerts_json" | jq '[.[] | select(.security_vulnerability.severity == "high")] | length')
+    medium=$(echo "$alerts_json" | jq '[.[] | select(.security_vulnerability.severity == "medium")] | length')
+    low=$(echo "$alerts_json" | jq '[.[] | select(.security_vulnerability.severity == "low")] | length')
+
+    total_critical=$((total_critical + critical))
+    total_high=$((total_high + high))
+    total_medium=$((total_medium + medium))
+    total_low=$((total_low + low))
+
+    local severity_str=""
+    [ "$critical" -gt 0 ] && severity_str+="${RED}${critical} critical${NC} "
+    [ "$high" -gt 0 ] && severity_str+="${YELLOW}${high} high${NC} "
+    [ "$medium" -gt 0 ] && severity_str+="${CYAN}${medium} medium${NC} "
+    [ "$low" -gt 0 ] && severity_str+="${DIM}${low} low${NC} "
+
+    echo -e "  ${YELLOW}!${NC} ${BOLD}${nwo}${NC} — ${severity_str}"
+
+    if $VERBOSE; then
+      echo "$alerts_json" | jq -r '.[] | "\(.security_vulnerability.severity)\t\(.security_advisory.summary // .security_vulnerability.package.name)"' | \
+        while IFS=$'\t' read -r sev summary; do
+          case "$sev" in
+            critical) echo -e "      ${RED}●${NC} ${summary}" ;;
+            high)     echo -e "      ${YELLOW}●${NC} ${summary}" ;;
+            medium)   echo -e "      ${CYAN}●${NC} ${summary}" ;;
+            *)        echo -e "      ${DIM}●${NC} ${summary}" ;;
+          esac
+        done
+    fi
+  done <<< "$repo_list"
+
+  echo ""
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "${BOLD}Summary:${NC}"
+  echo -e "  Repos scanned:      ${BOLD}${total_repos}${NC}"
+  echo -e "  Repos with alerts:  ${BOLD}${repos_with_vulns}${NC}"
+  if [ $((total_critical + total_high + total_medium + total_low)) -gt 0 ]; then
+    echo -e "  Critical:           ${RED}${total_critical}${NC}"
+    echo -e "  High:               ${YELLOW}${total_high}${NC}"
+    echo -e "  Medium:             ${CYAN}${total_medium}${NC}"
+    echo -e "  Low:                ${DIM}${total_low}${NC}"
+  fi
+  echo ""
+}
+
+# =============================================================================
+# COMMAND: branch-protection
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+BRANCH_PROT_TARGET=""
+BRANCH_PROT_TARGET_TYPE=""
+BRANCH_PROT_REPO=""
+BRANCH_PROT_ENFORCE=false
+BRANCH_PROT_REVIEWS=1
+BRANCH_PROT_STATUS_CHECKS=false
+BRANCH_PROT_NO_FORCE_PUSH=true
+
+cmd_branch_protection_usage() {
+  cat <<EOF
+${BOLD}github-helpers branch-protection${NC} ${DIM}v${VERSION}${NC} — Audit or enforce branch protection rules
+
+${BOLD}USAGE${NC}
+  github-helpers branch-protection [options]
+
+${BOLD}OPTIONS${NC}
+  --repo OWNER/REPO       Single repo
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --enforce               Apply protection rules (default: audit only)
+  --require-reviews N     Required approving reviews (default: 1)
+  --require-status-checks Require status checks to pass
+  --allow-force-push      Allow force push (default: disallow)
+  --dry-run               Preview enforcement changes
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed protection info
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers branch-protection
+  github-helpers branch-protection --org my-company
+  github-helpers branch-protection --enforce --require-reviews 2 --dry-run
+  github-helpers branch-protection --repo myuser/myrepo --enforce -y
+EOF
+  exit 0
+}
+
+cmd_branch_protection_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)                   BRANCH_PROT_REPO="$2"; shift 2 ;;
+      --user)                   BRANCH_PROT_TARGET="$2"; BRANCH_PROT_TARGET_TYPE="user"; shift 2 ;;
+      --org)                    BRANCH_PROT_TARGET="$2"; BRANCH_PROT_TARGET_TYPE="org"; shift 2 ;;
+      --enforce)                BRANCH_PROT_ENFORCE=true; shift ;;
+      --require-reviews)        BRANCH_PROT_REVIEWS="$2"; shift 2 ;;
+      --require-status-checks)  BRANCH_PROT_STATUS_CHECKS=true; shift ;;
+      --allow-force-push)       BRANCH_PROT_NO_FORCE_PUSH=false; shift ;;
+      --dry-run)                DRY_RUN=true; shift ;;
+      -y|--yes)                 AUTO_YES=true; shift ;;
+      -v|--verbose)             VERBOSE=true; shift ;;
+      -h|--help)                cmd_branch_protection_usage ;;
+      *) die "branch-protection: unknown option: $1" ;;
+    esac
+  done
+}
+
+cmd_branch_protection_main() {
+  cmd_branch_protection_parse_args "$@"
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}Branch Protection${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+
+  local repo_list
+  if [ -n "$BRANCH_PROT_REPO" ]; then
+    repo_list="$BRANCH_PROT_REPO"
+    echo -e "  Repo: ${BOLD}${BRANCH_PROT_REPO}${NC}"
+  else
+    if [ -z "$BRANCH_PROT_TARGET" ]; then
+      BRANCH_PROT_TARGET=$(get_username)
+      BRANCH_PROT_TARGET_TYPE="user"
+    fi
+    echo -e "  Target: ${BOLD}${BRANCH_PROT_TARGET}${NC}"
+    echo ""
+    echo -e "${DIM}Fetching repos...${NC}"
+    repo_list=$(gh repo list "$BRANCH_PROT_TARGET" --json nameWithOwner --source --no-archived --limit 9999 2>/dev/null \
+      | jq -r '.[].nameWithOwner') || die "Failed to list repos"
+  fi
+  if $BRANCH_PROT_ENFORCE; then
+    echo -e "  Mode: ${YELLOW}ENFORCE${NC}"
+    echo -e "  Reviews: ${BOLD}${BRANCH_PROT_REVIEWS}${NC}"
+    $BRANCH_PROT_STATUS_CHECKS && echo -e "  Status checks: ${BOLD}required${NC}"
+    $BRANCH_PROT_NO_FORCE_PUSH && echo -e "  Force push: ${BOLD}disallowed${NC}"
+    if $DRY_RUN; then
+      echo -e "  Run: ${YELLOW}DRY RUN${NC}"
+    fi
+  else
+    echo -e "  Mode: ${BOLD}audit${NC}"
+  fi
+  echo ""
+
+  local total_repos=0 protected=0 unprotected=0
+  local tmpfile
+  tmpfile=$(mktemp)
+  trap 'rm -f "$tmpfile"' EXIT
+
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    total_repos=$((total_repos + 1))
+
+    # Get default branch
+    local default_branch
+    default_branch=$(gh api "repos/${nwo}" --jq '.default_branch' 2>/dev/null) || {
+      echo -e "  ${RED}FAILED${NC}  ${nwo} ${DIM}(could not fetch repo info)${NC}"
+      continue
+    }
+
+    # Check protection
+    local prot_json
+    if prot_json=$(gh api "repos/${nwo}/branches/${default_branch}/protection" 2>/dev/null); then
+      protected=$((protected + 1))
+      if $VERBOSE; then
+        local reviews_required force_push_allowed
+        reviews_required=$(echo "$prot_json" | jq -r '.required_pull_request_reviews.required_approving_review_count // "none"')
+        force_push_allowed=$(echo "$prot_json" | jq -r '.allow_force_pushes.enabled // false')
+        echo -e "  ${GREEN}✓${NC} ${nwo} ${DIM}(${default_branch}: reviews=${reviews_required}, force-push=${force_push_allowed})${NC}"
+      fi
+    else
+      unprotected=$((unprotected + 1))
+      echo "${nwo}|${default_branch}" >> "$tmpfile"
+      echo -e "  ${YELLOW}!${NC} ${BOLD}${nwo}${NC} — ${RED}no protection${NC} on ${default_branch}"
+    fi
+  done <<< "$repo_list"
+
+  echo ""
+
+  # Enforce mode
+  if $BRANCH_PROT_ENFORCE && [ -s "$tmpfile" ]; then
+    local enforce_count
+    enforce_count=$(wc -l < "$tmpfile" | tr -d ' ')
+    echo -e "${YELLOW}${enforce_count} repos need protection${NC}"
+    echo ""
+
+    if ! $DRY_RUN && ! $AUTO_YES; then
+      read -rp "Apply branch protection to ${enforce_count} repos? [y/N] " confirm
+      if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Cancelled."
+        exit 0
+      fi
+      echo ""
+    fi
+
+    while IFS='|' read -r nwo branch; do
+      [ -z "$nwo" ] && continue
+
+      if $DRY_RUN; then
+        echo -e "  ${YELLOW}WOULD PROTECT${NC} ${nwo} (${branch})"
+        continue
+      fi
+
+      local payload
+      payload=$(jq -n \
+        --argjson reviews "$BRANCH_PROT_REVIEWS" \
+        --argjson status_checks "$BRANCH_PROT_STATUS_CHECKS" \
+        --argjson no_force_push "$BRANCH_PROT_NO_FORCE_PUSH" \
+        '{
+          required_pull_request_reviews: { required_approving_review_count: $reviews, dismiss_stale_reviews: false },
+          enforce_admins: true,
+          required_status_checks: (if $status_checks then { strict: true, contexts: [] } else null end),
+          restrictions: null,
+          allow_force_pushes: (if $no_force_push then false else true end),
+          allow_deletions: false
+        }')
+
+      if gh api -X PUT "repos/${nwo}/branches/${branch}/protection" --input - <<< "$payload" &>/dev/null; then
+        echo -e "  ${GREEN}PROTECTED${NC} ${nwo} (${branch})"
+      else
+        echo -e "  ${RED}FAILED${NC}    ${nwo}"
+      fi
+    done < "$tmpfile"
+
+    echo ""
+  fi
+
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "${BOLD}Summary:${NC}"
+  echo -e "  Repos scanned:    ${BOLD}${total_repos}${NC}"
+  echo -e "  Protected:        ${GREEN}${protected}${NC}"
+  echo -e "  Unprotected:      ${YELLOW}${unprotected}${NC}"
+  if $DRY_RUN && $BRANCH_PROT_ENFORCE; then
+    echo ""
+    echo -e "${YELLOW}DRY RUN — no changes were applied.${NC}"
+  fi
+  echo ""
+}
+
+# =============================================================================
+# COMMAND: stale-issues
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+STALE_ISSUES_TARGET=""
+STALE_ISSUES_TARGET_TYPE=""
+STALE_ISSUES_REPO=""
+STALE_ISSUES_DAYS=90
+STALE_ISSUES_TYPE="all"
+STALE_ISSUES_LABEL=""
+STALE_ISSUES_CLOSE=false
+STALE_ISSUES_COMMENT=""
+
+cmd_stale_issues_usage() {
+  cat <<EOF
+${BOLD}github-helpers stale-issues${NC} ${DIM}v${VERSION}${NC} — Find and close stale issues and PRs
+
+${BOLD}USAGE${NC}
+  github-helpers stale-issues [options]
+
+${BOLD}OPTIONS${NC}
+  --repo OWNER/REPO       Single repo
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --days N                Days without activity (default: 90)
+  --type TYPE             Filter: issue, pr, all (default: all)
+  --label LABEL           Filter by label
+  --close                 Close stale issues/PRs
+  --comment TEXT           Comment before closing (requires --close)
+  --dry-run               Preview actions without applying
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers stale-issues --repo myuser/myrepo --days 180
+  github-helpers stale-issues --org my-company --type pr --days 60
+  github-helpers stale-issues --repo myuser/myrepo --close --comment "Closing as stale" --dry-run
+EOF
+  exit 0
+}
+
+cmd_stale_issues_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)      STALE_ISSUES_REPO="$2"; shift 2 ;;
+      --user)      STALE_ISSUES_TARGET="$2"; STALE_ISSUES_TARGET_TYPE="user"; shift 2 ;;
+      --org)       STALE_ISSUES_TARGET="$2"; STALE_ISSUES_TARGET_TYPE="org"; shift 2 ;;
+      --days)      STALE_ISSUES_DAYS="$2"; shift 2 ;;
+      --type)      STALE_ISSUES_TYPE="$2"; shift 2 ;;
+      --label)     STALE_ISSUES_LABEL="$2"; shift 2 ;;
+      --close)     STALE_ISSUES_CLOSE=true; shift ;;
+      --comment)   STALE_ISSUES_COMMENT="$2"; shift 2 ;;
+      --dry-run)   DRY_RUN=true; shift ;;
+      -y|--yes)    AUTO_YES=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)   cmd_stale_issues_usage ;;
+      *) die "stale-issues: unknown option: $1" ;;
+    esac
+  done
+}
+
+cmd_stale_issues_process_repo() {
+  local nwo="$1"
+  local cutoff_date="$2"
+
+  # Process issues
+  if [ "$STALE_ISSUES_TYPE" = "all" ] || [ "$STALE_ISSUES_TYPE" = "issue" ]; then
+    local -a issue_flags=(--repo "$nwo" --state open --json number,title,updatedAt --limit 200)
+    [ -n "$STALE_ISSUES_LABEL" ] && issue_flags+=(--label "$STALE_ISSUES_LABEL")
+
+    local issues_json
+    issues_json=$(gh issue list "${issue_flags[@]}" 2>/dev/null || echo "[]")
+
+    echo "$issues_json" | jq -c --arg cutoff "$cutoff_date" '.[] | select(.updatedAt < $cutoff)' | while IFS= read -r item; do
+      local number title updated
+      number=$(echo "$item" | jq -r '.number')
+      title=$(echo "$item" | jq -r '.title')
+      updated=$(echo "$item" | jq -r '.updatedAt[:10]')
+
+      if $STALE_ISSUES_CLOSE; then
+        if $DRY_RUN; then
+          echo -e "      ${YELLOW}WOULD CLOSE${NC} #${number} ${DIM}(issue, last activity ${updated})${NC} ${title}"
+        else
+          [ -n "$STALE_ISSUES_COMMENT" ] && gh issue comment "$number" --repo "$nwo" --body "$STALE_ISSUES_COMMENT" &>/dev/null
+          if gh issue close "$number" --repo "$nwo" &>/dev/null; then
+            echo -e "      ${GREEN}CLOSED${NC} #${number} ${DIM}(issue, ${updated})${NC} ${title}"
+          else
+            echo -e "      ${RED}FAILED${NC} #${number} ${title}"
+          fi
+        fi
+      else
+        echo -e "      ${DIM}#${number}${NC} ${title} ${DIM}(issue, last activity ${updated})${NC}"
+      fi
+    done
+  fi
+
+  # Process PRs
+  if [ "$STALE_ISSUES_TYPE" = "all" ] || [ "$STALE_ISSUES_TYPE" = "pr" ]; then
+    local -a pr_flags=(--repo "$nwo" --state open --json number,title,updatedAt --limit 200)
+    [ -n "$STALE_ISSUES_LABEL" ] && pr_flags+=(--label "$STALE_ISSUES_LABEL")
+
+    local prs_json
+    prs_json=$(gh pr list "${pr_flags[@]}" 2>/dev/null || echo "[]")
+
+    echo "$prs_json" | jq -c --arg cutoff "$cutoff_date" '.[] | select(.updatedAt < $cutoff)' | while IFS= read -r item; do
+      local number title updated
+      number=$(echo "$item" | jq -r '.number')
+      title=$(echo "$item" | jq -r '.title')
+      updated=$(echo "$item" | jq -r '.updatedAt[:10]')
+
+      if $STALE_ISSUES_CLOSE; then
+        if $DRY_RUN; then
+          echo -e "      ${YELLOW}WOULD CLOSE${NC} #${number} ${DIM}(PR, last activity ${updated})${NC} ${title}"
+        else
+          [ -n "$STALE_ISSUES_COMMENT" ] && gh pr comment "$number" --repo "$nwo" --body "$STALE_ISSUES_COMMENT" &>/dev/null
+          if gh pr close "$number" --repo "$nwo" &>/dev/null; then
+            echo -e "      ${GREEN}CLOSED${NC} #${number} ${DIM}(PR, ${updated})${NC} ${title}"
+          else
+            echo -e "      ${RED}FAILED${NC} #${number} ${title}"
+          fi
+        fi
+      else
+        echo -e "      ${DIM}#${number}${NC} ${title} ${DIM}(PR, last activity ${updated})${NC}"
+      fi
+    done
+  fi
+}
+
+cmd_stale_issues_main() {
+  cmd_stale_issues_parse_args "$@"
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}Stale Issues${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Stale after: ${BOLD}${STALE_ISSUES_DAYS}${NC} days"
+  echo -e "  Type:        ${BOLD}${STALE_ISSUES_TYPE}${NC}"
+  if $STALE_ISSUES_CLOSE; then
+    echo -e "  Action:      ${YELLOW}close${NC}"
+  else
+    echo -e "  Action:      ${BOLD}list only${NC}"
+  fi
+  if $DRY_RUN; then
+    echo -e "  Mode:        ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  # Calculate cutoff date
+  local cutoff_date
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    cutoff_date=$(date -v-"${STALE_ISSUES_DAYS}"d -u +"%Y-%m-%dT%H:%M:%SZ")
+  else
+    cutoff_date=$(date -u -d "${STALE_ISSUES_DAYS} days ago" +"%Y-%m-%dT%H:%M:%SZ")
+  fi
+
+  local repo_list
+  if [ -n "$STALE_ISSUES_REPO" ]; then
+    repo_list="$STALE_ISSUES_REPO"
+  else
+    if [ -z "$STALE_ISSUES_TARGET" ]; then
+      STALE_ISSUES_TARGET=$(get_username)
+      STALE_ISSUES_TARGET_TYPE="user"
+    fi
+    echo -e "  Target: ${BOLD}${STALE_ISSUES_TARGET}${NC}"
+    echo ""
+    echo -e "${DIM}Fetching repos...${NC}"
+    repo_list=$(gh repo list "$STALE_ISSUES_TARGET" --json nameWithOwner --source --no-archived --limit 9999 2>/dev/null \
+      | jq -r '.[].nameWithOwner') || die "Failed to list repos"
+  fi
+  echo ""
+
+  if $STALE_ISSUES_CLOSE && ! $DRY_RUN && ! $AUTO_YES; then
+    read -rp "Close stale issues/PRs? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+    echo ""
+  fi
+
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    echo -e "  ${BOLD}${nwo}${NC}"
+    cmd_stale_issues_process_repo "$nwo" "$cutoff_date"
+  done <<< "$repo_list"
+
+  echo ""
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no changes were applied.${NC}"
+  else
+    echo -e "${GREEN}Done!${NC}"
+  fi
+}
+
+# =============================================================================
+# COMMAND: bulk-settings
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+BULK_SETTINGS_TARGET=""
+BULK_SETTINGS_TARGET_TYPE=""
+BULK_SETTINGS_LANGUAGE=""
+BULK_SETTINGS_TOPIC=""
+BULK_SETTINGS_PATTERN=""
+BULK_SETTINGS_WIKI=""
+BULK_SETTINGS_ISSUES=""
+BULK_SETTINGS_PROJECTS=""
+BULK_SETTINGS_DISCUSSIONS=""
+BULK_SETTINGS_AUTO_MERGE=""
+BULK_SETTINGS_DELETE_BRANCH=""
+
+cmd_bulk_settings_usage() {
+  cat <<EOF
+${BOLD}github-helpers bulk-settings${NC} ${DIM}v${VERSION}${NC} — Apply repo settings in batch
+
+${BOLD}USAGE${NC}
+  github-helpers bulk-settings <setting-flags> [options]
+
+${BOLD}SETTINGS${NC}
+  --enable-wiki               Enable wiki
+  --disable-wiki              Disable wiki
+  --enable-issues             Enable issues
+  --disable-issues            Disable issues
+  --enable-projects           Enable projects
+  --disable-projects          Disable projects
+  --enable-discussions        Enable discussions
+  --disable-discussions       Disable discussions
+  --enable-auto-merge         Enable auto-merge
+  --disable-auto-merge        Disable auto-merge
+  --enable-delete-branch      Enable delete branch on merge
+  --disable-delete-branch     Disable delete branch on merge
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --language LANG         Filter by primary language
+  --topic TOPIC           Filter by topic
+  --pattern PATTERN       Filter by repo name (grep regex)
+  --dry-run               Preview changes without applying
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers bulk-settings --disable-wiki --language TypeScript --dry-run
+  github-helpers bulk-settings --enable-delete-branch --enable-auto-merge --org my-company
+  github-helpers bulk-settings --disable-projects --disable-wiki --topic archived --dry-run
+EOF
+  exit 0
+}
+
+cmd_bulk_settings_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)                   BULK_SETTINGS_TARGET="$2"; BULK_SETTINGS_TARGET_TYPE="user"; shift 2 ;;
+      --org)                    BULK_SETTINGS_TARGET="$2"; BULK_SETTINGS_TARGET_TYPE="org"; shift 2 ;;
+      --language)               BULK_SETTINGS_LANGUAGE="$2"; shift 2 ;;
+      --topic)                  BULK_SETTINGS_TOPIC="$2"; shift 2 ;;
+      --pattern)                BULK_SETTINGS_PATTERN="$2"; shift 2 ;;
+      --enable-wiki)            BULK_SETTINGS_WIKI=true; shift ;;
+      --disable-wiki)           BULK_SETTINGS_WIKI=false; shift ;;
+      --enable-issues)          BULK_SETTINGS_ISSUES=true; shift ;;
+      --disable-issues)         BULK_SETTINGS_ISSUES=false; shift ;;
+      --enable-projects)        BULK_SETTINGS_PROJECTS=true; shift ;;
+      --disable-projects)       BULK_SETTINGS_PROJECTS=false; shift ;;
+      --enable-discussions)     BULK_SETTINGS_DISCUSSIONS=true; shift ;;
+      --disable-discussions)    BULK_SETTINGS_DISCUSSIONS=false; shift ;;
+      --enable-auto-merge)      BULK_SETTINGS_AUTO_MERGE=true; shift ;;
+      --disable-auto-merge)     BULK_SETTINGS_AUTO_MERGE=false; shift ;;
+      --enable-delete-branch)   BULK_SETTINGS_DELETE_BRANCH=true; shift ;;
+      --disable-delete-branch)  BULK_SETTINGS_DELETE_BRANCH=false; shift ;;
+      --dry-run)                DRY_RUN=true; shift ;;
+      -y|--yes)                 AUTO_YES=true; shift ;;
+      -v|--verbose)             VERBOSE=true; shift ;;
+      -h|--help)                cmd_bulk_settings_usage ;;
+      *) die "bulk-settings: unknown option: $1" ;;
+    esac
+  done
+
+  if [ -z "$BULK_SETTINGS_WIKI" ] && [ -z "$BULK_SETTINGS_ISSUES" ] && \
+     [ -z "$BULK_SETTINGS_PROJECTS" ] && [ -z "$BULK_SETTINGS_DISCUSSIONS" ] && \
+     [ -z "$BULK_SETTINGS_AUTO_MERGE" ] && [ -z "$BULK_SETTINGS_DELETE_BRANCH" ]; then
+    die "bulk-settings: at least one --enable-* or --disable-* flag is required"
+  fi
+}
+
+cmd_bulk_settings_main() {
+  cmd_bulk_settings_parse_args "$@"
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}Bulk Settings${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+
+  echo -e "  ${BOLD}Changes:${NC}"
+  [ -n "$BULK_SETTINGS_WIKI" ]          && echo -e "    Wiki:             ${BOLD}${BULK_SETTINGS_WIKI}${NC}"
+  [ -n "$BULK_SETTINGS_ISSUES" ]        && echo -e "    Issues:           ${BOLD}${BULK_SETTINGS_ISSUES}${NC}"
+  [ -n "$BULK_SETTINGS_PROJECTS" ]      && echo -e "    Projects:         ${BOLD}${BULK_SETTINGS_PROJECTS}${NC}"
+  [ -n "$BULK_SETTINGS_DISCUSSIONS" ]   && echo -e "    Discussions:      ${BOLD}${BULK_SETTINGS_DISCUSSIONS}${NC}"
+  [ -n "$BULK_SETTINGS_AUTO_MERGE" ]    && echo -e "    Auto-merge:       ${BOLD}${BULK_SETTINGS_AUTO_MERGE}${NC}"
+  [ -n "$BULK_SETTINGS_DELETE_BRANCH" ] && echo -e "    Delete branch:    ${BOLD}${BULK_SETTINGS_DELETE_BRANCH}${NC}"
+  if $DRY_RUN; then
+    echo -e "  Mode: ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  if [ -z "$BULK_SETTINGS_TARGET" ]; then
+    BULK_SETTINGS_TARGET=$(get_username)
+    BULK_SETTINGS_TARGET_TYPE="user"
+  fi
+  echo -e "  Target: ${BOLD}${BULK_SETTINGS_TARGET}${NC}"
+  echo ""
+
+  echo -e "${DIM}Fetching repos...${NC}"
+  local -a flags=("--json" "nameWithOwner" "--source" "--no-archived" "--limit" "9999")
+  [ -n "$BULK_SETTINGS_LANGUAGE" ] && flags+=("--language" "$BULK_SETTINGS_LANGUAGE")
+  [ -n "$BULK_SETTINGS_TOPIC" ]    && flags+=("--topic" "$BULK_SETTINGS_TOPIC")
+
+  local repo_list
+  repo_list=$(gh repo list "$BULK_SETTINGS_TARGET" "${flags[@]}" 2>/dev/null \
+    | jq -r '.[].nameWithOwner') || die "Failed to list repos"
+
+  if [ -n "$BULK_SETTINGS_PATTERN" ]; then
+    repo_list=$(echo "$repo_list" | grep -E "$BULK_SETTINGS_PATTERN" || true)
+  fi
+
+  local total
+  total=$(echo "$repo_list" | grep -c '.' || echo "0")
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No repos found.${NC}"
+    exit 0
+  fi
+
+  echo -e "Found ${BOLD}${total}${NC} repos"
+  echo ""
+
+  if ! $DRY_RUN && ! $AUTO_YES; then
+    read -rp "Apply settings to ${total} repos? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+    echo ""
+  fi
+
+  # Build API args (use -F for JSON booleans)
+  local -a api_args=()
+  [ -n "$BULK_SETTINGS_WIKI" ]          && api_args+=("-F" "has_wiki=${BULK_SETTINGS_WIKI}")
+  [ -n "$BULK_SETTINGS_ISSUES" ]        && api_args+=("-F" "has_issues=${BULK_SETTINGS_ISSUES}")
+  [ -n "$BULK_SETTINGS_PROJECTS" ]      && api_args+=("-F" "has_projects=${BULK_SETTINGS_PROJECTS}")
+  [ -n "$BULK_SETTINGS_DISCUSSIONS" ]   && api_args+=("-F" "has_discussions=${BULK_SETTINGS_DISCUSSIONS}")
+  [ -n "$BULK_SETTINGS_AUTO_MERGE" ]    && api_args+=("-F" "allow_auto_merge=${BULK_SETTINGS_AUTO_MERGE}")
+  [ -n "$BULK_SETTINGS_DELETE_BRANCH" ] && api_args+=("-F" "delete_branch_on_merge=${BULK_SETTINGS_DELETE_BRANCH}")
+
+  local success=0 fail=0
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+
+    if $DRY_RUN; then
+      echo -e "  ${YELLOW}WOULD UPDATE${NC} ${nwo}"
+      continue
+    fi
+
+    if gh api -X PATCH "repos/${nwo}" "${api_args[@]}" &>/dev/null; then
+      success=$((success + 1))
+      echo -e "  ${GREEN}UPDATED${NC} ${nwo}"
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC}  ${nwo}"
+    fi
+  done <<< "$repo_list"
+
+  echo ""
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no changes were applied.${NC}"
+  else
+    echo -e "${GREEN}Done!${NC} Updated: ${BOLD}${success}${NC}, Failed: ${BOLD}${fail}${NC}"
+  fi
+}
+
+# =============================================================================
+# COMMAND: webhook-audit
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+WEBHOOK_AUDIT_TARGET=""
+WEBHOOK_AUDIT_TARGET_TYPE=""
+WEBHOOK_AUDIT_REPO=""
+WEBHOOK_AUDIT_LIMIT=9999
+
+cmd_webhook_audit_usage() {
+  cat <<EOF
+${BOLD}github-helpers webhook-audit${NC} ${DIM}v${VERSION}${NC} — List webhooks across repos
+
+${BOLD}USAGE${NC}
+  github-helpers webhook-audit [options]
+
+${BOLD}OPTIONS${NC}
+  --repo OWNER/REPO       Single repo
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --limit N               Max repos to scan (default: all)
+  -v, --verbose           Show event list and last response
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers webhook-audit
+  github-helpers webhook-audit --org my-company -v
+  github-helpers webhook-audit --repo myuser/myrepo
+EOF
+  exit 0
+}
+
+cmd_webhook_audit_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)      WEBHOOK_AUDIT_REPO="$2"; shift 2 ;;
+      --user)      WEBHOOK_AUDIT_TARGET="$2"; WEBHOOK_AUDIT_TARGET_TYPE="user"; shift 2 ;;
+      --org)       WEBHOOK_AUDIT_TARGET="$2"; WEBHOOK_AUDIT_TARGET_TYPE="org"; shift 2 ;;
+      --limit)     WEBHOOK_AUDIT_LIMIT="$2"; shift 2 ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)   cmd_webhook_audit_usage ;;
+      *) die "webhook-audit: unknown option: $1" ;;
+    esac
+  done
+}
+
+cmd_webhook_audit_main() {
+  cmd_webhook_audit_parse_args "$@"
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}Webhook Audit${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+
+  local repo_list
+  if [ -n "$WEBHOOK_AUDIT_REPO" ]; then
+    repo_list="$WEBHOOK_AUDIT_REPO"
+    echo -e "  Repo: ${BOLD}${WEBHOOK_AUDIT_REPO}${NC}"
+  else
+    if [ -z "$WEBHOOK_AUDIT_TARGET" ]; then
+      WEBHOOK_AUDIT_TARGET=$(get_username)
+      WEBHOOK_AUDIT_TARGET_TYPE="user"
+    fi
+    echo -e "  Target: ${BOLD}${WEBHOOK_AUDIT_TARGET}${NC}"
+    echo ""
+    echo -e "${DIM}Fetching repos...${NC}"
+    repo_list=$(gh repo list "$WEBHOOK_AUDIT_TARGET" --json nameWithOwner --source --no-archived --limit "${WEBHOOK_AUDIT_LIMIT:-9999}" 2>/dev/null \
+      | jq -r '.[].nameWithOwner') || die "Failed to list repos"
+  fi
+  echo ""
+
+  local total_repos=0 repos_with_hooks=0 total_hooks=0 inactive_hooks=0
+
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    total_repos=$((total_repos + 1))
+
+    local hooks_json
+    hooks_json=$(gh api "repos/${nwo}/hooks" 2>/dev/null || echo "[]")
+
+    local hook_count
+    hook_count=$(echo "$hooks_json" | jq 'if type == "array" then length else 0 end')
+
+    if [ "$hook_count" -eq 0 ]; then
+      $VERBOSE && echo -e "  ${DIM}${nwo}: no webhooks${NC}"
+      continue
+    fi
+
+    repos_with_hooks=$((repos_with_hooks + 1))
+    total_hooks=$((total_hooks + hook_count))
+
+    # Count inactive hooks via jq (avoids subshell counter issue)
+    local repo_inactive
+    repo_inactive=$(echo "$hooks_json" | jq '[.[] | select(.active == false or (.last_response.code != null and .last_response.code != 200 and .last_response.code != 0))] | length')
+    inactive_hooks=$((inactive_hooks + repo_inactive))
+
+    echo -e "  ${BOLD}${nwo}${NC} ${DIM}(${hook_count} hooks)${NC}"
+
+    echo "$hooks_json" | jq -c '.[]' | while IFS= read -r hook; do
+      local url active last_status
+      url=$(echo "$hook" | jq -r '.config.url // "unknown"')
+      active=$(echo "$hook" | jq -r '.active')
+      last_status=$(echo "$hook" | jq -r '.last_response.code // 0')
+
+      local status_icon
+      if [ "$active" = "true" ]; then
+        if [ "$last_status" = "200" ] || [ "$last_status" = "0" ]; then
+          status_icon="${GREEN}●${NC}"
+        else
+          status_icon="${YELLOW}●${NC}"
+        fi
+      else
+        status_icon="${RED}●${NC}"
+      fi
+
+      echo -e "    ${status_icon} ${url}"
+      if $VERBOSE; then
+        local events
+        events=$(echo "$hook" | jq -r '.events | join(", ")')
+        echo -e "      ${DIM}Events: ${events}${NC}"
+        echo -e "      ${DIM}Active: ${active}, Last response: ${last_status}${NC}"
+      fi
+    done
+    echo ""
+  done <<< "$repo_list"
+
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "${BOLD}Summary:${NC}"
+  echo -e "  Repos scanned:      ${BOLD}${total_repos}${NC}"
+  echo -e "  Repos with hooks:   ${BOLD}${repos_with_hooks}${NC}"
+  echo -e "  Total webhooks:     ${BOLD}${total_hooks}${NC}"
+  echo -e "  Inactive/failing:   ${YELLOW}${inactive_hooks}${NC}"
+  echo ""
+}
+
+# =============================================================================
+# COMMAND: cleanup-packages
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+CLEANUP_PKG_TARGET=""
+CLEANUP_PKG_TARGET_TYPE=""
+CLEANUP_PKG_TYPE=""
+CLEANUP_PKG_PACKAGE=""
+CLEANUP_PKG_KEEP=5
+
+cmd_cleanup_packages_usage() {
+  cat <<EOF
+${BOLD}github-helpers cleanup-packages${NC} ${DIM}v${VERSION}${NC} — Delete old GitHub Package versions
+
+${BOLD}USAGE${NC}
+  github-helpers cleanup-packages [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --type TYPE             Package type: npm, maven, rubygems, docker, nuget, container (required)
+  --package NAME          Specific package name (default: all)
+  --keep N                Versions to keep per package (default: 5)
+  --dry-run               Preview deletions without applying
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers cleanup-packages --type container --keep 3 --dry-run
+  github-helpers cleanup-packages --org my-company --type npm --keep 10
+  github-helpers cleanup-packages --type container --package myapp --keep 1
+EOF
+  exit 0
+}
+
+cmd_cleanup_packages_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)      CLEANUP_PKG_TARGET="$2"; CLEANUP_PKG_TARGET_TYPE="user"; shift 2 ;;
+      --org)       CLEANUP_PKG_TARGET="$2"; CLEANUP_PKG_TARGET_TYPE="org"; shift 2 ;;
+      --type)      CLEANUP_PKG_TYPE="$2"; shift 2 ;;
+      --package)   CLEANUP_PKG_PACKAGE="$2"; shift 2 ;;
+      --keep)      CLEANUP_PKG_KEEP="$2"; shift 2 ;;
+      --dry-run)   DRY_RUN=true; shift ;;
+      -y|--yes)    AUTO_YES=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)   cmd_cleanup_packages_usage ;;
+      *) die "cleanup-packages: unknown option: $1" ;;
+    esac
+  done
+
+  [ -z "$CLEANUP_PKG_TYPE" ] && die "cleanup-packages: --type is required"
+  ! [[ "$CLEANUP_PKG_KEEP" =~ ^[0-9]+$ ]] && die "cleanup-packages: --keep must be a non-negative number"
+}
+
+cmd_cleanup_packages_main() {
+  cmd_cleanup_packages_parse_args "$@"
+  preflight_check
+
+  if [ -z "$CLEANUP_PKG_TARGET" ]; then
+    CLEANUP_PKG_TARGET=$(get_username)
+    CLEANUP_PKG_TARGET_TYPE="user"
+  fi
+
+  echo -e "${BOLD}${CYAN}Cleanup Packages${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Target: ${BOLD}${CLEANUP_PKG_TARGET}${NC}"
+  echo -e "  Type:   ${BOLD}${CLEANUP_PKG_TYPE}${NC}"
+  echo -e "  Keep:   ${BOLD}${CLEANUP_PKG_KEEP}${NC} versions"
+  if $DRY_RUN; then
+    echo -e "  Mode:   ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  # Build API base path
+  local api_base
+  if [ "$CLEANUP_PKG_TARGET_TYPE" = "org" ]; then
+    api_base="orgs/${CLEANUP_PKG_TARGET}"
+  else
+    api_base="users/${CLEANUP_PKG_TARGET}"
+  fi
+
+  echo -e "${DIM}Fetching packages...${NC}"
+  local packages_json
+  if [ -n "$CLEANUP_PKG_PACKAGE" ]; then
+    packages_json=$(gh api "${api_base}/packages/${CLEANUP_PKG_TYPE}/${CLEANUP_PKG_PACKAGE}" 2>/dev/null \
+      | jq '[.]') || die "Failed to fetch package: ${CLEANUP_PKG_PACKAGE}"
+  else
+    packages_json=$(gh api "${api_base}/packages?package_type=${CLEANUP_PKG_TYPE}&per_page=100" 2>/dev/null) \
+      || die "Failed to list packages"
+  fi
+
+  local pkg_count
+  pkg_count=$(echo "$packages_json" | jq 'length')
+
+  if [ "$pkg_count" -eq 0 ]; then
+    echo -e "${GREEN}No packages found.${NC}"
+    exit 0
+  fi
+
+  echo -e "Found ${BOLD}${pkg_count}${NC} packages"
+  echo ""
+
+  if ! $DRY_RUN && ! $AUTO_YES; then
+    read -rp "Clean up old versions (keeping ${CLEANUP_PKG_KEEP} per package)? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+    echo ""
+  fi
+
+  echo "$packages_json" | jq -r '.[].name' | while IFS= read -r pkg_name; do
+    [ -z "$pkg_name" ] && continue
+
+    # URL-encode package name (replace / with %2F for container packages)
+    local encoded_name="${pkg_name//\//%2F}"
+
+    local versions_json
+    versions_json=$(gh api "${api_base}/packages/${CLEANUP_PKG_TYPE}/${encoded_name}/versions?per_page=100" 2>/dev/null || echo "[]")
+
+    local ver_count
+    ver_count=$(echo "$versions_json" | jq 'length')
+
+    if [ "$ver_count" -le "$CLEANUP_PKG_KEEP" ]; then
+      $VERBOSE && echo -e "  ${DIM}${pkg_name}: ${ver_count} versions (keeping all)${NC}"
+      continue
+    fi
+
+    local to_delete=$((ver_count - CLEANUP_PKG_KEEP))
+    echo -e "  ${BOLD}${pkg_name}${NC}: ${ver_count} versions, deleting ${to_delete}"
+
+    # Versions are returned newest first; skip $KEEP, delete rest
+    echo "$versions_json" | jq -c ".[$CLEANUP_PKG_KEEP:][]" | while IFS= read -r version; do
+      local ver_id ver_name created
+      ver_id=$(echo "$version" | jq -r '.id')
+      ver_name=$(echo "$version" | jq -r '.metadata.container.tags[0] // .name // "unknown"')
+      created=$(echo "$version" | jq -r '.created_at[:10]')
+
+      if $DRY_RUN; then
+        echo -e "    ${YELLOW}WOULD DELETE${NC} ${ver_name} ${DIM}(${created})${NC}"
+      else
+        if gh api -X DELETE "${api_base}/packages/${CLEANUP_PKG_TYPE}/${encoded_name}/versions/${ver_id}" &>/dev/null; then
+          echo -e "    ${GREEN}DELETED${NC} ${ver_name} ${DIM}(${created})${NC}"
+        else
+          echo -e "    ${RED}FAILED${NC}  ${ver_name}"
+        fi
+      fi
+    done
+  done
+
+  echo ""
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no versions were deleted.${NC}"
+  else
+    echo -e "${GREEN}Done!${NC}"
+  fi
+}
+
+# =============================================================================
+# COMMAND: collaborator-audit
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+COLLAB_AUDIT_TARGET=""
+COLLAB_AUDIT_TARGET_TYPE=""
+COLLAB_AUDIT_PERMISSION=""
+COLLAB_AUDIT_LIMIT=9999
+
+cmd_collaborator_audit_usage() {
+  cat <<EOF
+${BOLD}github-helpers collaborator-audit${NC} ${DIM}v${VERSION}${NC} — Audit outside collaborators and permissions
+
+${BOLD}USAGE${NC}
+  github-helpers collaborator-audit [options]
+
+${BOLD}OPTIONS${NC}
+  --org NAME              Target organization
+  --user NAME             Target user
+  --permission LEVEL      Filter: admin, write, read
+  --limit N               Max repos to scan (default: all)
+  -v, --verbose           Show repos with no outside collaborators
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers collaborator-audit --org my-company
+  github-helpers collaborator-audit --org my-company --permission admin
+  github-helpers collaborator-audit --user myuser
+EOF
+  exit 0
+}
+
+cmd_collaborator_audit_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --org)        COLLAB_AUDIT_TARGET="$2"; COLLAB_AUDIT_TARGET_TYPE="org"; shift 2 ;;
+      --user)       COLLAB_AUDIT_TARGET="$2"; COLLAB_AUDIT_TARGET_TYPE="user"; shift 2 ;;
+      --permission) COLLAB_AUDIT_PERMISSION="$2"; shift 2 ;;
+      --limit)      COLLAB_AUDIT_LIMIT="$2"; shift 2 ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)    cmd_collaborator_audit_usage ;;
+      *) die "collaborator-audit: unknown option: $1" ;;
+    esac
+  done
+
+  [ -z "$COLLAB_AUDIT_TARGET" ] && die "collaborator-audit: --org or --user is required"
+}
+
+cmd_collaborator_audit_main() {
+  cmd_collaborator_audit_parse_args "$@"
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}Collaborator Audit${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Target: ${BOLD}${COLLAB_AUDIT_TARGET}${NC}"
+  [ -n "$COLLAB_AUDIT_PERMISSION" ] && echo -e "  Permission: ${BOLD}${COLLAB_AUDIT_PERMISSION}${NC}"
+  echo ""
+
+  echo -e "${DIM}Fetching repos...${NC}"
+  local repo_list
+  repo_list=$(gh repo list "$COLLAB_AUDIT_TARGET" --json nameWithOwner --source --no-archived --limit "${COLLAB_AUDIT_LIMIT:-9999}" 2>/dev/null \
+    | jq -r '.[].nameWithOwner') || die "Failed to list repos"
+  echo ""
+
+  local total_repos=0 repos_with_collabs=0 total_collabs=0
+
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    total_repos=$((total_repos + 1))
+
+    local query="affiliation=outside&per_page=100"
+    [ -n "$COLLAB_AUDIT_PERMISSION" ] && query="${query}&permission=${COLLAB_AUDIT_PERMISSION}"
+
+    local collabs_json
+    collabs_json=$(gh api "repos/${nwo}/collaborators?${query}" 2>/dev/null || echo "[]")
+
+    local collab_count
+    collab_count=$(echo "$collabs_json" | jq 'if type == "array" then length else 0 end')
+
+    if [ "$collab_count" -eq 0 ]; then
+      $VERBOSE && echo -e "  ${DIM}${nwo}: no outside collaborators${NC}"
+      continue
+    fi
+
+    repos_with_collabs=$((repos_with_collabs + 1))
+    total_collabs=$((total_collabs + collab_count))
+
+    echo -e "  ${BOLD}${nwo}${NC} ${DIM}(${collab_count} collaborators)${NC}"
+
+    echo "$collabs_json" | jq -c '.[]' | while IFS= read -r collab; do
+      local login role_name
+      login=$(echo "$collab" | jq -r '.login')
+      role_name=$(echo "$collab" | jq -r '.role_name // "unknown"')
+
+      local perm_color
+      case "$role_name" in
+        admin) perm_color="$RED" ;;
+        write|maintain) perm_color="$YELLOW" ;;
+        *)     perm_color="$DIM" ;;
+      esac
+
+      echo -e "    ${perm_color}${role_name}${NC}\t${login}"
+    done
+    echo ""
+  done <<< "$repo_list"
+
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "${BOLD}Summary:${NC}"
+  echo -e "  Repos scanned:            ${BOLD}${total_repos}${NC}"
+  echo -e "  Repos with collaborators: ${BOLD}${repos_with_collabs}${NC}"
+  echo -e "  Total collaborators:      ${BOLD}${total_collabs}${NC}"
+  echo ""
+}
+
+# =============================================================================
+# COMMAND: repo-template
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+REPO_TEMPLATE_FROM=""
+REPO_TEMPLATE_TARGET=""
+REPO_TEMPLATE_TARGET_TYPE=""
+REPO_TEMPLATE_LANGUAGE=""
+REPO_TEMPLATE_TOPIC=""
+REPO_TEMPLATE_SYNC_SETTINGS=false
+REPO_TEMPLATE_SYNC_LABELS=false
+REPO_TEMPLATE_SYNC_PROTECTION=false
+
+cmd_repo_template_usage() {
+  cat <<EOF
+${BOLD}github-helpers repo-template${NC} ${DIM}v${VERSION}${NC} — Sync settings from a template repo
+
+${BOLD}USAGE${NC}
+  github-helpers repo-template --from OWNER/REPO [options]
+
+${BOLD}OPTIONS${NC}
+  --from OWNER/REPO       Template repo to copy from (required)
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --language LANG         Filter target repos by language
+  --topic TOPIC           Filter target repos by topic
+  --sync-settings         Sync repo settings (wiki, issues, projects, etc.)
+  --sync-labels           Sync issue labels
+  --sync-protection       Sync branch protection rules
+  --all                   Sync everything (settings + labels + protection)
+  --dry-run               Preview changes without applying
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers repo-template --from myuser/template --sync-labels --dry-run
+  github-helpers repo-template --from myuser/template --all --org my-company
+  github-helpers repo-template --from myuser/template --sync-settings --topic typescript
+EOF
+  exit 0
+}
+
+cmd_repo_template_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)            REPO_TEMPLATE_FROM="$2"; shift 2 ;;
+      --user)            REPO_TEMPLATE_TARGET="$2"; REPO_TEMPLATE_TARGET_TYPE="user"; shift 2 ;;
+      --org)             REPO_TEMPLATE_TARGET="$2"; REPO_TEMPLATE_TARGET_TYPE="org"; shift 2 ;;
+      --language)        REPO_TEMPLATE_LANGUAGE="$2"; shift 2 ;;
+      --topic)           REPO_TEMPLATE_TOPIC="$2"; shift 2 ;;
+      --sync-settings)   REPO_TEMPLATE_SYNC_SETTINGS=true; shift ;;
+      --sync-labels)     REPO_TEMPLATE_SYNC_LABELS=true; shift ;;
+      --sync-protection) REPO_TEMPLATE_SYNC_PROTECTION=true; shift ;;
+      --all)             REPO_TEMPLATE_SYNC_SETTINGS=true; REPO_TEMPLATE_SYNC_LABELS=true; REPO_TEMPLATE_SYNC_PROTECTION=true; shift ;;
+      --dry-run)         DRY_RUN=true; shift ;;
+      -y|--yes)          AUTO_YES=true; shift ;;
+      -v|--verbose)      VERBOSE=true; shift ;;
+      -h|--help)         cmd_repo_template_usage ;;
+      *) die "repo-template: unknown option: $1" ;;
+    esac
+  done
+
+  [ -z "$REPO_TEMPLATE_FROM" ] && die "repo-template: --from is required"
+
+  if ! $REPO_TEMPLATE_SYNC_SETTINGS && ! $REPO_TEMPLATE_SYNC_LABELS && ! $REPO_TEMPLATE_SYNC_PROTECTION; then
+    die "repo-template: at least one --sync-* flag or --all is required"
+  fi
+}
+
+cmd_repo_template_main() {
+  cmd_repo_template_parse_args "$@"
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}Repo Template${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Template: ${BOLD}${REPO_TEMPLATE_FROM}${NC}"
+  echo -e "  Sync:"
+  $REPO_TEMPLATE_SYNC_SETTINGS   && echo -e "    ${BOLD}settings${NC}"
+  $REPO_TEMPLATE_SYNC_LABELS     && echo -e "    ${BOLD}labels${NC}"
+  $REPO_TEMPLATE_SYNC_PROTECTION && echo -e "    ${BOLD}branch protection${NC}"
+  if $DRY_RUN; then
+    echo -e "  Mode: ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  # Fetch template repo config
+  echo -e "${DIM}Reading template repo...${NC}"
+
+  local template_settings="" template_labels="" template_protection=""
+
+  if $REPO_TEMPLATE_SYNC_SETTINGS; then
+    template_settings=$(gh api "repos/${REPO_TEMPLATE_FROM}" --jq '{
+      has_wiki, has_issues, has_projects, has_discussions,
+      allow_auto_merge, delete_branch_on_merge, allow_squash_merge,
+      allow_merge_commit, allow_rebase_merge
+    }' 2>/dev/null) || die "Failed to fetch template settings"
+    $VERBOSE && echo -e "  ${DIM}Settings loaded${NC}"
+  fi
+
+  if $REPO_TEMPLATE_SYNC_LABELS; then
+    template_labels=$(gh api "repos/${REPO_TEMPLATE_FROM}/labels" --paginate 2>/dev/null) \
+      || die "Failed to fetch template labels"
+    local label_count
+    label_count=$(echo "$template_labels" | jq 'length')
+    $VERBOSE && echo -e "  ${DIM}${label_count} labels loaded${NC}"
+  fi
+
+  if $REPO_TEMPLATE_SYNC_PROTECTION; then
+    local template_branch
+    template_branch=$(gh api "repos/${REPO_TEMPLATE_FROM}" --jq '.default_branch' 2>/dev/null)
+    template_protection=$(gh api "repos/${REPO_TEMPLATE_FROM}/branches/${template_branch}/protection" 2>/dev/null) || {
+      echo -e "  ${YELLOW}Warning: template repo has no branch protection rules${NC}"
+      REPO_TEMPLATE_SYNC_PROTECTION=false
+    }
+  fi
+  echo ""
+
+  # Get target repos
+  if [ -z "$REPO_TEMPLATE_TARGET" ]; then
+    REPO_TEMPLATE_TARGET=$(get_username)
+    REPO_TEMPLATE_TARGET_TYPE="user"
+  fi
+
+  echo -e "  Target: ${BOLD}${REPO_TEMPLATE_TARGET}${NC}"
+  echo ""
+
+  local -a flags=("--json" "nameWithOwner" "--source" "--no-archived" "--limit" "9999")
+  [ -n "$REPO_TEMPLATE_LANGUAGE" ] && flags+=("--language" "$REPO_TEMPLATE_LANGUAGE")
+  [ -n "$REPO_TEMPLATE_TOPIC" ]    && flags+=("--topic" "$REPO_TEMPLATE_TOPIC")
+
+  local repo_list
+  repo_list=$(gh repo list "$REPO_TEMPLATE_TARGET" "${flags[@]}" 2>/dev/null \
+    | jq -r '.[].nameWithOwner') || die "Failed to list repos"
+
+  # Exclude template repo itself
+  repo_list=$(echo "$repo_list" | grep -v "^${REPO_TEMPLATE_FROM}$" || true)
+
+  local total
+  total=$(echo "$repo_list" | grep -c '.' || echo "0")
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No target repos found.${NC}"
+    exit 0
+  fi
+
+  echo -e "Found ${BOLD}${total}${NC} target repos"
+  echo ""
+
+  if ! $DRY_RUN && ! $AUTO_YES; then
+    read -rp "Apply template to ${total} repos? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+    echo ""
+  fi
+
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    echo -e "  ${BOLD}${nwo}${NC}"
+
+    # Sync settings
+    if $REPO_TEMPLATE_SYNC_SETTINGS; then
+      if $DRY_RUN; then
+        echo -e "    ${YELLOW}WOULD SYNC${NC} settings"
+      else
+        if gh api -X PATCH "repos/${nwo}" --input - <<< "$template_settings" &>/dev/null; then
+          echo -e "    ${GREEN}SYNCED${NC} settings"
+        else
+          echo -e "    ${RED}FAILED${NC} settings"
+        fi
+      fi
+    fi
+
+    # Sync labels
+    if $REPO_TEMPLATE_SYNC_LABELS; then
+      if $DRY_RUN; then
+        echo -e "    ${YELLOW}WOULD SYNC${NC} labels"
+      else
+        echo "$template_labels" | jq -c '.[]' | while IFS= read -r label; do
+          local lname lcolor ldesc
+          lname=$(echo "$label" | jq -r '.name')
+          lcolor=$(echo "$label" | jq -r '.color')
+          ldesc=$(echo "$label" | jq -r '.description // ""')
+
+          # URL-encode label name for API path (spaces, special chars)
+          local encoded_lname
+          encoded_lname=$(printf '%s' "$lname" | jq -sRr @uri)
+
+          # Try to update first, then create
+          if ! gh api -X PATCH "repos/${nwo}/labels/${encoded_lname}" \
+            -f color="$lcolor" -f description="$ldesc" &>/dev/null; then
+            gh api -X POST "repos/${nwo}/labels" \
+              -f name="$lname" -f color="$lcolor" -f description="$ldesc" &>/dev/null || true
+          fi
+        done
+        echo -e "    ${GREEN}SYNCED${NC} labels"
+      fi
+    fi
+
+    # Sync branch protection
+    if $REPO_TEMPLATE_SYNC_PROTECTION; then
+      local target_branch
+      target_branch=$(gh api "repos/${nwo}" --jq '.default_branch' 2>/dev/null)
+
+      if $DRY_RUN; then
+        echo -e "    ${YELLOW}WOULD SYNC${NC} branch protection (${target_branch})"
+      else
+        local prot_payload
+        prot_payload=$(echo "$template_protection" | jq '{
+          required_pull_request_reviews: (if .required_pull_request_reviews then {
+            required_approving_review_count: .required_pull_request_reviews.required_approving_review_count,
+            dismiss_stale_reviews: .required_pull_request_reviews.dismiss_stale_reviews
+          } else null end),
+          required_status_checks: (if .required_status_checks then {
+            strict: .required_status_checks.strict,
+            contexts: .required_status_checks.contexts
+          } else null end),
+          enforce_admins: .enforce_admins.enabled,
+          restrictions: null,
+          allow_force_pushes: .allow_force_pushes.enabled,
+          allow_deletions: .allow_deletions.enabled
+        }')
+
+        if gh api -X PUT "repos/${nwo}/branches/${target_branch}/protection" --input - <<< "$prot_payload" &>/dev/null; then
+          echo -e "    ${GREEN}SYNCED${NC} branch protection (${target_branch})"
+        else
+          echo -e "    ${RED}FAILED${NC} branch protection"
+        fi
+      fi
+    fi
+  done <<< "$repo_list"
+
+  echo ""
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no changes were applied.${NC}"
+  else
+    echo -e "${GREEN}Done!${NC}"
+  fi
+}
+
+# =============================================================================
+# COMMAND: pr-cleanup
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+PR_CLEANUP_TARGET=""
+PR_CLEANUP_TARGET_TYPE=""
+PR_CLEANUP_REPO=""
+PR_CLEANUP_DAYS=90
+PR_CLEANUP_DRAFT_ONLY=false
+PR_CLEANUP_CLOSE=false
+PR_CLEANUP_COMMENT=""
+PR_CLEANUP_DELETE_BRANCH=false
+
+cmd_pr_cleanup_usage() {
+  cat <<EOF
+${BOLD}github-helpers pr-cleanup${NC} ${DIM}v${VERSION}${NC} — Find and close abandoned pull requests
+
+${BOLD}USAGE${NC}
+  github-helpers pr-cleanup [options]
+
+${BOLD}OPTIONS${NC}
+  --repo OWNER/REPO       Single repo
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --days N                Days without activity (default: 90)
+  --draft-only            Only target draft PRs
+  --close                 Close abandoned PRs
+  --comment TEXT           Comment before closing (requires --close)
+  --delete-branch         Delete head branch after closing
+  --dry-run               Preview actions without applying
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers pr-cleanup --repo myuser/myrepo --days 60
+  github-helpers pr-cleanup --org my-company --draft-only --days 30
+  github-helpers pr-cleanup --repo myuser/myrepo --close --delete-branch --dry-run
+EOF
+  exit 0
+}
+
+cmd_pr_cleanup_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)           PR_CLEANUP_REPO="$2"; shift 2 ;;
+      --user)           PR_CLEANUP_TARGET="$2"; PR_CLEANUP_TARGET_TYPE="user"; shift 2 ;;
+      --org)            PR_CLEANUP_TARGET="$2"; PR_CLEANUP_TARGET_TYPE="org"; shift 2 ;;
+      --days)           PR_CLEANUP_DAYS="$2"; shift 2 ;;
+      --draft-only)     PR_CLEANUP_DRAFT_ONLY=true; shift ;;
+      --close)          PR_CLEANUP_CLOSE=true; shift ;;
+      --comment)        PR_CLEANUP_COMMENT="$2"; shift 2 ;;
+      --delete-branch)  PR_CLEANUP_DELETE_BRANCH=true; shift ;;
+      --dry-run)        DRY_RUN=true; shift ;;
+      -y|--yes)         AUTO_YES=true; shift ;;
+      -v|--verbose)     VERBOSE=true; shift ;;
+      -h|--help)        cmd_pr_cleanup_usage ;;
+      *) die "pr-cleanup: unknown option: $1" ;;
+    esac
+  done
+}
+
+cmd_pr_cleanup_process_repo() {
+  local nwo="$1"
+  local cutoff_date="$2"
+
+  local prs_json
+  prs_json=$(gh pr list --repo "$nwo" --state open --json number,title,updatedAt,isDraft,headRefName --limit 200 2>/dev/null || echo "[]")
+
+  # Filter by date and optionally by draft status
+  local filter
+  if $PR_CLEANUP_DRAFT_ONLY; then
+    filter='select(.updatedAt < $cutoff and .isDraft == true)'
+  else
+    filter='select(.updatedAt < $cutoff)'
+  fi
+
+  local stale_prs
+  stale_prs=$(echo "$prs_json" | jq -c --arg cutoff "$cutoff_date" "[.[] | ${filter}]")
+
+  local stale_count
+  stale_count=$(echo "$stale_prs" | jq 'length')
+
+  if [ "$stale_count" -eq 0 ]; then
+    $VERBOSE && echo -e "    ${DIM}no stale PRs${NC}"
+    return
+  fi
+
+  echo "$stale_prs" | jq -c '.[]' | while IFS= read -r pr; do
+    local number title updated is_draft head_branch
+    number=$(echo "$pr" | jq -r '.number')
+    title=$(echo "$pr" | jq -r '.title')
+    updated=$(echo "$pr" | jq -r '.updatedAt[:10]')
+    is_draft=$(echo "$pr" | jq -r '.isDraft')
+    head_branch=$(echo "$pr" | jq -r '.headRefName')
+
+    local draft_label=""
+    [ "$is_draft" = "true" ] && draft_label=" ${DIM}[draft]${NC}"
+
+    if $PR_CLEANUP_CLOSE; then
+      if $DRY_RUN; then
+        echo -e "    ${YELLOW}WOULD CLOSE${NC} #${number}${draft_label} ${DIM}(${updated})${NC} ${title}"
+        $PR_CLEANUP_DELETE_BRANCH && echo -e "      ${YELLOW}WOULD DELETE${NC} branch ${head_branch}"
+      else
+        [ -n "$PR_CLEANUP_COMMENT" ] && gh pr comment "$number" --repo "$nwo" --body "$PR_CLEANUP_COMMENT" &>/dev/null
+        if gh pr close "$number" --repo "$nwo" &>/dev/null; then
+          echo -e "    ${GREEN}CLOSED${NC} #${number}${draft_label} ${DIM}(${updated})${NC} ${title}"
+          if $PR_CLEANUP_DELETE_BRANCH; then
+            if gh api -X DELETE "repos/${nwo}/git/refs/heads/${head_branch}" &>/dev/null; then
+              echo -e "      ${GREEN}DELETED${NC} branch ${head_branch}"
+            else
+              echo -e "      ${DIM}branch ${head_branch} not deleted (may be from fork)${NC}"
+            fi
+          fi
+        else
+          echo -e "    ${RED}FAILED${NC} #${number} ${title}"
+        fi
+      fi
+    else
+      echo -e "    ${DIM}#${number}${NC}${draft_label} ${title} ${DIM}(last activity ${updated})${NC}"
+    fi
+  done
+}
+
+cmd_pr_cleanup_main() {
+  cmd_pr_cleanup_parse_args "$@"
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}PR Cleanup${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Stale after: ${BOLD}${PR_CLEANUP_DAYS}${NC} days"
+  $PR_CLEANUP_DRAFT_ONLY && echo -e "  Filter:      ${BOLD}draft only${NC}"
+  if $PR_CLEANUP_CLOSE; then
+    echo -e "  Action:      ${YELLOW}close${NC}"
+    $PR_CLEANUP_DELETE_BRANCH && echo -e "  Branches:    ${YELLOW}delete${NC}"
+  else
+    echo -e "  Action:      ${BOLD}list only${NC}"
+  fi
+  if $DRY_RUN; then
+    echo -e "  Mode:        ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  # Calculate cutoff date
+  local cutoff_date
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    cutoff_date=$(date -v-"${PR_CLEANUP_DAYS}"d -u +"%Y-%m-%dT%H:%M:%SZ")
+  else
+    cutoff_date=$(date -u -d "${PR_CLEANUP_DAYS} days ago" +"%Y-%m-%dT%H:%M:%SZ")
+  fi
+
+  local repo_list
+  if [ -n "$PR_CLEANUP_REPO" ]; then
+    repo_list="$PR_CLEANUP_REPO"
+  else
+    if [ -z "$PR_CLEANUP_TARGET" ]; then
+      PR_CLEANUP_TARGET=$(get_username)
+      PR_CLEANUP_TARGET_TYPE="user"
+    fi
+    echo -e "  Target: ${BOLD}${PR_CLEANUP_TARGET}${NC}"
+    echo ""
+    echo -e "${DIM}Fetching repos...${NC}"
+    repo_list=$(gh repo list "$PR_CLEANUP_TARGET" --json nameWithOwner --source --no-archived --limit 9999 2>/dev/null \
+      | jq -r '.[].nameWithOwner') || die "Failed to list repos"
+  fi
+  echo ""
+
+  if $PR_CLEANUP_CLOSE && ! $DRY_RUN && ! $AUTO_YES; then
+    read -rp "Close stale PRs? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+    echo ""
+  fi
+
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    echo -e "  ${BOLD}${nwo}${NC}"
+    cmd_pr_cleanup_process_repo "$nwo" "$cutoff_date"
+  done <<< "$repo_list"
+
+  echo ""
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no changes were applied.${NC}"
+  else
+    echo -e "${GREEN}Done!${NC}"
+  fi
+}
+
+# =============================================================================
+# COMMAND: activity-report
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+ACTIVITY_REPORT_TARGET=""
+ACTIVITY_REPORT_TARGET_TYPE=""
+ACTIVITY_REPORT_SINCE=""
+ACTIVITY_REPORT_UNTIL=""
+ACTIVITY_REPORT_FORMAT="text"
+
+cmd_activity_report_usage() {
+  cat <<EOF
+${BOLD}github-helpers activity-report${NC} ${DIM}v${VERSION}${NC} — Generate activity summary for a period
+
+${BOLD}USAGE${NC}
+  github-helpers activity-report [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --since DATE            Start date YYYY-MM-DD (default: 30 days ago)
+  --until DATE            End date YYYY-MM-DD (default: today)
+  --format FORMAT         Output: text, json, csv (default: text)
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers activity-report
+  github-helpers activity-report --org my-company --since 2025-01-01
+  github-helpers activity-report --since 2025-06-01 --until 2025-06-30 --format json
+  github-helpers activity-report --user octocat --format csv
+EOF
+  exit 0
+}
+
+cmd_activity_report_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)    ACTIVITY_REPORT_TARGET="$2"; ACTIVITY_REPORT_TARGET_TYPE="user"; shift 2 ;;
+      --org)     ACTIVITY_REPORT_TARGET="$2"; ACTIVITY_REPORT_TARGET_TYPE="org"; shift 2 ;;
+      --since)   ACTIVITY_REPORT_SINCE="$2"; shift 2 ;;
+      --until)   ACTIVITY_REPORT_UNTIL="$2"; shift 2 ;;
+      --format)  ACTIVITY_REPORT_FORMAT="$2"; shift 2 ;;
+      -h|--help) cmd_activity_report_usage ;;
+      *) die "activity-report: unknown option: $1" ;;
+    esac
+  done
+}
+
+cmd_activity_report_main() {
+  cmd_activity_report_parse_args "$@"
+  preflight_check
+
+  if [ -z "$ACTIVITY_REPORT_TARGET" ]; then
+    ACTIVITY_REPORT_TARGET=$(get_username)
+    ACTIVITY_REPORT_TARGET_TYPE="user"
+  fi
+
+  # Default dates
+  if [ -z "$ACTIVITY_REPORT_SINCE" ]; then
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      ACTIVITY_REPORT_SINCE=$(date -v-30d +"%Y-%m-%d")
+    else
+      ACTIVITY_REPORT_SINCE=$(date -d "30 days ago" +"%Y-%m-%d")
+    fi
+  fi
+  [ -z "$ACTIVITY_REPORT_UNTIL" ] && ACTIVITY_REPORT_UNTIL=$(date +"%Y-%m-%d")
+
+  if [ "$ACTIVITY_REPORT_FORMAT" = "text" ]; then
+    echo -e "${BOLD}${CYAN}Activity Report${NC} ${DIM}v${VERSION}${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────${NC}"
+    echo -e "  Target: ${BOLD}${ACTIVITY_REPORT_TARGET}${NC}"
+    echo -e "  Period: ${BOLD}${ACTIVITY_REPORT_SINCE}${NC} → ${BOLD}${ACTIVITY_REPORT_UNTIL}${NC}"
+    echo ""
+    echo -e "${DIM}Fetching activity data...${NC}"
+  fi
+
+  # Build search qualifier
+  local search_target
+  if [ "$ACTIVITY_REPORT_TARGET_TYPE" = "org" ]; then
+    search_target="org:${ACTIVITY_REPORT_TARGET}"
+  else
+    search_target="author:${ACTIVITY_REPORT_TARGET}"
+  fi
+
+  # Count repos (total + active)
+  local repos_json
+  repos_json=$(gh repo list "$ACTIVITY_REPORT_TARGET" --json nameWithOwner,pushedAt --source --no-archived --limit 9999 2>/dev/null) || repos_json="[]"
+  local total_repos active_repos
+  total_repos=$(echo "$repos_json" | jq 'length')
+  active_repos=$(echo "$repos_json" | jq --arg since "${ACTIVITY_REPORT_SINCE}T00:00:00Z" '[.[] | select(.pushedAt >= $since)] | length')
+
+  # PRs opened
+  local prs_opened
+  prs_opened=$(gh api "search/issues?q=${search_target}+is:pr+created:${ACTIVITY_REPORT_SINCE}..${ACTIVITY_REPORT_UNTIL}&per_page=1" 2>/dev/null \
+    | jq '.total_count // 0' || echo "0")
+
+  # PRs merged
+  local prs_merged
+  prs_merged=$(gh api "search/issues?q=${search_target}+is:pr+is:merged+merged:${ACTIVITY_REPORT_SINCE}..${ACTIVITY_REPORT_UNTIL}&per_page=1" 2>/dev/null \
+    | jq '.total_count // 0' || echo "0")
+
+  # Issues opened
+  local issues_opened
+  issues_opened=$(gh api "search/issues?q=${search_target}+is:issue+created:${ACTIVITY_REPORT_SINCE}..${ACTIVITY_REPORT_UNTIL}&per_page=1" 2>/dev/null \
+    | jq '.total_count // 0' || echo "0")
+
+  # Issues closed
+  local issues_closed
+  issues_closed=$(gh api "search/issues?q=${search_target}+is:issue+is:closed+closed:${ACTIVITY_REPORT_SINCE}..${ACTIVITY_REPORT_UNTIL}&per_page=1" 2>/dev/null \
+    | jq '.total_count // 0' || echo "0")
+
+  case "$ACTIVITY_REPORT_FORMAT" in
+    json)
+      jq -n \
+        --arg target "$ACTIVITY_REPORT_TARGET" \
+        --arg since "$ACTIVITY_REPORT_SINCE" \
+        --arg until "$ACTIVITY_REPORT_UNTIL" \
+        --argjson total_repos "$total_repos" \
+        --argjson active_repos "$active_repos" \
+        --argjson prs_opened "$prs_opened" \
+        --argjson prs_merged "$prs_merged" \
+        --argjson issues_opened "$issues_opened" \
+        --argjson issues_closed "$issues_closed" \
+        '{
+          target: $target,
+          period: { since: $since, until: $until },
+          repos: { total: $total_repos, active: $active_repos },
+          pull_requests: { opened: $prs_opened, merged: $prs_merged },
+          issues: { opened: $issues_opened, closed: $issues_closed }
+        }'
+      ;;
+    csv)
+      echo "metric,value"
+      echo "target,${ACTIVITY_REPORT_TARGET}"
+      echo "period_since,${ACTIVITY_REPORT_SINCE}"
+      echo "period_until,${ACTIVITY_REPORT_UNTIL}"
+      echo "total_repos,${total_repos}"
+      echo "active_repos,${active_repos}"
+      echo "prs_opened,${prs_opened}"
+      echo "prs_merged,${prs_merged}"
+      echo "issues_opened,${issues_opened}"
+      echo "issues_closed,${issues_closed}"
+      ;;
+    text)
+      echo ""
+      echo -e "  ${BOLD}Repositories${NC}"
+      echo -e "    Total:          ${BOLD}${total_repos}${NC}"
+      echo -e "    Active:         ${BOLD}${active_repos}${NC} ${DIM}(pushed during period)${NC}"
+      echo ""
+      echo -e "  ${BOLD}Pull Requests${NC}"
+      echo -e "    Opened:         ${BOLD}${prs_opened}${NC}"
+      echo -e "    Merged:         ${BOLD}${prs_merged}${NC}"
+      echo ""
+      echo -e "  ${BOLD}Issues${NC}"
+      echo -e "    Opened:         ${BOLD}${issues_opened}${NC}"
+      echo -e "    Closed:         ${BOLD}${issues_closed}${NC}"
+      echo ""
+      ;;
+    *) die "activity-report: unknown format: ${ACTIVITY_REPORT_FORMAT} (use text, json, or csv)" ;;
+  esac
+}
+
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -3186,6 +4927,16 @@ main() {
     dependabot-enable)     cmd_dependabot_enable_main "$@" ;;
     mirror)                cmd_mirror_main "$@" ;;
     release-cleanup)       cmd_release_cleanup_main "$@" ;;
+    vulnerability-check)   cmd_vulnerability_check_main "$@" ;;
+    branch-protection)     cmd_branch_protection_main "$@" ;;
+    stale-issues)          cmd_stale_issues_main "$@" ;;
+    bulk-settings)         cmd_bulk_settings_main "$@" ;;
+    webhook-audit)         cmd_webhook_audit_main "$@" ;;
+    cleanup-packages)      cmd_cleanup_packages_main "$@" ;;
+    collaborator-audit)    cmd_collaborator_audit_main "$@" ;;
+    repo-template)         cmd_repo_template_main "$@" ;;
+    pr-cleanup)            cmd_pr_cleanup_main "$@" ;;
+    activity-report)       cmd_activity_report_main "$@" ;;
     version|-V|--version)  echo "github-helpers v${VERSION}" ;;
     help|-h|--help)        usage ;;
     *)

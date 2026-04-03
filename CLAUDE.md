@@ -22,6 +22,7 @@ Guidelines for working on this project with Claude Code.
 3. Add the command to the `case` in `main()`.
 4. Add a help line in `usage()`.
 5. Add a smoke test in `.github/workflows/check-program.yml` (`./script.sh <name> --help`).
+6. Add documentation in `README.md`: entry in the commands table and a dedicated section with usage examples and flags table.
 
 ## Key conventions
 
@@ -50,11 +51,11 @@ There are no unit tests. CI runs smoke tests: every `<command> --help` must exit
 ./script.sh <command> --dry-run [required-flags]
 ```
 
-## Commands (17 total)
+## Commands (27 total)
 
-**Cleanup & maintenance**: `unstar`, `cleanup-forks`, `cleanup-branches`, `archive-repos`, `release-cleanup`
-**Audit & visibility**: `repo-audit`, `stats`, `workflow-status`, `secret-audit`, `license-check`
-**Bulk operations**: `clone-org`, `bulk-topic`, `sync-labels`, `export-stars`, `rename-default-branch`, `dependabot-enable`, `mirror`
+**Cleanup & maintenance**: `unstar`, `cleanup-forks`, `cleanup-branches`, `archive-repos`, `release-cleanup`, `pr-cleanup`, `cleanup-packages`, `stale-issues`
+**Audit & visibility**: `repo-audit`, `stats`, `workflow-status`, `secret-audit`, `license-check`, `vulnerability-check`, `branch-protection`, `webhook-audit`, `collaborator-audit`, `activity-report`
+**Bulk operations**: `clone-org`, `bulk-topic`, `sync-labels`, `export-stars`, `rename-default-branch`, `dependabot-enable`, `mirror`, `bulk-settings`, `repo-template`
 
 ## Dependencies
 
