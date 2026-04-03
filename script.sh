@@ -17,6 +17,16 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
+# ── Auto-detect: disable colors if not a TTY or NO_COLOR is set ─────────────
+# See https://no-color.org/
+if [ ! -t 1 ] || [ "${NO_COLOR:-}" != "" ]; then
+  RED='' GREEN='' YELLOW='' CYAN='' BOLD='' DIM='' NC=''
+fi
+
+disable_colors() {
+  RED='' GREEN='' YELLOW='' CYAN='' BOLD='' DIM='' NC=''
+}
+
 # ── Shared state ─────────────────────────────────────────────────────────────
 AUTO_YES=false
 VERBOSE=false
@@ -64,6 +74,7 @@ ${BOLD}COMMANDS${NC}
   clone-org     Clone all repositories from a GitHub organization
 
 ${BOLD}FLAGS${NC}
+  --no-color    Disable colored output
   --version     Show version
   --help        Show this help
 
@@ -736,6 +747,16 @@ cmd_clone_org_main() {
 # =============================================================================
 
 main() {
+  # Pre-process global flags
+  local -a args=()
+  for arg in "$@"; do
+    case "$arg" in
+      --no-color) disable_colors ;;
+      *) args+=("$arg") ;;
+    esac
+  done
+  set -- "${args[@]+"${args[@]}"}"
+
   if [ $# -eq 0 ]; then
     usage
     exit 0
