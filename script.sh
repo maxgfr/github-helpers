@@ -71,7 +71,7 @@ ${BOLD}USAGE${NC}
 
 ${BOLD}COMMANDS${NC}
   unstar        Clean up your GitHub stars (filter & bulk-unstar)
-  clone-org     Clone all repositories from a GitHub organization
+  clone-org     Clone all repos from a GitHub org or user
 
 ${BOLD}FLAGS${NC}
   --no-color    Disable colored output
@@ -80,7 +80,7 @@ ${BOLD}FLAGS${NC}
 
 ${BOLD}EXAMPLES${NC}
   github-helpers unstar --archived --dry-run
-  github-helpers clone-org --org my-company --ssh
+  github-helpers clone-org --org my-company --ssh --pull
 
 Run ${BOLD}github-helpers <command> --help${NC} for command-specific help.
 EOF
@@ -542,31 +542,43 @@ cmd_unstar_main() {
 # =============================================================================
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
-CLONE_ORG_NAME=""
+CLONE_ORG_TARGET=""
+CLONE_ORG_TARGET_TYPE=""
 CLONE_ORG_DIR="."
 CLONE_ORG_DRY_RUN=false
 CLONE_ORG_SSH=false
+CLONE_ORG_PULL=false
 CLONE_ORG_ARCHIVED=""
+CLONE_ORG_FORK=""
 CLONE_ORG_VISIBILITY=""
+CLONE_ORG_LANGUAGE=""
+CLONE_ORG_TOPIC=""
 CLONE_ORG_LIMIT=0
 
 cmd_clone_org_usage() {
   cat <<EOF
-${BOLD}github-helpers clone-org${NC} ${DIM}v${VERSION}${NC} — Clone all repos from a GitHub org
+${BOLD}github-helpers clone-org${NC} ${DIM}v${VERSION}${NC} — Clone all repos from a GitHub org or user
 
 ${BOLD}USAGE${NC}
   github-helpers clone-org --org NAME [options]
+  github-helpers clone-org --user NAME [options]
 
-${BOLD}REQUIRED${NC}
+${BOLD}TARGET${NC} (one is required)
   --org NAME              GitHub organization name
+  --user NAME             GitHub username
 
 ${BOLD}OPTIONS${NC}
   --dir PATH              Clone destination directory (default: current dir)
   --ssh                   Clone via SSH instead of HTTPS
-  --archived              Only clone archived repos
-  --not-archived          Only clone non-archived repos
+  --pull                  Pull existing repos instead of skipping them
+  --archived              Only archived repos
+  --not-archived          Only non-archived repos
+  --fork                  Only forked repos
+  --source                Only non-fork (source) repos
   --visibility TYPE       Filter by visibility: public, private, internal
-  --limit N               Maximum number of repos to clone (default: all)
+  --language LANG         Filter by primary language (e.g. Go, TypeScript)
+  --topic TOPIC           Filter by topic
+  --limit N               Maximum number of repos (default: all)
   --dry-run               List repos without cloning
   -y, --yes               Skip confirmation prompt
   -v, --verbose           Show detailed output
@@ -579,8 +591,11 @@ ${BOLD}EXAMPLES${NC}
   # Clone all non-archived repos via SSH
   github-helpers clone-org --org my-company --ssh --not-archived
 
-  # Clone into a specific directory
-  github-helpers clone-org --org my-company --dir ~/projects/my-company
+  # Clone only Go source repos from a user
+  github-helpers clone-org --user octocat --source --language Go
+
+  # Clone into a specific directory, pull existing
+  github-helpers clone-org --org my-company --dir ~/projects --pull
 
   # Clone only public repos, no confirmation
   github-helpers clone-org --org my-company --visibility public -y
@@ -595,12 +610,18 @@ cmd_clone_org_parse_args() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --org)           CLONE_ORG_NAME="$2"; shift 2 ;;
+      --org)           CLONE_ORG_TARGET="$2"; CLONE_ORG_TARGET_TYPE="org"; shift 2 ;;
+      --user)          CLONE_ORG_TARGET="$2"; CLONE_ORG_TARGET_TYPE="user"; shift 2 ;;
       --dir)           CLONE_ORG_DIR="$2"; shift 2 ;;
       --ssh)           CLONE_ORG_SSH=true; shift ;;
+      --pull)          CLONE_ORG_PULL=true; shift ;;
       --archived)      CLONE_ORG_ARCHIVED="true"; shift ;;
       --not-archived)  CLONE_ORG_ARCHIVED="false"; shift ;;
+      --fork)          CLONE_ORG_FORK="true"; shift ;;
+      --source)        CLONE_ORG_FORK="false"; shift ;;
       --visibility)    CLONE_ORG_VISIBILITY="$2"; shift 2 ;;
+      --language)      CLONE_ORG_LANGUAGE="$2"; shift 2 ;;
+      --topic)         CLONE_ORG_TOPIC="$2"; shift 2 ;;
       --limit)         CLONE_ORG_LIMIT="$2"; shift 2 ;;
       --dry-run)       CLONE_ORG_DRY_RUN=true; shift ;;
       -y|--yes)        AUTO_YES=true; shift ;;
@@ -610,8 +631,12 @@ cmd_clone_org_parse_args() {
     esac
   done
 
-  if [ -z "$CLONE_ORG_NAME" ]; then
-    die "clone-org: --org NAME is required"
+  if [ -z "$CLONE_ORG_TARGET" ]; then
+    die "clone-org: --org NAME or --user NAME is required"
+  fi
+
+  if [ "$CLONE_ORG_LIMIT" != "0" ] && ! [[ "$CLONE_ORG_LIMIT" =~ ^[0-9]+$ ]]; then
+    die "clone-org: --limit must be a number"
   fi
 }
 
@@ -621,7 +646,7 @@ cmd_clone_org_list_repos() {
     limit=9999
   fi
 
-  local -a flags=("--json" "nameWithOwner,sshUrl,url,isArchived,name" "--limit" "$limit")
+  local -a flags=("--json" "nameWithOwner,sshUrl,url,isArchived,isFork,name" "--limit" "$limit")
 
   if [ "$CLONE_ORG_ARCHIVED" = "true" ]; then
     flags+=("--archived")
@@ -629,12 +654,26 @@ cmd_clone_org_list_repos() {
     flags+=("--no-archived")
   fi
 
+  if [ "$CLONE_ORG_FORK" = "true" ]; then
+    flags+=("--fork")
+  elif [ "$CLONE_ORG_FORK" = "false" ]; then
+    flags+=("--source")
+  fi
+
   if [ -n "$CLONE_ORG_VISIBILITY" ]; then
     flags+=("--visibility" "$CLONE_ORG_VISIBILITY")
   fi
 
-  gh repo list "$CLONE_ORG_NAME" "${flags[@]}" 2>/dev/null || {
-    die "Failed to list repos for org '${CLONE_ORG_NAME}'. Check the org name and your permissions."
+  if [ -n "$CLONE_ORG_LANGUAGE" ]; then
+    flags+=("--language" "$CLONE_ORG_LANGUAGE")
+  fi
+
+  if [ -n "$CLONE_ORG_TOPIC" ]; then
+    flags+=("--topic" "$CLONE_ORG_TOPIC")
+  fi
+
+  gh repo list "$CLONE_ORG_TARGET" "${flags[@]}" 2>/dev/null || {
+    die "Failed to list repos for '${CLONE_ORG_TARGET}'. Check the name and your permissions."
   }
 }
 
@@ -642,17 +681,34 @@ cmd_clone_org_main() {
   cmd_clone_org_parse_args "$@"
   preflight_check
 
-  echo -e "${BOLD}${CYAN}Clone Org Repos${NC} ${DIM}v${VERSION}${NC}"
+  local target_label="Org"
+  [ "$CLONE_ORG_TARGET_TYPE" = "user" ] && target_label="User"
+
+  echo -e "${BOLD}${CYAN}Clone Repos${NC} ${DIM}v${VERSION}${NC}"
   echo -e "${DIM}─────────────────────────────────────────────${NC}"
-  echo -e "  Org:  ${BOLD}${CLONE_ORG_NAME}${NC}"
+  echo -e "  ${target_label}:  ${BOLD}${CLONE_ORG_TARGET}${NC}"
   echo -e "  Dir:  ${BOLD}$(cd "$CLONE_ORG_DIR" 2>/dev/null && pwd || echo "$CLONE_ORG_DIR")${NC}"
-  if $CLONE_ORG_SSH; then
-    echo -e "  Mode: ${BOLD}SSH${NC}"
-  else
-    echo -e "  Mode: ${BOLD}HTTPS${NC}"
-  fi
+  local proto="HTTPS"
+  $CLONE_ORG_SSH && proto="SSH"
+  echo -e "  Proto: ${BOLD}${proto}${NC}"
+  $CLONE_ORG_PULL && echo -e "  Pull:  ${BOLD}yes${NC} (update existing repos)"
   if $CLONE_ORG_DRY_RUN; then
-    echo -e "  Mode: ${YELLOW}DRY RUN${NC} (no clones)"
+    echo -e "  Mode:  ${YELLOW}DRY RUN${NC} (no changes)"
+  fi
+
+  # Show active filters
+  local -a filters=()
+  [ "$CLONE_ORG_ARCHIVED" = "true" ]  && filters+=("archived")
+  [ "$CLONE_ORG_ARCHIVED" = "false" ] && filters+=("not-archived")
+  [ "$CLONE_ORG_FORK" = "true" ]      && filters+=("forks only")
+  [ "$CLONE_ORG_FORK" = "false" ]     && filters+=("source only")
+  [ -n "$CLONE_ORG_VISIBILITY" ]      && filters+=("${CLONE_ORG_VISIBILITY}")
+  [ -n "$CLONE_ORG_LANGUAGE" ]        && filters+=("lang:${CLONE_ORG_LANGUAGE}")
+  [ -n "$CLONE_ORG_TOPIC" ]           && filters+=("topic:${CLONE_ORG_TOPIC}")
+  if [ ${#filters[@]} -gt 0 ]; then
+    local filters_str
+    filters_str=$(IFS=', '; echo "${filters[*]}")
+    echo -e "  Filters: ${DIM}${filters_str}${NC}"
   fi
   echo ""
 
@@ -674,13 +730,12 @@ cmd_clone_org_main() {
 
   # ── Display list ────────────────────────────────────────────────────────
   echo -e "${BOLD}Repos:${NC}"
-  echo "$repos_json" | jq -r '.[] | [.nameWithOwner, (.isArchived | tostring)] | @tsv' | \
-    while IFS=$'\t' read -r nwo archived; do
-      local suffix=""
-      if [ "$archived" = "true" ]; then
-        suffix=" ${DIM}(archived)${NC}"
-      fi
-      echo -e "  ${DIM}•${NC} ${nwo}${suffix}"
+  echo "$repos_json" | jq -r '.[] | [.nameWithOwner, (.isArchived | tostring), (.isFork | tostring)] | @tsv' | \
+    while IFS=$'\t' read -r nwo archived is_fork; do
+      local tags=""
+      [ "$archived" = "true" ] && tags+=" ${DIM}(archived)${NC}"
+      [ "$is_fork" = "true" ]  && tags+=" ${DIM}(fork)${NC}"
+      echo -e "  ${DIM}•${NC} ${nwo}${tags}"
     done
   echo ""
 
@@ -692,7 +747,9 @@ cmd_clone_org_main() {
 
   # ── Confirm ─────────────────────────────────────────────────────────────
   if ! $AUTO_YES; then
-    read -rp "Clone $total repos into ${CLONE_ORG_DIR}? [y/N] " confirm
+    local action="Clone"
+    $CLONE_ORG_PULL && action="Clone/pull"
+    read -rp "${action} ${total} repos into ${CLONE_ORG_DIR}? [y/N] " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
       echo "Cancelled."
       exit 0
@@ -709,37 +766,54 @@ cmd_clone_org_main() {
 
   echo "$repos_json" | jq -r '.[] | [.nameWithOwner, .sshUrl, .name] | @tsv' > "$repo_list"
 
-  local cloned=0 skip=0 failed=0
+  local cloned=0 pulled=0 skip=0 failed=0 idx=0
   while IFS=$'\t' read -r nwo ssh_url repo_name; do
+    idx=$((idx + 1))
     local target_dir="${CLONE_ORG_DIR}/${repo_name}"
+    local prefix="${DIM}[${idx}/${total}]${NC}"
 
     if [ -d "$target_dir" ]; then
-      skip=$((skip + 1))
-      $VERBOSE && echo -e "  ${DIM}SKIP${NC} ${nwo} (already exists)"
+      if $CLONE_ORG_PULL; then
+        if git -C "$target_dir" pull --ff-only --quiet 2>/dev/null; then
+          pulled=$((pulled + 1))
+          echo -e "  ${prefix} ${CYAN}PULLED${NC}  ${nwo}"
+        else
+          failed=$((failed + 1))
+          echo -e "  ${prefix} ${RED}FAILED${NC}  ${nwo} (pull)"
+        fi
+      else
+        skip=$((skip + 1))
+        $VERBOSE && echo -e "  ${prefix} ${DIM}SKIP${NC}    ${nwo} (already exists)"
+      fi
       continue
     fi
 
     if $CLONE_ORG_SSH; then
       if git clone --quiet "$ssh_url" "$target_dir" 2>/dev/null; then
         cloned=$((cloned + 1))
-        echo -e "  ${GREEN}CLONED${NC} ${nwo}"
+        echo -e "  ${prefix} ${GREEN}CLONED${NC}  ${nwo}"
       else
         failed=$((failed + 1))
-        echo -e "  ${RED}FAILED${NC} ${nwo}"
+        echo -e "  ${prefix} ${RED}FAILED${NC}  ${nwo}"
       fi
     else
       if gh repo clone "$nwo" "$target_dir" -- --quiet 2>/dev/null; then
         cloned=$((cloned + 1))
-        echo -e "  ${GREEN}CLONED${NC} ${nwo}"
+        echo -e "  ${prefix} ${GREEN}CLONED${NC}  ${nwo}"
       else
         failed=$((failed + 1))
-        echo -e "  ${RED}FAILED${NC} ${nwo}"
+        echo -e "  ${prefix} ${RED}FAILED${NC}  ${nwo}"
       fi
     fi
   done < "$repo_list"
 
   echo ""
-  echo -e "${GREEN}Done!${NC} Cloned: ${BOLD}${cloned}${NC}, Skipped: ${BOLD}${skip}${NC}, Failed: ${BOLD}${failed}${NC}"
+  local summary="${GREEN}Done!${NC} Cloned: ${BOLD}${cloned}${NC}"
+  if $CLONE_ORG_PULL; then
+    summary+=", Pulled: ${BOLD}${pulled}${NC}"
+  fi
+  summary+=", Skipped: ${BOLD}${skip}${NC}, Failed: ${BOLD}${failed}${NC}"
+  echo -e "$summary"
 }
 
 # =============================================================================
