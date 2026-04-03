@@ -65,7 +65,7 @@ github-helpers unstar --archived -y
 | `--out FILE` | Output file (default: `unstar-repos.txt`) |
 | `--from FILE` | Unstar from a previous dry-run file |
 
-### `clone-org` — Clone all repos from a GitHub organization
+### `clone-org` — Clone all repos from a GitHub org or user
 
 ```bash
 # List all repos in an org (dry-run)
@@ -74,23 +74,37 @@ github-helpers clone-org --org my-company --dry-run
 # Clone all non-archived repos via SSH
 github-helpers clone-org --org my-company --ssh --not-archived
 
-# Clone into a specific directory
-github-helpers clone-org --org my-company --dir ~/projects/my-company
+# Clone from a user account, only Go source repos
+github-helpers clone-org --user octocat --source --language Go
+
+# Clone into a specific directory, pull existing repos
+github-helpers clone-org --org my-company --dir ~/projects --pull
 
 # Clone only public repos, no confirmation
 github-helpers clone-org --org my-company --visibility public -y
 ```
 
+**Target** (one required):
+
+| Flag | Description |
+|---|---|
+| `--org NAME` | GitHub organization name |
+| `--user NAME` | GitHub username |
+
 **Options**:
 
 | Flag | Description |
 |---|---|
-| `--org NAME` | **(required)** GitHub organization name |
 | `--dir PATH` | Clone destination (default: `.`) |
 | `--ssh` | Clone via SSH instead of HTTPS |
+| `--pull` | Pull existing repos instead of skipping |
 | `--archived` | Only archived repos |
 | `--not-archived` | Only non-archived repos |
+| `--fork` | Only forked repos |
+| `--source` | Only non-fork (source) repos |
 | `--visibility TYPE` | `public`, `private`, or `internal` |
+| `--language LANG` | Filter by primary language |
+| `--topic TOPIC` | Filter by topic |
 | `--limit N` | Max repos to clone |
 | `--dry-run` | List repos without cloning |
 
@@ -98,6 +112,7 @@ github-helpers clone-org --org my-company --visibility public -y
 
 | Flag | Description |
 |---|---|
+| `--no-color` | Disable colored output |
 | `-y, --yes` | Skip confirmation prompt |
 | `-v, --verbose` | Detailed output |
 | `-h, --help` | Show help |
