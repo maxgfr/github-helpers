@@ -38,6 +38,13 @@ chmod +x /usr/local/bin/github-helpers
 | [`clone-org`](#clone-org--clone-all-repos-from-a-github-org-or-user) | Clone/pull all repos from an org or user |
 | [`bulk-topic`](#bulk-topic--add-or-remove-topics-in-batch) | Add/remove topics in batch |
 | [`sync-labels`](#sync-labels--sync-issue-labels-from-a-template-repo) | Sync issue labels across repos |
+| [`export-stars`](#export-stars--export-starred-repos) | Export stars to JSON/CSV/Markdown |
+| [`rename-default-branch`](#rename-default-branch--rename-default-branch-across-repos) | Rename master→main in batch |
+| [`secret-audit`](#secret-audit--list-secrets-and-env-vars) | List Actions secrets & variables |
+| [`license-check`](#license-check--check-and-add-license-files) | Check/add LICENSE files |
+| [`dependabot-enable`](#dependabot-enable--enable-dependabot-on-repos) | Enable Dependabot in batch |
+| [`mirror`](#mirror--mirror-repos-to-another-remote) | Mirror repos to GitLab/Bitbucket/etc. |
+| [`release-cleanup`](#release-cleanup--delete-old-releases) | Delete old releases, keep N latest |
 
 ---
 
@@ -220,6 +227,104 @@ github-helpers sync-labels --from maxgfr/template --org my-company -y
 | `--from OWNER/REPO` | Source repo with template labels |
 | `--to OWNER/REPO` | Single target repo |
 | `--org NAME` / `--user NAME` | Apply to all repos |
+
+#### `export-stars` — Export starred repos
+
+```bash
+github-helpers export-stars --format json --out stars.json
+github-helpers export-stars --format csv --out stars.csv
+github-helpers export-stars --format md
+```
+
+| Flag | Description |
+|---|---|
+| `--format FORMAT` | `json`, `csv`, or `md` (default: json) |
+| `--out FILE` | Output file (default: stdout) |
+
+#### `rename-default-branch` — Rename default branch across repos
+
+```bash
+github-helpers rename-default-branch --from master --to main --dry-run
+github-helpers rename-default-branch --org my-company --dry-run
+github-helpers rename-default-branch --repo maxgfr/old-repo -y
+```
+
+| Flag | Description |
+|---|---|
+| `--from NAME` | Current branch name (default: master) |
+| `--to NAME` | New branch name (default: main) |
+| `--repo OWNER/REPO` | Single repo |
+| `--user NAME` / `--org NAME` | Target (default: authenticated user) |
+
+#### `secret-audit` — List secrets and env vars
+
+```bash
+github-helpers secret-audit
+github-helpers secret-audit --org my-company
+github-helpers secret-audit --repo maxgfr/my-repo -v
+```
+
+| Flag | Description |
+|---|---|
+| `--user NAME` / `--org NAME` | Target (default: authenticated user) |
+| `--repo OWNER/REPO` | Single repo |
+| `--limit N` | Max repos to scan |
+
+#### `license-check` — Check and add LICENSE files
+
+```bash
+github-helpers license-check
+github-helpers license-check --add --template MIT --dry-run
+github-helpers license-check --org my-company --add --template Apache-2.0 -y
+```
+
+| Flag | Description |
+|---|---|
+| `--user NAME` / `--org NAME` | Target (default: authenticated user) |
+| `--add` | Add LICENSE to repos missing one |
+| `--template SPDX` | License template (e.g., MIT, Apache-2.0) |
+
+#### `dependabot-enable` — Enable Dependabot on repos
+
+```bash
+github-helpers dependabot-enable --dry-run
+github-helpers dependabot-enable --ecosystems npm,github-actions --schedule weekly
+github-helpers dependabot-enable --org my-company -y
+```
+
+| Flag | Description |
+|---|---|
+| `--user NAME` / `--org NAME` | Target (default: authenticated user) |
+| `--ecosystems LIST` | Comma-separated ecosystems (default: auto-detect) |
+| `--schedule FREQ` | `daily`, `weekly`, `monthly` (default: weekly) |
+
+#### `mirror` — Mirror repos to another remote
+
+```bash
+github-helpers mirror --repo maxgfr/my-repo --target "git@gitlab.com:maxgfr/{name}.git" --dry-run
+github-helpers mirror --user maxgfr --target "git@gitlab.com:maxgfr/{name}.git" -y
+```
+
+| Flag | Description |
+|---|---|
+| `--repo OWNER/REPO` | Single repo |
+| `--user NAME` / `--org NAME` | All repos from user/org |
+| `--target URL` | Target URL template with `{name}` placeholder |
+| `--dir PATH` | Temp directory for bare clones |
+
+#### `release-cleanup` — Delete old releases
+
+```bash
+github-helpers release-cleanup --repo maxgfr/my-repo --keep 5 --dry-run
+github-helpers release-cleanup --user maxgfr --pre-only --keep 3 -y
+```
+
+| Flag | Description |
+|---|---|
+| `--repo OWNER/REPO` | Single repo |
+| `--user NAME` / `--org NAME` | All repos |
+| `--keep N` | Releases to keep (default: 5) |
+| `--pre-only` | Only delete pre-releases |
 
 ---
 

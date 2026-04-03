@@ -54,6 +54,27 @@ jobs:
       - name: Test sync-labels help
         run: ./script.sh sync-labels --help
 
+      - name: Test export-stars help
+        run: ./script.sh export-stars --help
+
+      - name: Test rename-default-branch help
+        run: ./script.sh rename-default-branch --help
+
+      - name: Test secret-audit help
+        run: ./script.sh secret-audit --help
+
+      - name: Test license-check help
+        run: ./script.sh license-check --help
+
+      - name: Test dependabot-enable help
+        run: ./script.sh dependabot-enable --help
+
+      - name: Test mirror help
+        run: ./script.sh mirror --help
+
+      - name: Test release-cleanup help
+        run: ./script.sh release-cleanup --help
+
       - name: Test unknown command fails
         run: |
           if ./script.sh nonexistent 2>/dev/null; then

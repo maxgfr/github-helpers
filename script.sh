@@ -5,7 +5,9 @@ set -euo pipefail
 # github-helpers — GitHub maintenance toolkit
 # Subcommands: unstar, clone-org, cleanup-forks, cleanup-branches,
 #              archive-repos, repo-audit, stats, bulk-topic,
-#              workflow-status, sync-labels
+#              workflow-status, sync-labels, export-stars,
+#              rename-default-branch, secret-audit, license-check,
+#              dependabot-enable, mirror, release-cleanup
 # =============================================================================
 
 VERSION="1.2.1"
@@ -77,16 +79,23 @@ ${BOLD}COMMANDS${NC}
   cleanup-forks       Remove forks you never modified (0 commits ahead)
   cleanup-branches    Delete merged or stale remote branches
   archive-repos       Archive inactive repos in batch
+  release-cleanup     Delete old releases
 
   ${BOLD}Audit & visibility${NC}
   repo-audit          Scan repos for missing LICENSE, README, description, topics
   stats               Quick GitHub profile stats dashboard
   workflow-status     Overview of latest CI workflow runs
+  secret-audit        List secrets and env vars across repos
+  license-check       Check and add LICENSE files
 
   ${BOLD}Bulk operations${NC}
   clone-org           Clone all repos from a GitHub org or user
   bulk-topic          Add or remove topics across multiple repos
   sync-labels         Sync issue labels from a template repo
+  export-stars        Export starred repos to JSON/CSV/Markdown
+  rename-default-branch  Rename default branch across repos
+  dependabot-enable   Enable Dependabot on repos
+  mirror              Mirror repos to another remote
 
 ${BOLD}FLAGS${NC}
   --no-color    Disable colored output
@@ -1838,6 +1847,1305 @@ cmd_sync_labels_main() {
 }
 
 # =============================================================================
+# COMMAND: export-stars
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+EXPORT_STARS_FORMAT="json"
+EXPORT_STARS_OUT=""
+
+cmd_export_stars_usage() {
+  cat <<EOF
+${BOLD}github-helpers export-stars${NC} ${DIM}v${VERSION}${NC} — Export starred repos to JSON/CSV/Markdown
+
+${BOLD}USAGE${NC}
+  github-helpers export-stars [options]
+
+${BOLD}OPTIONS${NC}
+  --format FORMAT         Output format: json, csv, md (default: json)
+  --out FILE              Output file (default: stdout)
+  -v, --verbose           Show progress during fetch
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers export-stars --format json --out stars.json
+  github-helpers export-stars --format csv --out stars.csv
+  github-helpers export-stars --format md -v
+EOF
+  exit 0
+}
+
+cmd_export_stars_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --format)    EXPORT_STARS_FORMAT="$2"; shift 2 ;;
+      --out)       EXPORT_STARS_OUT="$2"; shift 2 ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)   cmd_export_stars_usage ;;
+      *) die "export-stars: unknown option: $1" ;;
+    esac
+  done
+
+  case "$EXPORT_STARS_FORMAT" in
+    json|csv|md) ;;
+    *) die "export-stars: --format must be json, csv, or md (got: ${EXPORT_STARS_FORMAT})" ;;
+  esac
+}
+
+cmd_export_stars_fetch() {
+  local username="$1"
+  local has_next="true" total_fetched=0
+  local -a cursor_arg=("-F" "cursor=null")
+  local all_json="[]"
+
+  while [ "$has_next" = "true" ]; do
+    local result
+    result=$(gh api graphql -f query='
+      query($login: String!, $cursor: String) {
+        user(login: $login) {
+          starredRepositories(first: 100, after: $cursor) {
+            totalCount
+            edges {
+              node {
+                nameWithOwner
+                description
+                url
+                primaryLanguage { name }
+                stargazerCount
+                pushedAt
+                isArchived
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+      }' -f login="$username" "${cursor_arg[@]}") || {
+      die "GraphQL request failed. Check your network and gh auth."
+    }
+
+    local gql_error
+    gql_error=$(echo "$result" | jq -r '.errors[0].message // empty' 2>/dev/null)
+    if [ -n "$gql_error" ]; then
+      die "GitHub API: ${gql_error}"
+    fi
+
+    # Extract repos and append to all_json
+    local page_repos
+    page_repos=$(echo "$result" | jq '[.data.user.starredRepositories.edges[].node | {
+      nameWithOwner,
+      description: (.description // ""),
+      url,
+      primaryLanguage: (.primaryLanguage.name // ""),
+      stargazerCount,
+      pushedAt: (.pushedAt // ""),
+      isArchived
+    }]')
+    all_json=$(echo "$all_json" "$page_repos" | jq -s '.[0] + .[1]')
+
+    local count total_count
+    count=$(echo "$result" | jq '.data.user.starredRepositories.edges | length')
+    total_fetched=$((total_fetched + count))
+    total_count=$(echo "$result" | jq '.data.user.starredRepositories.totalCount')
+
+    if $VERBOSE; then
+      echo -e "  ${DIM}Fetched ${total_fetched}/${total_count} starred repos...${NC}" >&2
+    fi
+
+    has_next=$(echo "$result" | jq -r '.data.user.starredRepositories.pageInfo.hasNextPage')
+    local end_cursor
+    end_cursor=$(echo "$result" | jq -r '.data.user.starredRepositories.pageInfo.endCursor // empty')
+    if [ -z "$end_cursor" ]; then
+      break
+    fi
+    cursor_arg=("-f" "cursor=${end_cursor}")
+  done
+
+  echo "$all_json"
+}
+
+cmd_export_stars_main() {
+  cmd_export_stars_parse_args "$@"
+  preflight_check
+
+  local USERNAME
+  USERNAME=$(get_username)
+
+  echo -e "${BOLD}${CYAN}Export Stars${NC} ${DIM}v${VERSION}${NC}" >&2
+  echo -e "${DIM}─────────────────────────────────────────────${NC}" >&2
+  echo -e "  User:   ${BOLD}${USERNAME}${NC}" >&2
+  echo -e "  Format: ${BOLD}${EXPORT_STARS_FORMAT}${NC}" >&2
+  if [ -n "$EXPORT_STARS_OUT" ]; then
+    echo -e "  Output: ${BOLD}${EXPORT_STARS_OUT}${NC}" >&2
+  fi
+  echo "" >&2
+
+  echo -e "${DIM}Fetching starred repos...${NC}" >&2
+  local stars_json
+  stars_json=$(cmd_export_stars_fetch "$USERNAME")
+
+  local total
+  total=$(echo "$stars_json" | jq 'length')
+  echo -e "${GREEN}Fetched ${total} starred repos.${NC}" >&2
+
+  local output=""
+
+  case "$EXPORT_STARS_FORMAT" in
+    json)
+      output=$(echo "$stars_json" | jq '.')
+      ;;
+    csv)
+      output=$(echo "$stars_json" | jq -r '
+        ["nameWithOwner","description","url","primaryLanguage","stargazerCount","pushedAt","isArchived"],
+        (.[] | [
+          .nameWithOwner,
+          (.description | gsub(","; " ") | gsub("\n"; " ")),
+          .url,
+          .primaryLanguage,
+          (.stargazerCount | tostring),
+          .pushedAt,
+          (.isArchived | tostring)
+        ]) | @csv')
+      ;;
+    md)
+      output=$(echo "$stars_json" | jq -r '
+        "| Repository | Description | Language | Stars | Last Push | Archived |",
+        "| --- | --- | --- | ---: | --- | --- |",
+        (.[] | "| [\(.nameWithOwner)](\(.url)) | \(.description | gsub("\\|"; "/") | gsub("\n"; " ") | .[0:80]) | \(.primaryLanguage) | \(.stargazerCount) | \(.pushedAt | .[0:10]) | \(.isArchived) |")')
+      ;;
+  esac
+
+  if [ -n "$EXPORT_STARS_OUT" ]; then
+    echo "$output" > "$EXPORT_STARS_OUT"
+    echo -e "${GREEN}Done!${NC} Saved to ${BOLD}${EXPORT_STARS_OUT}${NC}" >&2
+  else
+    echo "$output"
+  fi
+}
+
+# =============================================================================
+# COMMAND: rename-default-branch
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+RENAME_BRANCH_FROM="master"
+RENAME_BRANCH_TO="main"
+RENAME_BRANCH_TARGET=""
+RENAME_BRANCH_TARGET_TYPE=""
+RENAME_BRANCH_REPO=""
+
+cmd_rename_default_branch_usage() {
+  cat <<EOF
+${BOLD}github-helpers rename-default-branch${NC} ${DIM}v${VERSION}${NC} — Rename default branch across repos
+
+${BOLD}USAGE${NC}
+  github-helpers rename-default-branch [options]
+
+${BOLD}OPTIONS${NC}
+  --from NAME             Current branch name (default: master)
+  --to NAME               New branch name (default: main)
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --repo OWNER/REPO       Single repo to rename
+  --dry-run               Preview changes without applying
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers rename-default-branch --dry-run
+  github-helpers rename-default-branch --from master --to main -y
+  github-helpers rename-default-branch --repo myuser/myrepo --dry-run
+  github-helpers rename-default-branch --org my-company --dry-run
+EOF
+  exit 0
+}
+
+cmd_rename_default_branch_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)      RENAME_BRANCH_FROM="$2"; shift 2 ;;
+      --to)        RENAME_BRANCH_TO="$2"; shift 2 ;;
+      --user)      RENAME_BRANCH_TARGET="$2"; RENAME_BRANCH_TARGET_TYPE="user"; shift 2 ;;
+      --org)       RENAME_BRANCH_TARGET="$2"; RENAME_BRANCH_TARGET_TYPE="org"; shift 2 ;;
+      --repo)      RENAME_BRANCH_REPO="$2"; shift 2 ;;
+      --dry-run)   DRY_RUN=true; shift ;;
+      -y|--yes)    AUTO_YES=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)   cmd_rename_default_branch_usage ;;
+      *) die "rename-default-branch: unknown option: $1" ;;
+    esac
+  done
+
+  if [ "$RENAME_BRANCH_FROM" = "$RENAME_BRANCH_TO" ]; then
+    die "rename-default-branch: --from and --to cannot be the same"
+  fi
+}
+
+cmd_rename_default_branch_main() {
+  cmd_rename_default_branch_parse_args "$@"
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}Rename Default Branch${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Rename: ${BOLD}${RENAME_BRANCH_FROM}${NC} → ${BOLD}${RENAME_BRANCH_TO}${NC}"
+  if $DRY_RUN; then
+    echo -e "  Mode:   ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  # Build list of repos
+  local repos_json
+  if [ -n "$RENAME_BRANCH_REPO" ]; then
+    repos_json=$(gh api "repos/${RENAME_BRANCH_REPO}" --jq '[{nameWithOwner: .full_name, defaultBranch: .default_branch}]' 2>/dev/null) \
+      || die "Failed to fetch repo: ${RENAME_BRANCH_REPO}"
+  else
+    if [ -z "$RENAME_BRANCH_TARGET" ]; then
+      RENAME_BRANCH_TARGET=$(get_username)
+      RENAME_BRANCH_TARGET_TYPE="user"
+    fi
+    echo -e "  Target: ${BOLD}${RENAME_BRANCH_TARGET}${NC}"
+    echo ""
+    echo -e "${DIM}Fetching repos...${NC}"
+    repos_json=$(gh repo list "$RENAME_BRANCH_TARGET" --json nameWithOwner,defaultBranchRef --source --no-archived --limit 9999 2>/dev/null) \
+      || die "Failed to list repos"
+    # Normalize field name
+    repos_json=$(echo "$repos_json" | jq '[.[] | {nameWithOwner, defaultBranch: .defaultBranchRef.name}]')
+  fi
+
+  # Filter to repos whose default branch matches --from
+  local matching_json
+  matching_json=$(echo "$repos_json" | jq --arg from "$RENAME_BRANCH_FROM" '[.[] | select(.defaultBranch == $from)]')
+
+  local total
+  total=$(echo "$matching_json" | jq 'length')
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No repos found with default branch '${RENAME_BRANCH_FROM}'. Nothing to rename.${NC}"
+    exit 0
+  fi
+
+  local skipped
+  skipped=$(echo "$repos_json" | jq --arg from "$RENAME_BRANCH_FROM" '[.[] | select(.defaultBranch != $from)] | length')
+
+  echo -e "${YELLOW}Found ${total} repos with default branch '${RENAME_BRANCH_FROM}'${NC} (skipped ${skipped} already on other branches)"
+  echo ""
+
+  echo -e "${BOLD}Repos to rename:${NC}"
+  echo "$matching_json" | jq -r '.[].nameWithOwner' | while IFS= read -r nwo; do
+    echo -e "  ${DIM}•${NC} ${nwo}"
+  done
+  echo ""
+
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no branches were renamed.${NC}"
+    exit 0
+  fi
+
+  if ! $AUTO_YES; then
+    read -rp "Rename default branch on ${total} repos? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+  fi
+
+  local success=0 fail=0
+  echo "$matching_json" | jq -r '.[].nameWithOwner' | while IFS= read -r nwo; do
+    # Rename the branch
+    if gh api -X POST "repos/${nwo}/branches/${RENAME_BRANCH_FROM}/rename" \
+      -f new_name="$RENAME_BRANCH_TO" &>/dev/null; then
+      # Update default branch
+      if gh api -X PATCH "repos/${nwo}" -f default_branch="$RENAME_BRANCH_TO" &>/dev/null; then
+        success=$((success + 1))
+        echo -e "  ${GREEN}RENAMED${NC}  ${nwo}: ${RENAME_BRANCH_FROM} → ${RENAME_BRANCH_TO}"
+      else
+        fail=$((fail + 1))
+        echo -e "  ${YELLOW}PARTIAL${NC}  ${nwo}: branch renamed but default not updated"
+      fi
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC}   ${nwo}"
+    fi
+  done
+
+  echo ""
+  echo -e "${GREEN}Done!${NC}"
+}
+
+# =============================================================================
+# COMMAND: secret-audit
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+SECRET_AUDIT_TARGET=""
+SECRET_AUDIT_TARGET_TYPE=""
+SECRET_AUDIT_REPO=""
+SECRET_AUDIT_LIMIT=0
+
+cmd_secret_audit_usage() {
+  cat <<EOF
+${BOLD}github-helpers secret-audit${NC} ${DIM}v${VERSION}${NC} — List secrets and env vars across repos
+
+${BOLD}USAGE${NC}
+  github-helpers secret-audit [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --repo OWNER/REPO       Single repo to audit
+  --limit N               Max repos to scan (default: all)
+  -v, --verbose           Show repos even if they have no secrets
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers secret-audit
+  github-helpers secret-audit --org my-company --limit 50
+  github-helpers secret-audit --repo myuser/myrepo
+  github-helpers secret-audit -v
+EOF
+  exit 0
+}
+
+cmd_secret_audit_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)      SECRET_AUDIT_TARGET="$2"; SECRET_AUDIT_TARGET_TYPE="user"; shift 2 ;;
+      --org)       SECRET_AUDIT_TARGET="$2"; SECRET_AUDIT_TARGET_TYPE="org"; shift 2 ;;
+      --repo)      SECRET_AUDIT_REPO="$2"; shift 2 ;;
+      --limit)     SECRET_AUDIT_LIMIT="$2"; shift 2 ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)   cmd_secret_audit_usage ;;
+      *) die "secret-audit: unknown option: $1" ;;
+    esac
+  done
+}
+
+cmd_secret_audit_main() {
+  cmd_secret_audit_parse_args "$@"
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}Secret Audit${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+
+  # Build repo list
+  local repo_list
+  if [ -n "$SECRET_AUDIT_REPO" ]; then
+    repo_list="$SECRET_AUDIT_REPO"
+    echo -e "  Repo: ${BOLD}${SECRET_AUDIT_REPO}${NC}"
+  else
+    if [ -z "$SECRET_AUDIT_TARGET" ]; then
+      SECRET_AUDIT_TARGET=$(get_username)
+      SECRET_AUDIT_TARGET_TYPE="user"
+    fi
+    echo -e "  Target: ${BOLD}${SECRET_AUDIT_TARGET}${NC}"
+    echo ""
+    echo -e "${DIM}Fetching repos...${NC}"
+
+    local -a flags=("--json" "nameWithOwner" "--limit")
+    if [ "$SECRET_AUDIT_LIMIT" -gt 0 ] 2>/dev/null; then
+      flags+=("$SECRET_AUDIT_LIMIT")
+    else
+      flags+=("9999")
+    fi
+
+    repo_list=$(gh repo list "$SECRET_AUDIT_TARGET" "${flags[@]}" --no-archived 2>/dev/null \
+      | jq -r '.[].nameWithOwner') || die "Failed to list repos"
+  fi
+  echo ""
+
+  local total_repos=0 repos_with_secrets=0 total_secrets=0 total_variables=0
+
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    total_repos=$((total_repos + 1))
+
+    # Fetch secrets
+    local secrets_json
+    secrets_json=$(gh api "repos/${nwo}/actions/secrets" --jq '.secrets' 2>/dev/null || echo "[]")
+    local secret_count
+    secret_count=$(echo "$secrets_json" | jq 'length')
+
+    # Fetch variables
+    local vars_json
+    vars_json=$(gh api "repos/${nwo}/actions/variables" --jq '.variables' 2>/dev/null || echo "[]")
+    local var_count
+    var_count=$(echo "$vars_json" | jq 'length')
+
+    total_secrets=$((total_secrets + secret_count))
+    total_variables=$((total_variables + var_count))
+
+    if [ "$secret_count" -eq 0 ] && [ "$var_count" -eq 0 ]; then
+      if $VERBOSE; then
+        echo -e "  ${DIM}${nwo}: no secrets or variables${NC}"
+      fi
+      continue
+    fi
+
+    repos_with_secrets=$((repos_with_secrets + 1))
+
+    echo -e "  ${BOLD}${nwo}${NC}"
+
+    if [ "$secret_count" -gt 0 ]; then
+      echo -e "    ${YELLOW}Secrets (${secret_count}):${NC}"
+      echo "$secrets_json" | jq -r '.[].name' | while IFS= read -r name; do
+        echo -e "      ${DIM}•${NC} ${name}"
+      done
+    fi
+
+    if [ "$var_count" -gt 0 ]; then
+      echo -e "    ${CYAN}Variables (${var_count}):${NC}"
+      echo "$vars_json" | jq -r '.[] | "\(.name)=\(.value)"' | while IFS= read -r line; do
+        local vname="${line%%=*}"
+        local vvalue="${line#*=}"
+        echo -e "      ${DIM}•${NC} ${vname} ${DIM}= ${vvalue}${NC}"
+      done
+    fi
+
+    echo ""
+  done <<< "$repo_list"
+
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "${BOLD}Summary:${NC}"
+  echo -e "  Repos scanned:      ${BOLD}${total_repos}${NC}"
+  echo -e "  Repos with secrets: ${BOLD}${repos_with_secrets}${NC}"
+  echo -e "  Total secrets:      ${BOLD}${total_secrets}${NC}"
+  echo -e "  Total variables:    ${BOLD}${total_variables}${NC}"
+  echo ""
+}
+
+# =============================================================================
+# COMMAND: license-check
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+LICENSE_CHECK_TARGET=""
+LICENSE_CHECK_TARGET_TYPE=""
+LICENSE_CHECK_TEMPLATE=""
+LICENSE_CHECK_ADD=false
+
+cmd_license_check_usage() {
+  cat <<EOF
+${BOLD}github-helpers license-check${NC} ${DIM}v${VERSION}${NC} — Check and add LICENSE files
+
+${BOLD}USAGE${NC}
+  github-helpers license-check [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --template SPDX         License template to add (e.g., MIT, Apache-2.0)
+  --add                   Add missing licenses (requires --template)
+  --dry-run               Preview changes without applying
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  # List license status for all your repos
+  github-helpers license-check
+
+  # Check an org's repos
+  github-helpers license-check --org my-company
+
+  # Preview adding MIT license to repos missing one
+  github-helpers license-check --add --template MIT --dry-run
+
+  # Add MIT license to repos missing one
+  github-helpers license-check --add --template MIT -y
+EOF
+  exit 0
+}
+
+cmd_license_check_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)       LICENSE_CHECK_TARGET="$2"; LICENSE_CHECK_TARGET_TYPE="user"; shift 2 ;;
+      --org)        LICENSE_CHECK_TARGET="$2"; LICENSE_CHECK_TARGET_TYPE="org"; shift 2 ;;
+      --template)   LICENSE_CHECK_TEMPLATE="$2"; shift 2 ;;
+      --add)        LICENSE_CHECK_ADD=true; shift ;;
+      --dry-run)    DRY_RUN=true; shift ;;
+      -y|--yes)     AUTO_YES=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)    cmd_license_check_usage ;;
+      *) die "license-check: unknown option: $1" ;;
+    esac
+  done
+
+  if $LICENSE_CHECK_ADD && [ -z "$LICENSE_CHECK_TEMPLATE" ]; then
+    die "license-check: --add requires --template"
+  fi
+}
+
+cmd_license_check_main() {
+  cmd_license_check_parse_args "$@"
+  preflight_check
+
+  if [ -z "$LICENSE_CHECK_TARGET" ]; then
+    LICENSE_CHECK_TARGET=$(get_username)
+    LICENSE_CHECK_TARGET_TYPE="user"
+  fi
+
+  echo -e "${BOLD}${CYAN}License Check${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Target: ${BOLD}${LICENSE_CHECK_TARGET}${NC}"
+  if $LICENSE_CHECK_ADD; then
+    echo -e "  Action: ${BOLD}Add '${LICENSE_CHECK_TEMPLATE}' to repos missing a license${NC}"
+  fi
+  if $DRY_RUN; then
+    echo -e "  Mode:   ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  echo -e "${DIM}Fetching repos...${NC}"
+  local repos_json
+  repos_json=$(gh repo list "$LICENSE_CHECK_TARGET" --json nameWithOwner,licenseInfo --source --no-archived --limit 9999 2>/dev/null) \
+    || die "Failed to list repos"
+
+  local total
+  total=$(echo "$repos_json" | jq 'length')
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No repos found.${NC}"
+    exit 0
+  fi
+
+  echo -e "Found ${BOLD}${total}${NC} repos"
+  echo ""
+
+  # Categorize repos
+  local with_license=0 without_license=0
+  local -a missing_nwos=()
+
+  printf "  ${BOLD}%-45s %s${NC}\n" "Repository" "License"
+  printf "  %-45s %s\n" "─────────────────────────────────────────────" "──────────────────"
+
+  echo "$repos_json" | jq -c '.[]' | while IFS= read -r repo; do
+    local nwo license_name
+    nwo=$(echo "$repo" | jq -r '.nameWithOwner')
+    license_name=$(echo "$repo" | jq -r '.licenseInfo.name // empty')
+
+    if [ -n "$license_name" ]; then
+      printf "  %-45s ${GREEN}%s${NC}\n" "$nwo" "$license_name"
+    else
+      printf "  %-45s ${RED}%s${NC}\n" "$nwo" "NONE"
+    fi
+  done
+
+  # Get counts and missing list outside subshell
+  with_license=$(echo "$repos_json" | jq '[.[] | select(.licenseInfo.name != null and .licenseInfo.name != "")] | length')
+  without_license=$(echo "$repos_json" | jq '[.[] | select(.licenseInfo.name == null or .licenseInfo.name == "")] | length')
+
+  echo ""
+  echo -e "${BOLD}Summary:${NC} ${GREEN}${with_license} with license${NC}, ${RED}${without_license} missing${NC}"
+  echo ""
+
+  # If not adding, stop here
+  if ! $LICENSE_CHECK_ADD; then
+    exit 0
+  fi
+
+  if [ "$without_license" -eq 0 ]; then
+    echo -e "${GREEN}All repos have licenses. Nothing to add.${NC}"
+    exit 0
+  fi
+
+  # Fetch license template
+  echo -e "${DIM}Fetching license template '${LICENSE_CHECK_TEMPLATE}'...${NC}"
+  local license_body
+  license_body=$(gh api "licenses/${LICENSE_CHECK_TEMPLATE}" --jq '.body' 2>/dev/null) \
+    || die "Failed to fetch license template '${LICENSE_CHECK_TEMPLATE}'. Use a valid SPDX ID (e.g., MIT, Apache-2.0, GPL-3.0)."
+
+  if [ -z "$license_body" ]; then
+    die "License template '${LICENSE_CHECK_TEMPLATE}' returned empty body."
+  fi
+
+  # Get list of repos missing licenses
+  local missing_repos
+  missing_repos=$(echo "$repos_json" | jq -r '.[] | select(.licenseInfo.name == null or .licenseInfo.name == "") | .nameWithOwner')
+
+  echo -e "${YELLOW}Will add '${LICENSE_CHECK_TEMPLATE}' license to ${without_license} repos:${NC}"
+  echo "$missing_repos" | while IFS= read -r nwo; do
+    echo -e "  ${DIM}•${NC} ${nwo}"
+  done
+  echo ""
+
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no licenses were added.${NC}"
+    exit 0
+  fi
+
+  if ! $AUTO_YES; then
+    read -rp "Add '${LICENSE_CHECK_TEMPLATE}' license to ${without_license} repos? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+  fi
+
+  local encoded_body
+  encoded_body=$(echo -n "$license_body" | base64)
+
+  local success=0 fail=0
+  echo "$missing_repos" | while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    if gh api -X PUT "repos/${nwo}/contents/LICENSE" \
+      -f message="Add ${LICENSE_CHECK_TEMPLATE} license" \
+      -f content="$encoded_body" &>/dev/null; then
+      success=$((success + 1))
+      echo -e "  ${GREEN}ADDED${NC}   ${nwo}"
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC}  ${nwo}"
+    fi
+  done
+
+  echo ""
+  echo -e "${GREEN}Done!${NC}"
+}
+
+# =============================================================================
+# COMMAND: dependabot-enable
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+DEPENDABOT_TARGET=""
+DEPENDABOT_TARGET_TYPE=""
+DEPENDABOT_ECOSYSTEMS=""
+DEPENDABOT_SCHEDULE="weekly"
+
+cmd_dependabot_enable_usage() {
+  cat <<EOF
+${BOLD}github-helpers dependabot-enable${NC} ${DIM}v${VERSION}${NC} — Enable Dependabot on repos
+
+${BOLD}USAGE${NC}
+  github-helpers dependabot-enable [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --ecosystems LIST       Comma-separated: npm,pip,docker,github-actions,
+                          bundler,cargo,composer,gomod,maven,nuget
+                          (default: auto-detect from repo languages)
+  --schedule FREQ         Update frequency: daily, weekly, monthly
+                          (default: weekly)
+  --dry-run               Preview changes without applying
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers dependabot-enable --dry-run
+  github-helpers dependabot-enable --ecosystems npm,github-actions --schedule daily
+  github-helpers dependabot-enable --org my-company --dry-run
+EOF
+  exit 0
+}
+
+cmd_dependabot_enable_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)        DEPENDABOT_TARGET="$2"; DEPENDABOT_TARGET_TYPE="user"; shift 2 ;;
+      --org)         DEPENDABOT_TARGET="$2"; DEPENDABOT_TARGET_TYPE="org"; shift 2 ;;
+      --ecosystems)  DEPENDABOT_ECOSYSTEMS="$2"; shift 2 ;;
+      --schedule)    DEPENDABOT_SCHEDULE="$2"; shift 2 ;;
+      --dry-run)     DRY_RUN=true; shift ;;
+      -y|--yes)      AUTO_YES=true; shift ;;
+      -v|--verbose)  VERBOSE=true; shift ;;
+      -h|--help)     cmd_dependabot_enable_usage ;;
+      *) die "dependabot-enable: unknown option: $1" ;;
+    esac
+  done
+
+  case "$DEPENDABOT_SCHEDULE" in
+    daily|weekly|monthly) ;;
+    *) die "dependabot-enable: --schedule must be daily, weekly, or monthly (got: ${DEPENDABOT_SCHEDULE})" ;;
+  esac
+}
+
+cmd_dependabot_enable_detect_ecosystem() {
+  local language="$1"
+  case "$language" in
+    JavaScript|TypeScript|CoffeeScript) echo "npm" ;;
+    Python)          echo "pip" ;;
+    Ruby)            echo "bundler" ;;
+    Go)              echo "gomod" ;;
+    Rust)            echo "cargo" ;;
+    Java|Kotlin|Scala) echo "maven" ;;
+    PHP)             echo "composer" ;;
+    C#|F#|"Visual Basic .NET") echo "nuget" ;;
+    Dockerfile)      echo "docker" ;;
+    Elixir)          echo "mix" ;;
+    Swift)           echo "swift" ;;
+    *)               echo "" ;;
+  esac
+}
+
+cmd_dependabot_enable_build_config() {
+  local schedule="$1"
+  shift
+  local ecosystems=("$@")
+
+  local config="version: 2\nupdates:"
+  for eco in "${ecosystems[@]}"; do
+    local directory="/"
+    config="${config}\n  - package-ecosystem: \"${eco}\""
+    config="${config}\n    directory: \"${directory}\""
+    config="${config}\n    schedule:"
+    config="${config}\n      interval: \"${schedule}\""
+  done
+
+  echo -e "$config"
+}
+
+cmd_dependabot_enable_main() {
+  cmd_dependabot_enable_parse_args "$@"
+  preflight_check
+
+  if [ -z "$DEPENDABOT_TARGET" ]; then
+    DEPENDABOT_TARGET=$(get_username)
+    DEPENDABOT_TARGET_TYPE="user"
+  fi
+
+  echo -e "${BOLD}${CYAN}Dependabot Enable${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Target:   ${BOLD}${DEPENDABOT_TARGET}${NC}"
+  echo -e "  Schedule: ${BOLD}${DEPENDABOT_SCHEDULE}${NC}"
+  if [ -n "$DEPENDABOT_ECOSYSTEMS" ]; then
+    echo -e "  Ecosystems: ${BOLD}${DEPENDABOT_ECOSYSTEMS}${NC}"
+  else
+    echo -e "  Ecosystems: ${BOLD}auto-detect${NC}"
+  fi
+  if $DRY_RUN; then
+    echo -e "  Mode:     ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  echo -e "${DIM}Fetching repos...${NC}"
+  local repos_json
+  repos_json=$(gh repo list "$DEPENDABOT_TARGET" --json nameWithOwner,primaryLanguage --source --no-archived --limit 9999 2>/dev/null) \
+    || die "Failed to list repos"
+
+  local total
+  total=$(echo "$repos_json" | jq 'length')
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No repos found.${NC}"
+    exit 0
+  fi
+
+  echo -e "Found ${BOLD}${total}${NC} repos"
+  echo ""
+
+  # Check each repo for existing dependabot config
+  local to_enable=0 already=0 skipped=0
+  local -a enable_repos=()
+  local -a enable_ecosystems=()
+
+  echo "$repos_json" | jq -c '.[]' | while IFS= read -r repo; do
+    local nwo lang
+    nwo=$(echo "$repo" | jq -r '.nameWithOwner')
+    lang=$(echo "$repo" | jq -r '.primaryLanguage.name // empty')
+
+    # Check if dependabot.yml already exists
+    if gh api "repos/${nwo}/contents/.github/dependabot.yml" &>/dev/null; then
+      already=$((already + 1))
+      $VERBOSE && echo -e "  ${DIM}SKIP${NC}  ${nwo} ${DIM}(already has dependabot.yml)${NC}"
+      continue
+    fi
+
+    # Determine ecosystems
+    local -a repo_ecosystems=()
+    if [ -n "$DEPENDABOT_ECOSYSTEMS" ]; then
+      IFS=',' read -ra repo_ecosystems <<< "$DEPENDABOT_ECOSYSTEMS"
+    else
+      # Auto-detect from language
+      if [ -n "$lang" ]; then
+        local detected
+        detected=$(cmd_dependabot_enable_detect_ecosystem "$lang")
+        if [ -n "$detected" ]; then
+          repo_ecosystems+=("$detected")
+        fi
+      fi
+      # Always include github-actions
+      repo_ecosystems+=("github-actions")
+    fi
+
+    if [ ${#repo_ecosystems[@]} -eq 0 ]; then
+      skipped=$((skipped + 1))
+      $VERBOSE && echo -e "  ${DIM}SKIP${NC}  ${nwo} ${DIM}(no ecosystem detected)${NC}"
+      continue
+    fi
+
+    local eco_list
+    eco_list=$(IFS=','; echo "${repo_ecosystems[*]}")
+
+    to_enable=$((to_enable + 1))
+    echo -e "  ${YELLOW}ENABLE${NC} ${nwo} ${DIM}(${eco_list})${NC}"
+
+    # Store for later processing
+    echo "${nwo}|${eco_list}" >> /tmp/gh-dependabot-enable-list.$$
+  done
+
+  echo ""
+
+  local list_file="/tmp/gh-dependabot-enable-list.$$"
+  if [ ! -f "$list_file" ] || [ ! -s "$list_file" ]; then
+    echo -e "${GREEN}All repos already have Dependabot configured. Nothing to do.${NC}"
+    rm -f "$list_file"
+    exit 0
+  fi
+
+  local enable_count
+  enable_count=$(wc -l < "$list_file" | tr -d ' ')
+
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no dependabot.yml files were created.${NC}"
+    rm -f "$list_file"
+    exit 0
+  fi
+
+  if ! $AUTO_YES; then
+    read -rp "Enable Dependabot on ${enable_count} repos? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      rm -f "$list_file"
+      exit 0
+    fi
+  fi
+
+  echo ""
+  local success=0 fail=0
+  while IFS='|' read -r nwo eco_list; do
+    [ -z "$nwo" ] && continue
+
+    IFS=',' read -ra ecosystems <<< "$eco_list"
+    local config_content
+    config_content=$(cmd_dependabot_enable_build_config "$DEPENDABOT_SCHEDULE" "${ecosystems[@]}")
+
+    local encoded_content
+    encoded_content=$(echo -e "$config_content" | base64)
+
+    if gh api -X PUT "repos/${nwo}/contents/.github/dependabot.yml" \
+      -f message="Enable Dependabot updates" \
+      -f content="$encoded_content" &>/dev/null; then
+      success=$((success + 1))
+      echo -e "  ${GREEN}CREATED${NC}  ${nwo}"
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC}   ${nwo}"
+    fi
+  done < "$list_file"
+
+  rm -f "$list_file"
+
+  echo ""
+  echo -e "${GREEN}Done!${NC}"
+}
+
+# =============================================================================
+# COMMAND: mirror
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+MIRROR_REPO=""
+MIRROR_TARGET=""
+MIRROR_TARGET_TYPE=""
+MIRROR_URL_TEMPLATE=""
+MIRROR_DIR="/tmp/gh-mirror"
+
+cmd_mirror_usage() {
+  cat <<EOF
+${BOLD}github-helpers mirror${NC} ${DIM}v${VERSION}${NC} — Mirror repos to another remote
+
+${BOLD}USAGE${NC}
+  github-helpers mirror --target URL_TEMPLATE [options]
+
+${BOLD}OPTIONS${NC}
+  --repo OWNER/REPO       Single source repo
+  --user NAME             All repos from user (default: authenticated user)
+  --org NAME              All repos from organization
+  --target URL_TEMPLATE   Target URL with {name} placeholder
+                          (e.g., git@gitlab.com:myorg/{name}.git)
+  --dir PATH              Temp directory for bare clones
+                          (default: /tmp/gh-mirror)
+  --dry-run               Preview changes without applying
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  # Mirror a single repo to GitLab
+  github-helpers mirror --repo myuser/myrepo --target "git@gitlab.com:myorg/{name}.git"
+
+  # Mirror all user repos (dry-run)
+  github-helpers mirror --target "git@gitlab.com:myorg/{name}.git" --dry-run
+
+  # Mirror an org's repos
+  github-helpers mirror --org my-company --target "git@gitlab.com:backup/{name}.git" -y
+EOF
+  exit 0
+}
+
+cmd_mirror_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)      MIRROR_REPO="$2"; shift 2 ;;
+      --user)      MIRROR_TARGET="$2"; MIRROR_TARGET_TYPE="user"; shift 2 ;;
+      --org)       MIRROR_TARGET="$2"; MIRROR_TARGET_TYPE="org"; shift 2 ;;
+      --target)    MIRROR_URL_TEMPLATE="$2"; shift 2 ;;
+      --dir)       MIRROR_DIR="$2"; shift 2 ;;
+      --dry-run)   DRY_RUN=true; shift ;;
+      -y|--yes)    AUTO_YES=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)   cmd_mirror_usage ;;
+      *) die "mirror: unknown option: $1" ;;
+    esac
+  done
+
+  if [ -z "$MIRROR_URL_TEMPLATE" ]; then
+    die "mirror: --target URL_TEMPLATE is required"
+  fi
+
+  if [[ "$MIRROR_URL_TEMPLATE" != *"{name}"* ]]; then
+    die "mirror: --target must contain {name} placeholder (e.g., git@gitlab.com:myorg/{name}.git)"
+  fi
+}
+
+cmd_mirror_main() {
+  cmd_mirror_parse_args "$@"
+  preflight_check
+
+  if ! command -v git &>/dev/null; then
+    die "git is required for mirror"
+  fi
+
+  echo -e "${BOLD}${CYAN}Mirror Repos${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Target template: ${BOLD}${MIRROR_URL_TEMPLATE}${NC}"
+  echo -e "  Clone dir:       ${BOLD}${MIRROR_DIR}${NC}"
+  if $DRY_RUN; then
+    echo -e "  Mode:            ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  # Build repo list
+  local repo_list_json
+  if [ -n "$MIRROR_REPO" ]; then
+    repo_list_json=$(gh api "repos/${MIRROR_REPO}" --jq '[{nameWithOwner: .full_name, name: .name, clone_url: .clone_url, ssh_url: .ssh_url}]' 2>/dev/null) \
+      || die "Failed to fetch repo: ${MIRROR_REPO}"
+  else
+    if [ -z "$MIRROR_TARGET" ]; then
+      MIRROR_TARGET=$(get_username)
+      MIRROR_TARGET_TYPE="user"
+    fi
+    echo -e "  Source: ${BOLD}${MIRROR_TARGET}${NC}"
+    echo ""
+    echo -e "${DIM}Fetching repos...${NC}"
+    repo_list_json=$(gh repo list "$MIRROR_TARGET" --json nameWithOwner,name,url --source --no-archived --limit 9999 2>/dev/null) \
+      || die "Failed to list repos"
+  fi
+
+  local total
+  total=$(echo "$repo_list_json" | jq 'length')
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No repos found.${NC}"
+    exit 0
+  fi
+
+  echo -e "Found ${BOLD}${total}${NC} repos to mirror"
+  echo ""
+
+  echo -e "${BOLD}Repos:${NC}"
+  echo "$repo_list_json" | jq -r '.[] | .nameWithOwner' | while IFS= read -r nwo; do
+    local repo_name="${nwo#*/}"
+    local target_url="${MIRROR_URL_TEMPLATE//\{name\}/$repo_name}"
+    echo -e "  ${DIM}•${NC} ${nwo} → ${DIM}${target_url}${NC}"
+  done
+  echo ""
+
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no repos were mirrored.${NC}"
+    exit 0
+  fi
+
+  if ! $AUTO_YES; then
+    read -rp "Mirror ${total} repos? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+  fi
+
+  # Create mirror directory
+  mkdir -p "$MIRROR_DIR"
+
+  local success=0 fail=0
+  echo "$repo_list_json" | jq -r '.[] | "\(.nameWithOwner)\t\(.name)"' | while IFS=$'\t' read -r nwo repo_name; do
+    [ -z "$nwo" ] && continue
+
+    local target_url="${MIRROR_URL_TEMPLATE//\{name\}/$repo_name}"
+    local clone_path="${MIRROR_DIR}/${repo_name}.git"
+
+    echo -e "  ${BOLD}${nwo}${NC}"
+
+    # Clone bare
+    $VERBOSE && echo -e "    ${DIM}Cloning bare...${NC}"
+    rm -rf "$clone_path"
+    if ! git clone --bare "https://github.com/${nwo}.git" "$clone_path" 2>/dev/null; then
+      fail=$((fail + 1))
+      echo -e "    ${RED}FAILED${NC} (clone)"
+      continue
+    fi
+
+    # Push mirror
+    $VERBOSE && echo -e "    ${DIM}Pushing to ${target_url}...${NC}"
+    if (cd "$clone_path" && git push --mirror "$target_url" 2>/dev/null); then
+      success=$((success + 1))
+      echo -e "    ${GREEN}MIRRORED${NC} → ${target_url}"
+    else
+      fail=$((fail + 1))
+      echo -e "    ${RED}FAILED${NC} (push to ${target_url})"
+    fi
+
+    # Cleanup
+    rm -rf "$clone_path"
+  done
+
+  echo ""
+  echo -e "${GREEN}Done!${NC}"
+}
+
+# =============================================================================
+# COMMAND: release-cleanup
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+RELEASE_CLEANUP_REPO=""
+RELEASE_CLEANUP_TARGET=""
+RELEASE_CLEANUP_TARGET_TYPE=""
+RELEASE_CLEANUP_KEEP=5
+RELEASE_CLEANUP_PRE_ONLY=false
+
+cmd_release_cleanup_usage() {
+  cat <<EOF
+${BOLD}github-helpers release-cleanup${NC} ${DIM}v${VERSION}${NC} — Delete old releases
+
+${BOLD}USAGE${NC}
+  github-helpers release-cleanup [options]
+
+${BOLD}OPTIONS${NC}
+  --repo OWNER/REPO       Single repo (required if no --user/--org)
+  --user NAME             All repos from user
+  --org NAME              All repos from organization
+  --keep N                Number of releases to keep (default: 5)
+  --pre-only              Only delete pre-releases
+  --dry-run               Preview deletions without applying
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers release-cleanup --repo myuser/myrepo --keep 3 --dry-run
+  github-helpers release-cleanup --repo myuser/myrepo --pre-only --keep 0
+  github-helpers release-cleanup --org my-company --keep 10 --dry-run
+  github-helpers release-cleanup --repo myuser/myrepo --keep 5 -y
+EOF
+  exit 0
+}
+
+cmd_release_cleanup_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)       RELEASE_CLEANUP_REPO="$2"; shift 2 ;;
+      --user)       RELEASE_CLEANUP_TARGET="$2"; RELEASE_CLEANUP_TARGET_TYPE="user"; shift 2 ;;
+      --org)        RELEASE_CLEANUP_TARGET="$2"; RELEASE_CLEANUP_TARGET_TYPE="org"; shift 2 ;;
+      --keep)       RELEASE_CLEANUP_KEEP="$2"; shift 2 ;;
+      --pre-only)   RELEASE_CLEANUP_PRE_ONLY=true; shift ;;
+      --dry-run)    DRY_RUN=true; shift ;;
+      -y|--yes)     AUTO_YES=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)    cmd_release_cleanup_usage ;;
+      *) die "release-cleanup: unknown option: $1" ;;
+    esac
+  done
+
+  if [ -z "$RELEASE_CLEANUP_REPO" ] && [ -z "$RELEASE_CLEANUP_TARGET" ]; then
+    die "release-cleanup: --repo, --user, or --org is required"
+  fi
+
+  if ! [[ "$RELEASE_CLEANUP_KEEP" =~ ^[0-9]+$ ]]; then
+    die "release-cleanup: --keep must be a non-negative number"
+  fi
+}
+
+cmd_release_cleanup_process_repo() {
+  local nwo="$1"
+  local keep="$2"
+  local pre_only="$3"
+
+  $VERBOSE && echo -e "  ${DIM}Fetching releases for ${nwo}...${NC}"
+
+  # Fetch all releases (paginated up to 100)
+  local releases_json
+  releases_json=$(gh api "repos/${nwo}/releases?per_page=100" 2>/dev/null) || {
+    echo -e "  ${RED}FAILED${NC}  Could not fetch releases for ${nwo}"
+    return 1
+  }
+
+  # Sort by created_at desc (API already returns sorted, but be explicit)
+  releases_json=$(echo "$releases_json" | jq 'sort_by(.created_at) | reverse')
+
+  # If pre-only, filter to only pre-releases
+  local target_releases
+  if $pre_only; then
+    target_releases=$(echo "$releases_json" | jq '[.[] | select(.prerelease == true)]')
+  else
+    target_releases=$(echo "$releases_json")
+  fi
+
+  local total_target
+  total_target=$(echo "$target_releases" | jq 'length')
+
+  if [ "$total_target" -le "$keep" ]; then
+    $VERBOSE && echo -e "  ${DIM}${nwo}: ${total_target} releases (keeping ${keep}) — nothing to delete${NC}"
+    return 0
+  fi
+
+  # Releases to delete: skip first $keep, take the rest
+  local to_delete
+  to_delete=$(echo "$target_releases" | jq --argjson keep "$keep" '.[$keep:]')
+
+  local delete_count
+  delete_count=$(echo "$to_delete" | jq 'length')
+
+  echo -e "  ${BOLD}${nwo}${NC}: ${delete_count} releases to delete (keeping ${keep})"
+
+  echo "$to_delete" | jq -c '.[]' | while IFS= read -r release; do
+    local release_id tag_name prerelease created_at
+    release_id=$(echo "$release" | jq -r '.id')
+    tag_name=$(echo "$release" | jq -r '.tag_name')
+    prerelease=$(echo "$release" | jq -r '.prerelease')
+    created_at=$(echo "$release" | jq -r '.created_at')
+
+    local pre_label=""
+    if [ "$prerelease" = "true" ]; then
+      pre_label=" ${YELLOW}(pre-release)${NC}"
+    fi
+
+    if $DRY_RUN; then
+      echo -e "    ${YELLOW}WOULD DELETE${NC} ${tag_name} ${DIM}(${created_at%%T*})${NC}${pre_label}"
+    else
+      if gh api -X DELETE "repos/${nwo}/releases/${release_id}" &>/dev/null; then
+        echo -e "    ${GREEN}DELETED${NC}  ${tag_name} ${DIM}(${created_at%%T*})${NC}${pre_label}"
+      else
+        echo -e "    ${RED}FAILED${NC}   ${tag_name}"
+      fi
+    fi
+  done
+}
+
+cmd_release_cleanup_main() {
+  cmd_release_cleanup_parse_args "$@"
+  preflight_check
+
+  echo -e "${BOLD}${CYAN}Release Cleanup${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+  echo -e "  Keep:     ${BOLD}${RELEASE_CLEANUP_KEEP}${NC} latest releases"
+  if $RELEASE_CLEANUP_PRE_ONLY; then
+    echo -e "  Filter:   ${BOLD}pre-releases only${NC}"
+  fi
+  if $DRY_RUN; then
+    echo -e "  Mode:     ${YELLOW}DRY RUN${NC}"
+  fi
+  echo ""
+
+  # Build repo list
+  local repo_nwos
+  if [ -n "$RELEASE_CLEANUP_REPO" ]; then
+    repo_nwos="$RELEASE_CLEANUP_REPO"
+  else
+    if [ -z "$RELEASE_CLEANUP_TARGET" ]; then
+      RELEASE_CLEANUP_TARGET=$(get_username)
+      RELEASE_CLEANUP_TARGET_TYPE="user"
+    fi
+    echo -e "  Target: ${BOLD}${RELEASE_CLEANUP_TARGET}${NC}"
+    echo ""
+    echo -e "${DIM}Fetching repos...${NC}"
+    repo_nwos=$(gh repo list "$RELEASE_CLEANUP_TARGET" --json nameWithOwner --source --no-archived --limit 9999 2>/dev/null \
+      | jq -r '.[].nameWithOwner') || die "Failed to list repos"
+  fi
+  echo ""
+
+  # First pass: collect info about what will be deleted
+  local total_to_delete=0
+  local tmpfile
+  tmpfile=$(mktemp)
+  trap 'rm -f "$tmpfile"' EXIT
+
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+
+    local releases_json
+    releases_json=$(gh api "repos/${nwo}/releases?per_page=100" 2>/dev/null || echo "[]")
+    releases_json=$(echo "$releases_json" | jq 'sort_by(.created_at) | reverse')
+
+    local target_releases
+    if $RELEASE_CLEANUP_PRE_ONLY; then
+      target_releases=$(echo "$releases_json" | jq '[.[] | select(.prerelease == true)]')
+    else
+      target_releases=$(echo "$releases_json")
+    fi
+
+    local total_target
+    total_target=$(echo "$target_releases" | jq 'length')
+
+    if [ "$total_target" -gt "$RELEASE_CLEANUP_KEEP" ]; then
+      local delete_count=$((total_target - RELEASE_CLEANUP_KEEP))
+      total_to_delete=$((total_to_delete + delete_count))
+      echo "$nwo" >> "$tmpfile"
+    else
+      $VERBOSE && echo -e "  ${DIM}${nwo}: ${total_target} releases — nothing to delete${NC}"
+    fi
+  done <<< "$repo_nwos"
+
+  if [ "$total_to_delete" -eq 0 ]; then
+    echo -e "${GREEN}No releases to clean up.${NC}"
+    exit 0
+  fi
+
+  local repo_count
+  repo_count=$(wc -l < "$tmpfile" | tr -d ' ')
+  echo -e "${YELLOW}Found ${total_to_delete} releases to delete across ${repo_count} repos${NC}"
+  echo ""
+
+  if ! $DRY_RUN && ! $AUTO_YES; then
+    read -rp "Delete ${total_to_delete} releases? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      exit 0
+    fi
+    echo ""
+  fi
+
+  # Second pass: process each repo
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    cmd_release_cleanup_process_repo "$nwo" "$RELEASE_CLEANUP_KEEP" "$RELEASE_CLEANUP_PRE_ONLY"
+  done < "$tmpfile"
+
+  echo ""
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no releases were deleted.${NC}"
+  else
+    echo -e "${GREEN}Done!${NC}"
+  fi
+}
+
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -1871,6 +3179,13 @@ main() {
     bulk-topic)            cmd_bulk_topic_main "$@" ;;
     workflow-status|ci)    cmd_workflow_status_main "$@" ;;
     sync-labels)           cmd_sync_labels_main "$@" ;;
+    export-stars)          cmd_export_stars_main "$@" ;;
+    rename-default-branch) cmd_rename_default_branch_main "$@" ;;
+    secret-audit)          cmd_secret_audit_main "$@" ;;
+    license-check)         cmd_license_check_main "$@" ;;
+    dependabot-enable)     cmd_dependabot_enable_main "$@" ;;
+    mirror)                cmd_mirror_main "$@" ;;
+    release-cleanup)       cmd_release_cleanup_main "$@" ;;
     version|-V|--version)  echo "github-helpers v${VERSION}" ;;
     help|-h|--help)        usage ;;
     *)

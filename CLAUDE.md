@@ -13,7 +13,7 @@ Guidelines for working on this project with Claude Code.
 - **Naming convention**: Each command's functions are prefixed `cmd_<name>_` (e.g., `cmd_unstar_usage`, `cmd_unstar_parse_args`, `cmd_unstar_main`).
 - **Shared utilities** at the top: `die()`, `preflight_check()`, `get_username()`, `disable_colors()`.
 - **Global state**: Variables like `AUTO_YES`, `VERBOSE`, `DRY_RUN` are globals — only one command runs per invocation.
-- **Colors**: ANSI codes in variables (`RED`, `GREEN`, etc.), auto-disabled when not a TTY or `NO_COLOR` is set.
+- **Colors**: ANSI codes in `$'...'` variables (`RED`, `GREEN`, etc.), auto-disabled when not a TTY or `NO_COLOR` is set. IMPORTANT: use `$'\033[...'` (not `'\033[...'`) so colors work in `cat <<EOF` heredocs.
 
 ## Adding a new command
 
@@ -50,9 +50,15 @@ There are no unit tests. CI runs smoke tests: every `<command> --help` must exit
 ./script.sh <command> --dry-run [required-flags]
 ```
 
+## Commands (17 total)
+
+**Cleanup & maintenance**: `unstar`, `cleanup-forks`, `cleanup-branches`, `archive-repos`, `release-cleanup`
+**Audit & visibility**: `repo-audit`, `stats`, `workflow-status`, `secret-audit`, `license-check`
+**Bulk operations**: `clone-org`, `bulk-topic`, `sync-labels`, `export-stars`, `rename-default-branch`, `dependabot-enable`, `mirror`
+
 ## Dependencies
 
 - `gh` (GitHub CLI) — authenticated
 - `jq` — JSON processor
-- `git` — for clone-org
-- Standard POSIX tools (`mktemp`, `sort`, `grep`, etc.)
+- `git` — for clone-org, mirror
+- Standard POSIX tools (`mktemp`, `sort`, `grep`, `base64`, etc.)
