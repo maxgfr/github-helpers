@@ -285,13 +285,35 @@ gh_api_try() {
   return 1
 }
 
-# gh_paginate <label> <path> — full pagination as one JSON array on stdout.
+# gh_paginate <label> <path> [jq-selector] — full pagination as one JSON array.
+# The selector defaults to '.[]' for endpoints that return a bare array; pass
+# e.g. '.artifacts[]' for the ones that wrap it in an object.
 # Always include per_page=100 in <path>: --paginate does not raise gh's
 # default page size of 30.
 gh_paginate() {
-  local label="$1" path="$2" raw
-  raw=$(gh_api_try "$label" "$path" --paginate --jq '.[]') || return 1
+  local label="$1" path="$2" selector="${3:-.[]}" raw
+  raw=$(gh_api_try "$label" "$path" --paginate --jq "$selector") || return 1
   printf '%s' "$raw" | jq -s '.'
+}
+
+# resolve_repo_list <target> <repo-or-empty> <limit> <label> -> file path
+# Emits a temp file of nameWithOwner lines and warns when the list is capped,
+# so a truncated sweep never reads as full coverage.
+resolve_repo_list() {
+  local target="$1" single="$2" limit="$3" label="$4" f
+  f=$(tmp_new)
+  if [ -n "$single" ]; then
+    printf '%s\n' "$single" > "$f"
+  else
+    list_repos "$target" "$limit" --no-archived > "$f" 2>/dev/null \
+      || die "${label}: failed to list repos for ${target}"
+    local n
+    n=$(count_lines "$f")
+    if [ "$n" -ge "$limit" ]; then
+      warn "${label}: limited to ${limit} repos — raise it with --limit"
+    fi
+  fi
+  printf '%s' "$f"
 }
 
 # require_scope <scope> — 0 if the token carries it, or if scopes are
@@ -407,6 +429,9 @@ ${BOLD}COMMANDS${NC}
   pr-cleanup          Find and close abandoned pull requests
   cleanup-packages    Delete old GitHub Package versions
   stale-issues        Find and close stale issues/PRs
+  cache-cleanup       Purge GitHub Actions caches (10 GB/repo quota)
+  artifact-cleanup    Delete GitHub Actions artifacts
+  run-cleanup         Delete old workflow runs (and their logs)
 
   ${BOLD}Audit & visibility${NC}
   repo-audit          Scan repos for missing LICENSE, README, description, topics
@@ -5897,6 +5922,571 @@ cmd_sync_forks_main() {
   print_skips
 }
 # =============================================================================
+# COMMAND: cache-cleanup
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+CACHE_CLEANUP_TARGET=""
+CACHE_CLEANUP_TARGET_TYPE=""
+CACHE_CLEANUP_REPO=""
+CACHE_CLEANUP_OLDER_THAN=""
+CACHE_CLEANUP_KEY=""
+CACHE_CLEANUP_REF=""
+CACHE_CLEANUP_LARGER_THAN=""
+CACHE_CLEANUP_KEEP=""
+CACHE_CLEANUP_LIMIT=200
+
+cmd_cache_cleanup_usage() {
+  cat <<EOF
+${BOLD}github-helpers cache-cleanup${NC} ${DIM}v${VERSION}${NC} — Purge GitHub Actions caches
+
+${BOLD}USAGE${NC}
+  github-helpers cache-cleanup [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --repo OWNER/NAME       Single repository
+  --older-than N          Caches not accessed for N days
+  --key PATTERN           Cache key matches this regex
+  --ref REF               Only caches for this ref (e.g. refs/heads/main)
+  --larger-than SIZE      Caches at least this big (100MB, 1.5GiB, 500K)
+  --keep N                Keep the N most recently accessed caches per repo
+  --limit N               Max repos to scan (default: ${CACHE_CLEANUP_LIMIT})
+  --dry-run               Show what would be deleted, delete nothing
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           List every cache, not just the totals
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers cache-cleanup --dry-run
+  github-helpers cache-cleanup --older-than 30 -y
+  github-helpers cache-cleanup --repo me/proj --keep 5
+  github-helpers cache-cleanup --org my-company --larger-than 500MB --dry-run
+
+${BOLD}NOTE${NC}
+  Each repository has a 10 GB Actions cache quota; GitHub evicts the least
+  recently used entries once it is full. Repos with Actions disabled are
+  skipped, not treated as failures.
+EOF
+  exit 0
+}
+
+cmd_cache_cleanup_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)         need_arg "--user" "${2:-}"; CACHE_CLEANUP_TARGET="$2"; CACHE_CLEANUP_TARGET_TYPE="user"; shift 2 ;;
+      --org)          need_arg "--org" "${2:-}"; CACHE_CLEANUP_TARGET="$2"; CACHE_CLEANUP_TARGET_TYPE="org"; shift 2 ;;
+      --repo)         need_arg "--repo" "${2:-}"; CACHE_CLEANUP_REPO="$2"; shift 2 ;;
+      --older-than)   need_arg "--older-than" "${2:-}"; CACHE_CLEANUP_OLDER_THAN="$2"; shift 2 ;;
+      --key)          need_arg "--key" "${2:-}"; CACHE_CLEANUP_KEY="$2"; shift 2 ;;
+      --ref)          need_arg "--ref" "${2:-}"; CACHE_CLEANUP_REF="$2"; shift 2 ;;
+      --larger-than)  need_arg "--larger-than" "${2:-}"; CACHE_CLEANUP_LARGER_THAN="$2"; shift 2 ;;
+      --keep)         need_arg "--keep" "${2:-}"; CACHE_CLEANUP_KEEP="$2"; shift 2 ;;
+      --limit)        need_arg "--limit" "${2:-}"; CACHE_CLEANUP_LIMIT="$2"; shift 2 ;;
+      --dry-run)      DRY_RUN=true; shift ;;
+      -y|--yes)       AUTO_YES=true; shift ;;
+      -v|--verbose)   VERBOSE=true; shift ;;
+      -h|--help)      cmd_cache_cleanup_usage ;;
+      *) die "cache-cleanup: unknown option: $1" ;;
+    esac
+  done
+
+  [ -n "$CACHE_CLEANUP_OLDER_THAN" ] && { [[ "$CACHE_CLEANUP_OLDER_THAN" =~ ^[0-9]+$ ]] || die "cache-cleanup: --older-than must be a whole number of days"; }
+  [ -n "$CACHE_CLEANUP_KEEP" ] && { [[ "$CACHE_CLEANUP_KEEP" =~ ^[0-9]+$ ]] || die "cache-cleanup: --keep must be a whole number"; }
+  [[ "$CACHE_CLEANUP_LIMIT" =~ ^[0-9]+$ ]] || die "cache-cleanup: --limit must be a whole number"
+  [ -n "$CACHE_CLEANUP_REPO" ] && [[ "$CACHE_CLEANUP_REPO" != */* ]] && die "cache-cleanup: --repo must be OWNER/NAME"
+  if [ -n "$CACHE_CLEANUP_KEY" ]; then
+    jq -n --arg p "$CACHE_CLEANUP_KEY" '"" | test($p)' >/dev/null 2>&1 \
+      || die "cache-cleanup: --key is not a valid regex: ${CACHE_CLEANUP_KEY}"
+  fi
+  return 0
+}
+
+cmd_cache_cleanup_main() {
+  cmd_cache_cleanup_parse_args "$@"
+  preflight_check
+  skip_init
+
+  if [ -z "$CACHE_CLEANUP_TARGET" ]; then
+    CACHE_CLEANUP_TARGET=$(get_username)
+    CACHE_CLEANUP_TARGET_TYPE="user"
+  fi
+
+  local min_bytes=0 cutoff=""
+  [ -n "$CACHE_CLEANUP_LARGER_THAN" ] && min_bytes=$(parse_size "$CACHE_CLEANUP_LARGER_THAN")
+  [ -n "$CACHE_CLEANUP_OLDER_THAN" ] && cutoff=$(cutoff_date "$CACHE_CLEANUP_OLDER_THAN" days)
+
+  header "Actions Cache Cleanup"
+  if [ -n "$CACHE_CLEANUP_REPO" ]; then
+    echo -e "  Repo:        ${BOLD}${CACHE_CLEANUP_REPO}${NC}"
+  else
+    echo -e "  Target:      ${BOLD}${CACHE_CLEANUP_TARGET}${NC}"
+  fi
+  [ -n "$cutoff" ] && echo -e "  Not used in: ${BOLD}${CACHE_CLEANUP_OLDER_THAN}${NC} days (before ${cutoff%%T*})"
+  [ -n "$CACHE_CLEANUP_KEY" ] && echo -e "  Key regex:   ${BOLD}${CACHE_CLEANUP_KEY}${NC}"
+  [ -n "$CACHE_CLEANUP_REF" ] && echo -e "  Ref:         ${BOLD}${CACHE_CLEANUP_REF}${NC}"
+  [ "$min_bytes" -gt 0 ] && echo -e "  Larger than: ${BOLD}$(human_bytes "$min_bytes")${NC}"
+  [ -n "$CACHE_CLEANUP_KEEP" ] && echo -e "  Keep:        ${BOLD}${CACHE_CLEANUP_KEEP}${NC} most recent per repo"
+  $DRY_RUN && echo -e "  Mode:        ${YELLOW}DRY RUN${NC}"
+  echo ""
+
+  local repo_file cand_file
+  repo_file=$(resolve_repo_list "$CACHE_CLEANUP_TARGET" "$CACHE_CLEANUP_REPO" "$CACHE_CLEANUP_LIMIT" "cache-cleanup")
+  cand_file=$(tmp_new)
+
+  echo -e "${DIM}Scanning $(count_lines "$repo_file") repo(s)...${NC}"
+  local nwo caches
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    caches=$(gh_paginate "$nwo" "repos/${nwo}/actions/caches?per_page=100" '.actions_caches[]') || continue
+    printf '%s' "$caches" | jq -r \
+      --arg repo "$nwo" --arg cutoff "$cutoff" --arg key "$CACHE_CLEANUP_KEY" \
+      --arg ref "$CACHE_CLEANUP_REF" --argjson min "$min_bytes" \
+      --argjson keep "${CACHE_CLEANUP_KEEP:-0}" '
+      sort_by(.last_accessed_at) | reverse
+      | (if $keep > 0 then .[$keep:] else . end)
+      | map(select($cutoff == "" or .last_accessed_at < $cutoff))
+      | map(select($key == "" or (.key | test($key))))
+      | map(select($ref == "" or .ref == $ref))
+      | map(select(.size_in_bytes >= $min))
+      | .[] | [$repo, (.id | tostring), .key, (.size_in_bytes | tostring), .ref, .last_accessed_at] | @tsv
+      ' >> "$cand_file"
+  done < "$repo_file"
+
+  local n_cand total_bytes
+  n_cand=$(count_lines "$cand_file")
+  if [ "$n_cand" -eq 0 ]; then
+    echo -e "${GREEN}No caches match — nothing to reclaim.${NC}"
+    print_skips
+    exit 0
+  fi
+  total_bytes=$(awk -F'\t' '{s += $4} END {printf "%d", s + 0}' "$cand_file")
+
+  echo ""
+  echo -e "${YELLOW}${n_cand} cache(s), $(human_bytes "$total_bytes") reclaimable${NC}"
+  awk -F'\t' '{s[$1] += $4; n[$1]++} END {for (r in s) printf "%s\t%d\t%d\n", r, n[r], s[r]}' "$cand_file" \
+    | sort -k3 -rn | while IFS=$'\t' read -r r n b; do
+        echo -e "  ${DIM}•${NC} ${r} ${DIM}(${n} caches, $(human_bytes "$b"))${NC}"
+      done
+  if $VERBOSE; then
+    echo ""
+    while IFS=$'\t' read -r r id key sz ref last; do
+      echo -e "    ${DIM}${r}  ${key}  $(human_bytes "$sz")  ${ref}  ${last%%T*}${NC}"
+    done < "$cand_file"
+  fi
+  echo ""
+
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no caches were deleted.${NC}"
+    print_skips
+    exit 0
+  fi
+
+  if ! confirm "Delete ${n_cand} cache(s) and reclaim $(human_bytes "$total_bytes")?"; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  local deleted=0 fail=0 freed=0 r id key sz ref last
+  while IFS=$'\t' read -r r id key sz ref last; do
+    if gh api --method DELETE "repos/${r}/actions/caches/${id}" &>/dev/null; then
+      deleted=$((deleted + 1)); freed=$((freed + sz))
+      $VERBOSE && echo -e "  ${GREEN}DELETED${NC}  ${r} ${DIM}${key}${NC}"
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC}   ${r} ${DIM}${key}${NC}"
+    fi
+  done < "$cand_file"
+
+  echo ""
+  echo -e "${GREEN}Done!${NC} Deleted: ${BOLD}${deleted}${NC}, Failed: ${BOLD}${fail}${NC}, Reclaimed: ${BOLD}$(human_bytes "$freed")${NC}"
+  print_skips
+}
+
+# =============================================================================
+# COMMAND: artifact-cleanup
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+ARTIFACT_CLEANUP_TARGET=""
+ARTIFACT_CLEANUP_TARGET_TYPE=""
+ARTIFACT_CLEANUP_REPO=""
+ARTIFACT_CLEANUP_OLDER_THAN=""
+ARTIFACT_CLEANUP_NAME=""
+ARTIFACT_CLEANUP_BRANCH=""
+ARTIFACT_CLEANUP_LARGER_THAN=""
+ARTIFACT_CLEANUP_EXPIRED=false
+ARTIFACT_CLEANUP_LIMIT=200
+
+cmd_artifact_cleanup_usage() {
+  cat <<EOF
+${BOLD}github-helpers artifact-cleanup${NC} ${DIM}v${VERSION}${NC} — Delete GitHub Actions artifacts
+
+${BOLD}USAGE${NC}
+  github-helpers artifact-cleanup [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --repo OWNER/NAME       Single repository
+  --older-than N          Artifacts created more than N days ago
+  --name PATTERN          Artifact name matches this regex
+  --branch NAME           Only artifacts from runs on this branch
+  --larger-than SIZE      Artifacts at least this big (100MB, 1.5GiB)
+  --expired               Only ALREADY-EXPIRED artifacts (see NOTE)
+  --limit N               Max repos to scan (default: ${ARTIFACT_CLEANUP_LIMIT})
+  --dry-run               Show what would be deleted, delete nothing
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           List every artifact, not just the totals
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers artifact-cleanup --dry-run
+  github-helpers artifact-cleanup --older-than 14 -y
+  github-helpers artifact-cleanup --repo me/proj --larger-than 200MB
+
+${BOLD}NOTE${NC}
+  Expired artifacts no longer count against billed storage, so deleting them
+  reclaims nothing. They are excluded by default; --expired selects only them,
+  for tidiness rather than savings.
+
+  To also drop the runs themselves (and their logs), see ${BOLD}run-cleanup${NC}.
+EOF
+  exit 0
+}
+
+cmd_artifact_cleanup_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)        need_arg "--user" "${2:-}"; ARTIFACT_CLEANUP_TARGET="$2"; ARTIFACT_CLEANUP_TARGET_TYPE="user"; shift 2 ;;
+      --org)         need_arg "--org" "${2:-}"; ARTIFACT_CLEANUP_TARGET="$2"; ARTIFACT_CLEANUP_TARGET_TYPE="org"; shift 2 ;;
+      --repo)        need_arg "--repo" "${2:-}"; ARTIFACT_CLEANUP_REPO="$2"; shift 2 ;;
+      --older-than)  need_arg "--older-than" "${2:-}"; ARTIFACT_CLEANUP_OLDER_THAN="$2"; shift 2 ;;
+      --name)        need_arg "--name" "${2:-}"; ARTIFACT_CLEANUP_NAME="$2"; shift 2 ;;
+      --branch)      need_arg "--branch" "${2:-}"; ARTIFACT_CLEANUP_BRANCH="$2"; shift 2 ;;
+      --larger-than) need_arg "--larger-than" "${2:-}"; ARTIFACT_CLEANUP_LARGER_THAN="$2"; shift 2 ;;
+      --expired)     ARTIFACT_CLEANUP_EXPIRED=true; shift ;;
+      --limit)       need_arg "--limit" "${2:-}"; ARTIFACT_CLEANUP_LIMIT="$2"; shift 2 ;;
+      --dry-run)     DRY_RUN=true; shift ;;
+      -y|--yes)      AUTO_YES=true; shift ;;
+      -v|--verbose)  VERBOSE=true; shift ;;
+      -h|--help)     cmd_artifact_cleanup_usage ;;
+      *) die "artifact-cleanup: unknown option: $1" ;;
+    esac
+  done
+
+  [ -n "$ARTIFACT_CLEANUP_OLDER_THAN" ] && { [[ "$ARTIFACT_CLEANUP_OLDER_THAN" =~ ^[0-9]+$ ]] || die "artifact-cleanup: --older-than must be a whole number of days"; }
+  [[ "$ARTIFACT_CLEANUP_LIMIT" =~ ^[0-9]+$ ]] || die "artifact-cleanup: --limit must be a whole number"
+  [ -n "$ARTIFACT_CLEANUP_REPO" ] && [[ "$ARTIFACT_CLEANUP_REPO" != */* ]] && die "artifact-cleanup: --repo must be OWNER/NAME"
+  if [ -n "$ARTIFACT_CLEANUP_NAME" ]; then
+    jq -n --arg p "$ARTIFACT_CLEANUP_NAME" '"" | test($p)' >/dev/null 2>&1 \
+      || die "artifact-cleanup: --name is not a valid regex: ${ARTIFACT_CLEANUP_NAME}"
+  fi
+  return 0
+}
+
+cmd_artifact_cleanup_main() {
+  cmd_artifact_cleanup_parse_args "$@"
+  preflight_check
+  skip_init
+
+  if [ -z "$ARTIFACT_CLEANUP_TARGET" ]; then
+    ARTIFACT_CLEANUP_TARGET=$(get_username)
+    ARTIFACT_CLEANUP_TARGET_TYPE="user"
+  fi
+
+  local min_bytes=0 cutoff=""
+  [ -n "$ARTIFACT_CLEANUP_LARGER_THAN" ] && min_bytes=$(parse_size "$ARTIFACT_CLEANUP_LARGER_THAN")
+  [ -n "$ARTIFACT_CLEANUP_OLDER_THAN" ] && cutoff=$(cutoff_date "$ARTIFACT_CLEANUP_OLDER_THAN" days)
+
+  header "Actions Artifact Cleanup"
+  if [ -n "$ARTIFACT_CLEANUP_REPO" ]; then
+    echo -e "  Repo:        ${BOLD}${ARTIFACT_CLEANUP_REPO}${NC}"
+  else
+    echo -e "  Target:      ${BOLD}${ARTIFACT_CLEANUP_TARGET}${NC}"
+  fi
+  [ -n "$cutoff" ] && echo -e "  Older than:  ${BOLD}${ARTIFACT_CLEANUP_OLDER_THAN}${NC} days (before ${cutoff%%T*})"
+  [ -n "$ARTIFACT_CLEANUP_NAME" ] && echo -e "  Name regex:  ${BOLD}${ARTIFACT_CLEANUP_NAME}${NC}"
+  [ -n "$ARTIFACT_CLEANUP_BRANCH" ] && echo -e "  Branch:      ${BOLD}${ARTIFACT_CLEANUP_BRANCH}${NC}"
+  [ "$min_bytes" -gt 0 ] && echo -e "  Larger than: ${BOLD}$(human_bytes "$min_bytes")${NC}"
+  $ARTIFACT_CLEANUP_EXPIRED && echo -e "  Selecting:   ${BOLD}expired only${NC} ${DIM}(reclaims no billed storage)${NC}"
+  $DRY_RUN && echo -e "  Mode:        ${YELLOW}DRY RUN${NC}"
+  echo ""
+
+  local repo_file cand_file
+  repo_file=$(resolve_repo_list "$ARTIFACT_CLEANUP_TARGET" "$ARTIFACT_CLEANUP_REPO" "$ARTIFACT_CLEANUP_LIMIT" "artifact-cleanup")
+  cand_file=$(tmp_new)
+
+  echo -e "${DIM}Scanning $(count_lines "$repo_file") repo(s)...${NC}"
+  local nwo arts
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    arts=$(gh_paginate "$nwo" "repos/${nwo}/actions/artifacts?per_page=100" '.artifacts[]') || continue
+    printf '%s' "$arts" | jq -r \
+      --arg repo "$nwo" --arg cutoff "$cutoff" --arg name "$ARTIFACT_CLEANUP_NAME" \
+      --arg branch "$ARTIFACT_CLEANUP_BRANCH" --argjson min "$min_bytes" \
+      --argjson wantExpired "$ARTIFACT_CLEANUP_EXPIRED" '
+      map(select(if $wantExpired then .expired == true else .expired != true end))
+      | map(select($cutoff == "" or .created_at < $cutoff))
+      | map(select($name == "" or (.name | test($name))))
+      | map(select($branch == "" or (.workflow_run.head_branch // "") == $branch))
+      | map(select(.size_in_bytes >= $min))
+      | .[] | [$repo, (.id | tostring), .name, (.size_in_bytes | tostring),
+               (.workflow_run.head_branch // ""), .created_at] | @tsv
+      ' >> "$cand_file"
+  done < "$repo_file"
+
+  local n_cand total_bytes
+  n_cand=$(count_lines "$cand_file")
+  if [ "$n_cand" -eq 0 ]; then
+    echo -e "${GREEN}No artifacts match — nothing to delete.${NC}"
+    print_skips
+    exit 0
+  fi
+  total_bytes=$(awk -F'\t' '{s += $4} END {printf "%d", s + 0}' "$cand_file")
+
+  echo ""
+  echo -e "${YELLOW}${n_cand} artifact(s), $(human_bytes "$total_bytes")${NC}"
+  awk -F'\t' '{s[$1] += $4; n[$1]++} END {for (r in s) printf "%s\t%d\t%d\n", r, n[r], s[r]}' "$cand_file" \
+    | sort -k3 -rn | while IFS=$'\t' read -r r n b; do
+        echo -e "  ${DIM}•${NC} ${r} ${DIM}(${n} artifacts, $(human_bytes "$b"))${NC}"
+      done
+  if $VERBOSE; then
+    echo ""
+    while IFS=$'\t' read -r r id name sz branch created; do
+      echo -e "    ${DIM}${r}  ${name}  $(human_bytes "$sz")  ${branch}  ${created%%T*}${NC}"
+    done < "$cand_file"
+  fi
+  echo ""
+
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no artifacts were deleted.${NC}"
+    print_skips
+    exit 0
+  fi
+
+  if ! confirm "Delete ${n_cand} artifact(s) ($(human_bytes "$total_bytes"))?"; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  local deleted=0 fail=0 freed=0 r id name sz branch created
+  while IFS=$'\t' read -r r id name sz branch created; do
+    if gh api --method DELETE "repos/${r}/actions/artifacts/${id}" &>/dev/null; then
+      deleted=$((deleted + 1)); freed=$((freed + sz))
+      $VERBOSE && echo -e "  ${GREEN}DELETED${NC}  ${r} ${DIM}${name}${NC}"
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC}   ${r} ${DIM}${name}${NC}"
+    fi
+  done < "$cand_file"
+
+  echo ""
+  echo -e "${GREEN}Done!${NC} Deleted: ${BOLD}${deleted}${NC}, Failed: ${BOLD}${fail}${NC}, Reclaimed: ${BOLD}$(human_bytes "$freed")${NC}"
+  print_skips
+}
+
+# =============================================================================
+# COMMAND: run-cleanup
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+RUN_CLEANUP_TARGET=""
+RUN_CLEANUP_TARGET_TYPE=""
+RUN_CLEANUP_REPO=""
+RUN_CLEANUP_OLDER_THAN=""
+RUN_CLEANUP_KEEP=""
+RUN_CLEANUP_CONCLUSION=""
+RUN_CLEANUP_BRANCH=""
+RUN_CLEANUP_WORKFLOW=""
+RUN_CLEANUP_LIMIT=200
+
+cmd_run_cleanup_usage() {
+  cat <<EOF
+${BOLD}github-helpers run-cleanup${NC} ${DIM}v${VERSION}${NC} — Delete old GitHub Actions workflow runs
+
+${BOLD}USAGE${NC}
+  github-helpers run-cleanup [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --repo OWNER/NAME       Single repository
+  --older-than N          Runs created more than N days ago
+  --keep N                Keep the N most recent runs OF EACH WORKFLOW
+  --conclusion C          success, failure, cancelled, skipped, timed_out...
+  --branch NAME           Only runs on this branch
+  --workflow NAME         Only this workflow (file name or display name)
+  --limit N               Max repos to scan (default: ${RUN_CLEANUP_LIMIT})
+  --dry-run               Show what would be deleted, delete nothing
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           List every run, not just the totals
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers run-cleanup --older-than 90 --dry-run
+  github-helpers run-cleanup --keep 10 -y
+  github-helpers run-cleanup --conclusion failure --older-than 30
+  github-helpers run-cleanup --repo me/proj --workflow ci.yml --keep 5
+
+${BOLD}NOTE${NC}
+  --keep is per workflow, not per repo: a noisy workflow would otherwise wipe
+  out the entire history of a rarely-run one.
+
+  Deleting a run also deletes ${BOLD}its logs and its artifacts${NC}. To reclaim storage
+  while keeping the run history, use ${BOLD}artifact-cleanup${NC} instead.
+
+  Runs that are queued, in progress or waiting are never deleted.
+EOF
+  exit 0
+}
+
+cmd_run_cleanup_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)        need_arg "--user" "${2:-}"; RUN_CLEANUP_TARGET="$2"; RUN_CLEANUP_TARGET_TYPE="user"; shift 2 ;;
+      --org)         need_arg "--org" "${2:-}"; RUN_CLEANUP_TARGET="$2"; RUN_CLEANUP_TARGET_TYPE="org"; shift 2 ;;
+      --repo)        need_arg "--repo" "${2:-}"; RUN_CLEANUP_REPO="$2"; shift 2 ;;
+      --older-than)  need_arg "--older-than" "${2:-}"; RUN_CLEANUP_OLDER_THAN="$2"; shift 2 ;;
+      --keep)        need_arg "--keep" "${2:-}"; RUN_CLEANUP_KEEP="$2"; shift 2 ;;
+      --conclusion)  need_arg "--conclusion" "${2:-}"; RUN_CLEANUP_CONCLUSION="$2"; shift 2 ;;
+      --branch)      need_arg "--branch" "${2:-}"; RUN_CLEANUP_BRANCH="$2"; shift 2 ;;
+      --workflow)    need_arg "--workflow" "${2:-}"; RUN_CLEANUP_WORKFLOW="$2"; shift 2 ;;
+      --limit)       need_arg "--limit" "${2:-}"; RUN_CLEANUP_LIMIT="$2"; shift 2 ;;
+      --dry-run)     DRY_RUN=true; shift ;;
+      -y|--yes)      AUTO_YES=true; shift ;;
+      -v|--verbose)  VERBOSE=true; shift ;;
+      -h|--help)     cmd_run_cleanup_usage ;;
+      *) die "run-cleanup: unknown option: $1" ;;
+    esac
+  done
+
+  [ -n "$RUN_CLEANUP_OLDER_THAN" ] && { [[ "$RUN_CLEANUP_OLDER_THAN" =~ ^[0-9]+$ ]] || die "run-cleanup: --older-than must be a whole number of days"; }
+  [ -n "$RUN_CLEANUP_KEEP" ] && { [[ "$RUN_CLEANUP_KEEP" =~ ^[0-9]+$ ]] || die "run-cleanup: --keep must be a whole number"; }
+  [[ "$RUN_CLEANUP_LIMIT" =~ ^[0-9]+$ ]] || die "run-cleanup: --limit must be a whole number"
+  [ -n "$RUN_CLEANUP_REPO" ] && [[ "$RUN_CLEANUP_REPO" != */* ]] && die "run-cleanup: --repo must be OWNER/NAME"
+  if [ -z "$RUN_CLEANUP_OLDER_THAN" ] && [ -z "$RUN_CLEANUP_KEEP" ] && [ -z "$RUN_CLEANUP_CONCLUSION" ]; then
+    die "run-cleanup: refusing to delete every run — use --older-than, --keep or --conclusion"
+  fi
+  return 0
+}
+
+cmd_run_cleanup_main() {
+  cmd_run_cleanup_parse_args "$@"
+  preflight_check
+  skip_init
+
+  if [ -z "$RUN_CLEANUP_TARGET" ]; then
+    RUN_CLEANUP_TARGET=$(get_username)
+    RUN_CLEANUP_TARGET_TYPE="user"
+  fi
+
+  local cutoff=""
+  [ -n "$RUN_CLEANUP_OLDER_THAN" ] && cutoff=$(cutoff_date "$RUN_CLEANUP_OLDER_THAN" days)
+
+  header "Workflow Run Cleanup"
+  if [ -n "$RUN_CLEANUP_REPO" ]; then
+    echo -e "  Repo:       ${BOLD}${RUN_CLEANUP_REPO}${NC}"
+  else
+    echo -e "  Target:     ${BOLD}${RUN_CLEANUP_TARGET}${NC}"
+  fi
+  [ -n "$cutoff" ] && echo -e "  Older than: ${BOLD}${RUN_CLEANUP_OLDER_THAN}${NC} days (before ${cutoff%%T*})"
+  [ -n "$RUN_CLEANUP_KEEP" ] && echo -e "  Keep:       ${BOLD}${RUN_CLEANUP_KEEP}${NC} most recent per workflow"
+  [ -n "$RUN_CLEANUP_CONCLUSION" ] && echo -e "  Conclusion: ${BOLD}${RUN_CLEANUP_CONCLUSION}${NC}"
+  [ -n "$RUN_CLEANUP_BRANCH" ] && echo -e "  Branch:     ${BOLD}${RUN_CLEANUP_BRANCH}${NC}"
+  [ -n "$RUN_CLEANUP_WORKFLOW" ] && echo -e "  Workflow:   ${BOLD}${RUN_CLEANUP_WORKFLOW}${NC}"
+  $DRY_RUN && echo -e "  Mode:       ${YELLOW}DRY RUN${NC}"
+  echo ""
+
+  # `created=<DATE` is the only server-side filter the runs API offers. Without
+  # --older-than every page of every repo's full history has to come down.
+  if [ -z "$cutoff" ]; then
+    warn "no --older-than: the full run history of each repo must be paged in, which is slow"
+  fi
+
+  local repo_file cand_file
+  repo_file=$(resolve_repo_list "$RUN_CLEANUP_TARGET" "$RUN_CLEANUP_REPO" "$RUN_CLEANUP_LIMIT" "run-cleanup")
+  cand_file=$(tmp_new)
+
+  echo -e "${DIM}Scanning $(count_lines "$repo_file") repo(s)...${NC}"
+  local nwo runs query
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    # created=<DATE is a server-side filter — far cheaper than paging it all in.
+    query="per_page=100&exclude_pull_requests=true"
+    [ -n "$cutoff" ] && query="${query}&created=%3C${cutoff%%T*}"
+    [ -n "$RUN_CLEANUP_BRANCH" ] && query="${query}&branch=${RUN_CLEANUP_BRANCH}"
+    runs=$(gh_paginate "$nwo" "repos/${nwo}/actions/runs?${query}" '.workflow_runs[]') || continue
+    printf '%s' "$runs" | jq -r \
+      --arg repo "$nwo" --arg cutoff "$cutoff" --arg concl "$RUN_CLEANUP_CONCLUSION" \
+      --arg wf "$RUN_CLEANUP_WORKFLOW" --argjson keep "${RUN_CLEANUP_KEEP:-0}" '
+      # Never touch a run that has not finished. Bind the status first: after a
+      # pipe the context is the literal array, so `index(.status)` would look
+      # up ".status" on the array itself.
+      map(select((.status // "") as $st
+                 | ["queued","in_progress","requested","waiting","pending"]
+                 | index($st) == null))
+      | map(select($wf == "" or (.name // "") == $wf or ((.path // "") | endswith("/" + $wf))))
+      | group_by(.workflow_id)
+      | map(sort_by(.created_at) | reverse | (if $keep > 0 then .[$keep:] else . end))
+      | flatten
+      | map(select($cutoff == "" or .created_at < $cutoff))
+      | map(select($concl == "" or (.conclusion // "") == $concl))
+      | .[] | [$repo, (.id | tostring), (.name // "?"), (.conclusion // "none"),
+               (.head_branch // ""), .created_at] | @tsv
+      ' >> "$cand_file"
+  done < "$repo_file"
+
+  local n_cand
+  n_cand=$(count_lines "$cand_file")
+  if [ "$n_cand" -eq 0 ]; then
+    echo -e "${GREEN}No runs match — nothing to delete.${NC}"
+    print_skips
+    exit 0
+  fi
+
+  echo ""
+  echo -e "${YELLOW}${n_cand} workflow run(s) to delete${NC}"
+  awk -F'\t' '{n[$1]++} END {for (r in n) printf "%s\t%d\n", r, n[r]}' "$cand_file" \
+    | sort -k2 -rn | while IFS=$'\t' read -r r n; do
+        echo -e "  ${DIM}•${NC} ${r} ${DIM}(${n} runs)${NC}"
+      done
+  if $VERBOSE; then
+    echo ""
+    while IFS=$'\t' read -r r id name concl branch created; do
+      echo -e "    ${DIM}${r}  ${name}  ${concl}  ${branch}  ${created%%T*}${NC}"
+    done < "$cand_file"
+  fi
+  echo ""
+
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no runs were deleted.${NC}"
+    print_skips
+    exit 0
+  fi
+
+  if ! confirm "Delete ${n_cand} workflow run(s), including their logs and artifacts?"; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  local deleted=0 fail=0 r id name concl branch created
+  while IFS=$'\t' read -r r id name concl branch created; do
+    if gh api --method DELETE "repos/${r}/actions/runs/${id}" &>/dev/null; then
+      deleted=$((deleted + 1))
+      $VERBOSE && echo -e "  ${GREEN}DELETED${NC}  ${r} ${DIM}#${id} ${name}${NC}"
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC}   ${r} ${DIM}#${id} ${name}${NC}"
+    fi
+  done < "$cand_file"
+
+  echo ""
+  echo -e "${GREEN}Done!${NC} Deleted: ${BOLD}${deleted}${NC}, Failed: ${BOLD}${fail}${NC}"
+  print_skips
+}
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -5924,6 +6514,9 @@ main() {
     clone-org)             cmd_clone_org_main "$@" ;;
     cleanup-forks|forks)   cmd_cleanup_forks_main "$@" ;;
     sync-forks)            cmd_sync_forks_main "$@" ;;
+    cache-cleanup)         cmd_cache_cleanup_main "$@" ;;
+    artifact-cleanup)      cmd_artifact_cleanup_main "$@" ;;
+    run-cleanup)           cmd_run_cleanup_main "$@" ;;
     cleanup-branches)      cmd_cleanup_branches_main "$@" ;;
     archive-repos)         cmd_archive_repos_main "$@" ;;
     repo-audit|audit)      cmd_repo_audit_main "$@" ;;
