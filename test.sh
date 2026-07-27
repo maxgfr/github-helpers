@@ -374,6 +374,157 @@ assert_eq "pipe subshell counter stays 0 (verifying the bug)" "0" "$count"
 
 echo ""
 
+# ── 11. Shared helpers ───────────────────────────────────────────────────────
+echo -e "${BOLD}11. Shared helpers${NC}"
+setup_env
+
+# cutoff_date: exact values are time-dependent, so assert shape and ordering.
+assert_match "cutoff_date emits an ISO-8601 Z timestamp" \
+  '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$(cutoff_date 30 days)"
+assert_match "cutoff_date accepts months" \
+  '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' "$(cutoff_date 6 months)"
+older=$(cutoff_date 2 days); newer=$(cutoff_date 1 days)
+[[ "$older" < "$newer" ]] && ord=0 || ord=1
+assert_exit_code "cutoff_date output sorts lexicographically by age" 0 $ord
+(cutoff_date abc days) &>/dev/null && rc=0 || rc=1
+assert_exit_code "cutoff_date rejects a non-numeric count" 1 $rc
+(cutoff_date 5 weeks) &>/dev/null && rc=0 || rc=1
+assert_exit_code "cutoff_date rejects an unknown unit" 1 $rc
+
+# parse_size / human_bytes
+assert_eq "parse_size plain bytes"    "100"        "$(parse_size 100)"
+assert_eq "parse_size 500K"           "512000"     "$(parse_size 500K)"
+assert_eq "parse_size 100MB"          "104857600"  "$(parse_size 100MB)"
+assert_eq "parse_size fractional GiB" "1610612736" "$(parse_size 1.5GiB)"
+(parse_size 12ZB) &>/dev/null && rc=0 || rc=1
+assert_exit_code "parse_size rejects an unknown unit" 1 $rc
+(parse_size "") &>/dev/null && rc=0 || rc=1
+assert_exit_code "parse_size rejects an empty value" 1 $rc
+assert_eq "human_bytes under 1K"  "512 B"   "$(human_bytes 512)"
+assert_eq "human_bytes KB"        "1.0 KB"  "$(human_bytes 1024)"
+assert_eq "human_bytes GB"        "1.2 GB"  "$(human_bytes 1288490188)"
+assert_eq "human_bytes on garbage" "0 B"    "$(human_bytes abc)"
+
+# count_lines: `grep -c '.' f || echo 0` prints "0\n0" on an empty file.
+empty_file=$(mktemp); : > "$empty_file"
+assert_eq "count_lines on an empty file is a single 0" "0" "$(count_lines "$empty_file")"
+printf 'a\n\nb\n' > "$empty_file"
+assert_eq "count_lines ignores blank lines" "2" "$(count_lines "$empty_file")"
+assert_eq "count_lines on a missing file is 0" "0" "$(count_lines /nonexistent-zz)"
+rm -f "$empty_file"
+
+# confirm: honours --yes and --dry-run, and defaults to no.
+setup_env
+AUTO_YES=false DRY_RUN=false
+confirm "x" </dev/null && rc=0 || rc=1
+assert_exit_code "confirm defaults to no on empty input" 1 $rc
+echo y | confirm "x" && rc=0 || rc=1
+assert_exit_code "confirm accepts y" 0 $rc
+echo n | confirm "x" && rc=0 || rc=1
+assert_exit_code "confirm rejects n" 1 $rc
+AUTO_YES=true DRY_RUN=false
+confirm "x" </dev/null && rc=0 || rc=1
+assert_exit_code "confirm auto-proceeds under --yes" 0 $rc
+AUTO_YES=false DRY_RUN=true
+confirm "x" </dev/null && rc=0 || rc=1
+assert_exit_code "confirm auto-proceeds under --dry-run" 0 $rc
+setup_env
+
+# render_rows
+ROWS='[{"a":"x","b":1},{"a":"y","b":2}]'
+assert_eq "render_rows csv header follows key order" '"a","b"' "$(render_rows csv "$ROWS" | head -1)"
+assert_eq "render_rows csv row" '"y","2"' "$(render_rows csv "$ROWS" | tail -1)"
+assert_eq "render_rows md header" '| a | b |' "$(render_rows md "$ROWS" | head -1)"
+assert_eq "render_rows on an empty array emits nothing" "" "$(render_rows csv '[]')"
+assert_eq "render_rows flattens newlines in csv" '"a b","1"' \
+  "$(render_rows csv '[{"a":"a\nb","b":1}]' | tail -1)"
+
+echo ""
+
+# ── 12. cleanup-forks: the fail-safe classifier ─────────────────────────────
+echo -e "${BOLD}12. cleanup-forks fail-safe classifier${NC}"
+setup_env
+CUT="2026-01-01T00:00:00Z"
+OLD="2025-01-01T00:00:00Z"
+NEW="2026-07-01T00:00:00Z"
+verdict() { cmd_cleanup_forks_cheap_verdict "$@" | cut -f1; }
+
+CLEANUP_FORKS_INCLUDE_ORPHANS=false
+CLEANUP_FORKS_INCLUDE_ARCHIVED=false
+CLEANUP_FORKS_IGNORE_POPULARITY=false
+
+assert_eq "clean, old, unpopular fork goes to the API probe" "PROBE" \
+  "$(verdict u/a p/a false false false 0 0 0 "$OLD" "$OLD" "$CUT")"
+assert_eq "orphan is protected by default" "PROTECTED" \
+  "$(verdict u/a '' false false false 0 0 0 "$OLD" "$OLD" "$CUT")"
+assert_eq "stars protect" "PROTECTED" \
+  "$(verdict u/a p/a false false false 3 0 0 "$OLD" "$OLD" "$CUT")"
+assert_eq "watchers protect" "PROTECTED" \
+  "$(verdict u/a p/a false false false 0 0 1 "$OLD" "$OLD" "$CUT")"
+assert_eq "being forked by others protects" "PROTECTED" \
+  "$(verdict u/a p/a false false false 0 2 0 "$OLD" "$OLD" "$CUT")"
+assert_eq "archived is protected by default" "PROTECTED" \
+  "$(verdict u/a p/a true false false 0 0 0 "$OLD" "$OLD" "$CUT")"
+assert_eq "locked repo is always protected" "PROTECTED" \
+  "$(verdict u/a p/a false true false 0 0 0 "$OLD" "$OLD" "$CUT")"
+assert_eq "a recent push protects" "PROTECTED" \
+  "$(verdict u/a p/a false false false 0 0 0 "$NEW" "$OLD" "$CUT")"
+assert_eq "a recent creation protects" "PROTECTED" \
+  "$(verdict u/a p/a false false false 0 0 0 "$OLD" "$NEW" "$CUT")"
+assert_eq "an empty star count is unreadable, not zero" "SKIPPED" \
+  "$(verdict u/a p/a false false false '' 0 0 "$OLD" "$OLD" "$CUT")"
+assert_eq "a null star count is unreadable" "SKIPPED" \
+  "$(verdict u/a p/a false false false null 0 0 "$OLD" "$OLD" "$CUT")"
+assert_eq "missing timestamps are unreadable" "SKIPPED" \
+  "$(verdict u/a p/a false false false 0 0 0 '' '' "$CUT")"
+assert_eq "a malformed record is skipped" "SKIPPED" \
+  "$(verdict '' p/a false false false 0 0 0 "$OLD" "$OLD" "$CUT")"
+
+CLEANUP_FORKS_INCLUDE_ORPHANS=true
+assert_eq "--include-orphans lets an orphan reach the probe" "PROBE" \
+  "$(verdict u/a '' false false false 0 0 0 "$OLD" "$OLD" "$CUT")"
+CLEANUP_FORKS_INCLUDE_ORPHANS=false
+CLEANUP_FORKS_IGNORE_POPULARITY=true
+assert_eq "--ignore-popularity drops the star guard" "PROBE" \
+  "$(verdict u/a p/a false false false 99 9 9 "$OLD" "$OLD" "$CUT")"
+CLEANUP_FORKS_IGNORE_POPULARITY=false
+
+# THE invariant: this function must never be able to authorise a deletion.
+bad=0
+for par in "" "p/a"; do for arch in true false; do for lock in true false; do
+  for st in "" null -1 0 5 abc; do for pu in "" "$OLD" "$NEW"; do
+    for orph in true false; do
+      CLEANUP_FORKS_INCLUDE_ORPHANS=$orph
+      [ "$(verdict u/a "$par" "$arch" "$lock" false "$st" 0 0 "$pu" '' "$CUT")" = "DELETABLE" ] \
+        && bad=$((bad + 1))
+    done
+  done; done; done; done; done
+assert_eq "cheap_verdict never emits DELETABLE (288 degenerate inputs)" "0" "$bad"
+CLEANUP_FORKS_INCLUDE_ORPHANS=false
+
+echo ""
+
+# ── 13. Pure parsers ─────────────────────────────────────────────────────────
+echo -e "${BOLD}13. Pure parsers${NC}"
+setup_env
+assert_eq "semver patch bump"                "patch"   "$(cmd_bulk_merge_bump_kind 'Bump lodash from 4.17.20 to 4.17.21')"
+assert_eq "semver minor bump"                "minor"   "$(cmd_bulk_merge_bump_kind 'Bump actions/checkout from 3.1.0 to 3.2.0')"
+assert_eq "semver major bump"                "major"   "$(cmd_bulk_merge_bump_kind 'Bump express from 4.18.2 to 5.0.0')"
+assert_eq "semver bare major tags"           "major"   "$(cmd_bulk_merge_bump_kind 'bump actions/setup-node from 4 to 7')"
+assert_eq "semver partial versions"          "minor"   "$(cmd_bulk_merge_bump_kind 'bump actions/checkout from 4 to 4.1')"
+assert_eq "semver prerelease suffix"         "patch"   "$(cmd_bulk_merge_bump_kind 'Bump @types/node from 20.1.0-beta.1 to 20.1.1')"
+assert_eq "semver grouped update is unknown" "unknown" "$(cmd_bulk_merge_bump_kind 'Bump the npm group with 3 updates')"
+assert_eq "semver unrelated title"           "unknown" "$(cmd_bulk_merge_bump_kind 'Update README')"
+
+# The batch query builder must omit compare() for orphans and pass names as
+# GraphQL variables rather than interpolating them into the query text.
+cmd_cleanup_forks_build_batch_query $'u/a\x1fp/a\x1fmain\x1fmain' $'u/b\x1f\x1f\x1fmain'
+assert_eq "batch query has one alias per fork" "2" "$(printf '%s' "$CF_QUERY" | grep -c 'repository(owner:')"
+assert_eq "batch query omits compare for the orphan" "1" "$(printf '%s' "$CF_QUERY" | grep -c 'compare(headRef:')"
+assert_eq "repo names travel as GraphQL variables" "-f o0=u -f n0=a -f h0=p:main -f o1=u -f n1=b" "${CF_GQL_ARGS[*]}"
+assert_match "batch meta records the parent per alias" '"f1":\{"nwo":"u/b","parent":""' "$CF_BATCH_META"
+
+echo ""
 # ── 10. Script syntax check ─────────────────────────────────────────────────
 echo -e "${BOLD}10. Script integrity${NC}"
 
@@ -388,6 +539,41 @@ assert_eq "all shift-2 cases have need_arg guard (${needarg_total}/${shift2_tota
 # Verify no local variables in EXIT traps
 bad_traps=$(grep -c "trap.*rm.*\"\$[a-z]" "$SCRIPT_PATH" || true)
 assert_eq "no traps referencing bare local vars" "0" "$bad_traps"
+
+# Confirmations must go through confirm(); the only `read -rp` left is its own.
+raw_prompts=$(grep -c 'read -rp' "$SCRIPT_PATH" || true)
+assert_eq "no hand-rolled confirmation prompts" "1" "$raw_prompts"
+
+# Repo deletion is irreversible: keep it to a single, reviewable call site.
+delete_sites=$(grep -c 'gh repo delete' "$SCRIPT_PATH" || true)
+assert_eq "exactly one 'gh repo delete' call site" "1" "$delete_sites"
+
+# The original bug: GNU `date --iso-8601=seconds` emits `+00:00` where BSD
+# emits `Z`. Every consumer compares lexicographically against GitHub's `Z`
+# timestamps and `+` sorts before `Z`, so results were skewed on Linux only.
+iso_flag=$(grep -c -- '--iso-8601' "$SCRIPT_PATH" || true)
+assert_eq "no --iso-8601 date formatting" "0" "$iso_flag"
+
+# ISO-8601 `Z` timestamps come from exactly two places: the two branches of
+# cutoff_date (N units ago) and `date -u` for "now". Anything else would be a
+# new hand-rolled, platform-dependent date computation.
+# `+FORMAT` produces a timestamp; `-jf FORMAT` parses one, so only the former
+# counts as date arithmetic.
+produced=$(grep -c 'date .*+"\?%Y-%m-%dT%H:%M:%SZ' "$SCRIPT_PATH" | tr -d ' ')
+now_stamps=$(grep -c 'date -u +%Y-%m-%dT%H:%M:%SZ' "$SCRIPT_PATH" | tr -d ' ')
+assert_eq "ISO-Z arithmetic lives only in cutoff_date" "2" "$((produced - now_stamps))"
+
+# Every dispatched command must have a matching usage function.
+missing_usage=0
+while IFS= read -r fn; do
+  grep -q "^${fn%_main}_usage()" "$SCRIPT_PATH" || { missing_usage=$((missing_usage + 1)); echo "       no usage for $fn"; }
+done < <(grep -oE 'cmd_[a-z_]+_main' "$SCRIPT_PATH" | sort -u)
+assert_eq "every command has a usage function" "0" "$missing_usage"
+
+# New commands must not install their own EXIT trap: it would replace the
+# global tmp_cleanup one and leak every file allocated through tmp_new.
+own_traps=$(grep -c "trap .* EXIT" "$SCRIPT_PATH" || true)
+assert_eq "EXIT traps stay at the documented count" "6" "$own_traps"
 
 echo ""
 
