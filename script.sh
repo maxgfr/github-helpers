@@ -433,6 +433,8 @@ ${BOLD}COMMANDS${NC}
   artifact-cleanup    Delete GitHub Actions artifacts
   run-cleanup         Delete old workflow runs (and their logs)
   gist                List, export and bulk-delete your gists
+  notifications       Triage and bulk-clear your notification inbox
+  invite-cleanup      List, accept or decline pending invitations
 
   ${BOLD}Audit & visibility${NC}
   repo-audit          Scan repos for missing LICENSE, README, description, topics
@@ -444,6 +446,7 @@ ${BOLD}COMMANDS${NC}
   branch-protection   Audit or enforce branch protection rules
   webhook-audit       List webhooks across repos
   collaborator-audit  Audit outside collaborators and permissions
+  org-audit           Org-level security and membership posture
   activity-report     Generate activity summary for a period
   traffic             Snapshot repo views and clones (14-day window)
 
@@ -7021,6 +7024,777 @@ cmd_traffic_main() {
   print_skips
 }
 # =============================================================================
+# COMMAND: notifications
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+NOTIF_REPO=""
+NOTIF_REASON=""
+NOTIF_TYPE=""
+NOTIF_DAYS=""
+NOTIF_LIMIT=0
+NOTIF_FORMAT="text"
+NOTIF_ALL=false
+NOTIF_MARK_READ=false
+NOTIF_UNSUB=false
+
+NOTIF_REASONS="assign author comment ci_activity invitation manual mention review_requested security_alert state_change subscribed team_mention"
+
+cmd_notifications_usage() {
+  cat <<EOF
+${BOLD}github-helpers notifications${NC} ${DIM}v${VERSION}${NC} — Triage your notification inbox
+                                        ${DIM}(alias: github-helpers notifs)${NC}
+
+${BOLD}USAGE${NC}
+  github-helpers notifications [filters]
+  github-helpers notifications [filters] --mark-read
+  github-helpers notifications --repo OWNER/NAME --all --unsubscribe
+
+${BOLD}FILTERS${NC}
+  --repo OWNER/NAME       Only this repository
+  --reason REASON         ${DIM}assign, author, comment, ci_activity, invitation, manual,${NC}
+                          ${DIM}mention, review_requested, security_alert, state_change,${NC}
+                          ${DIM}subscribed, team_mention${NC}
+  --type TYPE             Issue, PullRequest, Release, Discussion, CheckSuite...
+  --older-than N          Not updated in the last N days
+  --unread                Only unread ${DIM}(default)${NC}
+  --all                   Include already-read notifications
+  --limit N               Cap the number shown
+
+${BOLD}ACTIONS${NC}
+  --mark-read             Mark the matched notifications as read
+  --unsubscribe           Mute the matched threads permanently
+
+${BOLD}I/O${NC}
+  --format FORMAT         text, json, csv or md (default: text)
+  --dry-run               Preview only
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show more detail
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  # clear a week of CI noise
+  github-helpers notifications --reason ci_activity --older-than 7 --mark-read --dry-run
+  github-helpers notifications --reason ci_activity --older-than 7 --mark-read -y
+
+  # permanently mute every thread in one repo (--all covers read threads too)
+  github-helpers notifications --repo owner/repo --all --unsubscribe --mark-read
+
+${BOLD}NOTE${NC}
+  gh does not request the 'notifications' scope by default:
+    gh auth refresh -h github.com -s notifications
+
+  --unsubscribe sets the thread to "ignored" rather than just dropping the
+  subscription, because a plain unsubscribe silently resubscribes you on the
+  next comment.
+EOF
+  exit 0
+}
+
+cmd_notifications_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)        need_arg "--repo" "${2:-}"; NOTIF_REPO="$2"; shift 2 ;;
+      --reason)      need_arg "--reason" "${2:-}"; NOTIF_REASON="$2"; shift 2 ;;
+      --type)        need_arg "--type" "${2:-}"; NOTIF_TYPE="$2"; shift 2 ;;
+      --older-than)  need_arg "--older-than" "${2:-}"; NOTIF_DAYS="$2"; shift 2 ;;
+      --limit)       need_arg "--limit" "${2:-}"; NOTIF_LIMIT="$2"; shift 2 ;;
+      --format)      need_arg "--format" "${2:-}"; NOTIF_FORMAT="$2"; shift 2 ;;
+      --unread)      NOTIF_ALL=false; shift ;;
+      --all)         NOTIF_ALL=true; shift ;;
+      --list)        shift ;;
+      --mark-read)   NOTIF_MARK_READ=true; shift ;;
+      --unsubscribe) NOTIF_UNSUB=true; shift ;;
+      --dry-run)     DRY_RUN=true; shift ;;
+      -y|--yes)      AUTO_YES=true; shift ;;
+      -v|--verbose)  VERBOSE=true; shift ;;
+      -h|--help)     cmd_notifications_usage ;;
+      *) die "notifications: unknown option: $1" ;;
+    esac
+  done
+
+  case "$NOTIF_FORMAT" in text|json|csv|md) ;; *) die "notifications: invalid --format '${NOTIF_FORMAT}' (use text, json, csv or md)" ;; esac
+  [ -n "$NOTIF_DAYS" ] && { [[ "$NOTIF_DAYS" =~ ^[0-9]+$ ]] || die "notifications: --older-than must be a whole number of days"; }
+  [[ "$NOTIF_LIMIT" =~ ^[0-9]+$ ]] || die "notifications: --limit must be a whole number"
+  [ -n "$NOTIF_REPO" ] && [[ "$NOTIF_REPO" != */* ]] && die "notifications: --repo must be OWNER/NAME"
+  if [ -n "$NOTIF_REASON" ]; then
+    case " $NOTIF_REASONS " in
+      *" $NOTIF_REASON "*) ;;
+      *) die "notifications: unknown --reason '${NOTIF_REASON}' (valid: ${NOTIF_REASONS// /, })" ;;
+    esac
+  fi
+  if [ "$NOTIF_FORMAT" != "text" ] && { $NOTIF_MARK_READ || $NOTIF_UNSUB; }; then
+    die "notifications: --format is for reporting — drop --mark-read/--unsubscribe"
+  fi
+  return 0
+}
+
+cmd_notifications_main() {
+  cmd_notifications_parse_args "$@"
+  preflight_check
+  skip_init
+
+  local out=1
+  [ "$NOTIF_FORMAT" != "text" ] && out=2
+
+  local cutoff=""
+  [ -n "$NOTIF_DAYS" ] && cutoff=$(cutoff_date "$NOTIF_DAYS" days)
+
+  {
+    header "Notifications"
+    [ -n "$NOTIF_REPO" ] && echo -e "  Repo:      ${BOLD}${NOTIF_REPO}${NC}"
+    [ -n "$NOTIF_REASON" ] && echo -e "  Reason:    ${BOLD}${NOTIF_REASON}${NC}"
+    [ -n "$NOTIF_TYPE" ] && echo -e "  Type:      ${BOLD}${NOTIF_TYPE}${NC}"
+    [ -n "$cutoff" ] && echo -e "  Older than:${BOLD} ${NOTIF_DAYS}${NC} days (before ${cutoff%%T*})"
+    $NOTIF_ALL && echo -e "  Include:   ${BOLD}read and unread${NC}" || echo -e "  Include:   ${BOLD}unread only${NC}"
+    $DRY_RUN && echo -e "  Mode:      ${YELLOW}DRY RUN${NC}"
+    echo ""
+  } >&$out
+
+  # `before=` is a real server-side filter on updated_at, so "older than N
+  # days" is a short request instead of a full-inbox download.
+  local path="notifications?all=${NOTIF_ALL}&per_page=100"
+  [ -n "$NOTIF_REPO" ] && path="repos/${NOTIF_REPO}/notifications?all=${NOTIF_ALL}&per_page=100"
+  [ -n "$cutoff" ] && path="${path}&before=${cutoff}"
+
+  local raw
+  raw=$(gh_paginate "notifications" "$path") || {
+    scope_hint "notifications"
+    print_skips
+    exit 0
+  }
+
+  local rows
+  rows=$(printf '%s' "$raw" | jq -c \
+    --arg reason "$NOTIF_REASON" --arg type "$NOTIF_TYPE" --arg cutoff "$cutoff" \
+    --argjson limit "$NOTIF_LIMIT" '
+    [ .[]
+      | select($reason == "" or .reason == $reason)
+      | select($type   == "" or (.subject.type // "") == $type)
+      | select($cutoff == "" or .updated_at < $cutoff)
+      | { id: .id,
+          repo: (.repository.full_name // "?"),
+          reason: .reason,
+          type: (.subject.type // "?"),
+          title: ((.subject.title // "") | gsub("[\t\n\r]"; " ") | .[0:70]),
+          unread: .unread,
+          updated: .updated_at,
+          age: (((now - (.updated_at | fromdateiso8601)) / 86400) | floor) } ]
+    | sort_by(.repo, -.age)
+    | (if $limit > 0 then .[0:$limit] else . end)')
+
+  local total
+  total=$(printf '%s' "$rows" | jq 'length')
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}Inbox clear — nothing matches.${NC}" >&$out
+    print_skips
+    exit 0
+  fi
+
+  if [ "$NOTIF_FORMAT" != "text" ]; then
+    render_rows "$NOTIF_FORMAT" "$(printf '%s' "$rows" | jq 'map({repo, reason, type, title, age, unread, updated})')"
+    print_skips
+    exit 0
+  fi
+
+  echo -e "${YELLOW}${total} notification(s)${NC}"
+  echo ""
+  local last_repo="" repo reason type title age unread rcol reason_pad age_pad type_pad
+  while IFS=$'\t' read -r repo reason type title age unread; do
+    if [ "$repo" != "$last_repo" ]; then
+      [ -n "$last_repo" ] && echo ""
+      local n_in_repo
+      n_in_repo=$(printf '%s' "$rows" | jq --arg r "$repo" '[.[] | select(.repo == $r)] | length')
+      echo -e "  ${BOLD}${repo}${NC} ${DIM}(${n_in_repo})${NC}"
+      last_repo="$repo"
+    fi
+    case "$reason" in
+      security_alert)                    rcol="$RED" ;;
+      mention|review_requested|assign)   rcol="$YELLOW" ;;
+      *)                                 rcol="$DIM" ;;
+    esac
+    # Pad first, colour after: a colour code inside %-Ns breaks the column.
+    printf -v reason_pad '%-16s' "$reason"
+    printf -v age_pad    '%4s'   "${age}d"
+    printf -v type_pad   '%-13s' "$type"
+    echo -e "    ${rcol}${reason_pad}${NC} ${DIM}${age_pad}${NC}  ${type_pad} ${title}"
+  done < <(printf '%s' "$rows" | jq -r '.[] | [.repo, .reason, .type, .title, (.age|tostring), (.unread|tostring)] | @tsv')
+  echo ""
+
+  if ! $NOTIF_MARK_READ && ! $NOTIF_UNSUB; then
+    print_skips
+    exit 0
+  fi
+
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — nothing was changed.${NC}"
+    print_skips
+    exit 0
+  fi
+
+  local -a actions=()
+  $NOTIF_UNSUB && actions+=("unsubscribe")
+  $NOTIF_MARK_READ && actions+=("mark read")
+  local action_str
+  action_str=$(printf '%s and ' "${actions[@]}"); action_str="${action_str% and }"
+  if ! confirm "${action_str^} ${total} notification(s)?"; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  # PUT /notifications marks EVERYTHING read up to last_read_at, so it is only
+  # equivalent to the selection when no reason/type predicate narrowed it.
+  if $NOTIF_MARK_READ && ! $NOTIF_UNSUB && [ -z "$NOTIF_REASON" ] && [ -z "$NOTIF_TYPE" ]; then
+    local bulk_path="notifications" stamp
+    [ -n "$NOTIF_REPO" ] && bulk_path="repos/${NOTIF_REPO}/notifications"
+    stamp="${cutoff:-$(cutoff_date 0 days)}"
+    if jq -n --arg t "$stamp" '{last_read_at: $t, read: true}' \
+         | gh api --method PUT "$bulk_path" --input - &>/dev/null; then
+      echo -e "${GREEN}Done!${NC} Marked everything up to ${BOLD}${stamp%%T*}${NC} as read ${DIM}(1 request)${NC}"
+    else
+      die "notifications: bulk mark-read failed"
+    fi
+    print_skips
+    exit 0
+  fi
+
+  local marked=0 muted=0 fail=0 id
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    if $NOTIF_UNSUB; then
+      if jq -n '{ignored: true}' | gh api --method PUT "notifications/threads/${id}/subscription" --input - &>/dev/null; then
+        muted=$((muted + 1))
+      else
+        fail=$((fail + 1))
+      fi
+    fi
+    if $NOTIF_MARK_READ; then
+      if gh api --method PATCH "notifications/threads/${id}" &>/dev/null; then
+        marked=$((marked + 1))
+      else
+        fail=$((fail + 1))
+      fi
+    fi
+  done < <(printf '%s' "$rows" | jq -r '.[].id')
+
+  echo ""
+  echo -e "${GREEN}Done!${NC} Marked read: ${BOLD}${marked}${NC}, Muted: ${BOLD}${muted}${NC}, Failed: ${BOLD}${fail}${NC}"
+  print_skips
+}
+
+# =============================================================================
+# COMMAND: invite-cleanup
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+INVITE_ORG=""
+INVITE_REPO=""
+INVITE_DAYS=""
+INVITE_DIRECTION="incoming"
+INVITE_ACCEPT=false
+INVITE_DECLINE=false
+
+cmd_invite_cleanup_usage() {
+  cat <<EOF
+${BOLD}github-helpers invite-cleanup${NC} ${DIM}v${VERSION}${NC} — Pending repository and org invitations
+
+${BOLD}USAGE${NC}
+  github-helpers invite-cleanup
+  github-helpers invite-cleanup --accept --repo OWNER/NAME
+  github-helpers invite-cleanup --outgoing --org my-company --decline --older-than 30
+
+${BOLD}OPTIONS${NC}
+  --incoming              Invitations sent TO you ${DIM}(default)${NC}
+  --outgoing              Invitations YOU sent ${DIM}(requires --repo or --org)${NC}
+  --repo OWNER/NAME       Restrict to one repository
+  --org NAME              Restrict to one organization
+  --older-than N          Only invitations older than N days
+  --accept                Accept the listed invitations
+  --decline               Decline them ${DIM}(revoke, in --outgoing mode)${NC}
+  --dry-run               Preview only
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show more detail
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers invite-cleanup
+  github-helpers invite-cleanup --accept --repo friend/project
+  github-helpers invite-cleanup --decline
+  github-helpers invite-cleanup --outgoing --org my-company --older-than 60
+
+${BOLD}NOTE${NC}
+  Listing is the default; --accept and --decline are never implicit.
+
+  --outgoing requires --repo or --org. GraphQL exposes no outgoing-invitation
+  connection, so a whole-account scan would cost one REST call per repository;
+  --org answers in a single call via /orgs/{org}/invitations.
+
+  There is no REST endpoint to DECLINE an organization invitation. Those are
+  reported with a link and counted under "Manual", not as failures.
+EOF
+  exit 0
+}
+
+cmd_invite_cleanup_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --org)         need_arg "--org" "${2:-}"; INVITE_ORG="$2"; shift 2 ;;
+      --repo)        need_arg "--repo" "${2:-}"; INVITE_REPO="$2"; shift 2 ;;
+      --older-than)  need_arg "--older-than" "${2:-}"; INVITE_DAYS="$2"; shift 2 ;;
+      --incoming)    INVITE_DIRECTION="incoming"; shift ;;
+      --outgoing)    INVITE_DIRECTION="outgoing"; shift ;;
+      --accept)      INVITE_ACCEPT=true; shift ;;
+      --decline)     INVITE_DECLINE=true; shift ;;
+      --dry-run)     DRY_RUN=true; shift ;;
+      -y|--yes)      AUTO_YES=true; shift ;;
+      -v|--verbose)  VERBOSE=true; shift ;;
+      -h|--help)     cmd_invite_cleanup_usage ;;
+      *) die "invite-cleanup: unknown option: $1" ;;
+    esac
+  done
+
+  $INVITE_ACCEPT && $INVITE_DECLINE && die "invite-cleanup: --accept and --decline are mutually exclusive"
+  [ -n "$INVITE_DAYS" ] && { [[ "$INVITE_DAYS" =~ ^[0-9]+$ ]] || die "invite-cleanup: --older-than must be a whole number of days"; }
+  [ -n "$INVITE_REPO" ] && [[ "$INVITE_REPO" != */* ]] && die "invite-cleanup: --repo must be OWNER/NAME"
+  if [ "$INVITE_DIRECTION" = "outgoing" ]; then
+    [ -z "$INVITE_ORG" ] && [ -z "$INVITE_REPO" ] \
+      && die "invite-cleanup: --outgoing requires --repo or --org (a full-account scan costs one request per repo)"
+    $INVITE_ACCEPT && die "invite-cleanup: --accept makes no sense for invitations you sent"
+  fi
+  return 0
+}
+
+cmd_invite_cleanup_main() {
+  cmd_invite_cleanup_parse_args "$@"
+  preflight_check
+  skip_init
+
+  local cutoff=""
+  [ -n "$INVITE_DAYS" ] && cutoff=$(cutoff_date "$INVITE_DAYS" days)
+
+  header "Invitations"
+  echo -e "  Direction: ${BOLD}${INVITE_DIRECTION}${NC}"
+  [ -n "$INVITE_ORG" ] && echo -e "  Org:       ${BOLD}${INVITE_ORG}${NC}"
+  [ -n "$INVITE_REPO" ] && echo -e "  Repo:      ${BOLD}${INVITE_REPO}${NC}"
+  [ -n "$cutoff" ] && echo -e "  Older than:${BOLD} ${INVITE_DAYS}${NC} days"
+  $DRY_RUN && echo -e "  Mode:      ${YELLOW}DRY RUN${NC}"
+  echo ""
+
+  local items
+  items=$(tmp_new)
+
+  if [ "$INVITE_DIRECTION" = "incoming" ]; then
+    local repo_inv org_inv
+    repo_inv=$(gh_paginate "repository invitations" "user/repository_invitations?per_page=100") || repo_inv='[]'
+    printf '%s' "$repo_inv" | jq -r --arg cutoff "$cutoff" --arg repo "$INVITE_REPO" '
+      .[] | select($cutoff == "" or .created_at < $cutoff)
+          | select($repo == "" or .repository.full_name == $repo)
+          | ["repo", (.id|tostring), .repository.full_name, (.inviter.login // "?"),
+             (.permissions // "?"), .created_at, (if .expired then "expired" else "" end)] | @tsv' >> "$items"
+
+    org_inv=$(gh_paginate "org memberships" "user/memberships/orgs?state=pending&per_page=100") || org_inv='[]'
+    printf '%s' "$org_inv" | jq -r '
+      .[] | select(.state == "pending")
+          | ["org", .organization.login, .organization.login, "-", (.role // "member"), "", ""] | @tsv' >> "$items"
+  else
+    if [ -n "$INVITE_ORG" ]; then
+      local oi
+      oi=$(gh_paginate "orgs/${INVITE_ORG}/invitations" "orgs/${INVITE_ORG}/invitations?per_page=100") || oi='[]'
+      printf '%s' "$oi" | jq -r --arg org "$INVITE_ORG" --arg cutoff "$cutoff" '
+        .[] | select($cutoff == "" or .created_at < $cutoff)
+            | ["orgout", (.id|tostring), $org, (.login // .email // "?"),
+               (.role // "?"), (.created_at // ""), ""] | @tsv' >> "$items"
+    fi
+    if [ -n "$INVITE_REPO" ]; then
+      local ri
+      ri=$(gh_paginate "$INVITE_REPO" "repos/${INVITE_REPO}/invitations?per_page=100") || ri='[]'
+      printf '%s' "$ri" | jq -r --arg repo "$INVITE_REPO" --arg cutoff "$cutoff" '
+        .[] | select($cutoff == "" or .created_at < $cutoff)
+            | ["repoout", (.id|tostring), $repo, (.invitee.login // "?"),
+               (.permissions // "?"), .created_at, ""] | @tsv' >> "$items"
+    fi
+  fi
+
+  local total
+  total=$(count_lines "$items")
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No pending invitations.${NC}"
+    print_skips
+    exit 0
+  fi
+
+  echo -e "${YELLOW}${total} pending invitation(s)${NC}"
+  echo ""
+  local kind id subject who perm created flag
+  while IFS=$'\t' read -r kind id subject who perm created flag; do
+    local label="${created%%T*}"
+    [ -n "$flag" ] && label="${label} ${YELLOW}${flag}${NC}"
+    case "$kind" in
+      repo)     echo -e "  ${DIM}repo${NC}  ${BOLD}${subject}${NC}  from ${who}  ${perm}  ${DIM}${label}${NC}" ;;
+      org)      echo -e "  ${DIM}org${NC}   ${BOLD}${subject}${NC}  role ${perm}" ;;
+      orgout)   echo -e "  ${DIM}org${NC}   ${BOLD}${subject}${NC}  -> ${who}  ${perm}  ${DIM}${label}${NC}" ;;
+      repoout)  echo -e "  ${DIM}repo${NC}  ${BOLD}${subject}${NC}  -> ${who}  ${perm}  ${DIM}${label}${NC}" ;;
+    esac
+  done < "$items"
+  echo ""
+
+  if ! $INVITE_ACCEPT && ! $INVITE_DECLINE; then
+    print_skips
+    exit 0
+  fi
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — nothing was changed.${NC}"
+    print_skips
+    exit 0
+  fi
+
+  local verb="Accept"
+  $INVITE_DECLINE && { verb="Decline"; [ "$INVITE_DIRECTION" = "outgoing" ] && verb="Revoke"; }
+  if ! confirm "${verb} ${total} invitation(s)?"; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  local ok=0 fail=0 manual=0
+  while IFS=$'\t' read -r kind id subject who perm created flag; do
+    case "${kind}:$($INVITE_ACCEPT && echo accept || echo decline)" in
+      repo:accept)
+        gh api --method PATCH "user/repository_invitations/${id}" &>/dev/null && ok=$((ok+1)) || fail=$((fail+1)) ;;
+      repo:decline)
+        gh api --method DELETE "user/repository_invitations/${id}" &>/dev/null && ok=$((ok+1)) || fail=$((fail+1)) ;;
+      org:accept)
+        jq -n '{state:"active"}' | gh api --method PATCH "user/memberships/orgs/${subject}" --input - &>/dev/null \
+          && ok=$((ok+1)) || fail=$((fail+1)) ;;
+      org:decline)
+        manual=$((manual+1))
+        echo -e "  ${DIM}${subject}: declining an org invitation is not exposed by the REST API${NC}"
+        echo -e "  ${DIM}  -> https://github.com/orgs/${subject}/invitation${NC}" ;;
+      orgout:decline)
+        gh api --method DELETE "orgs/${subject}/invitations/${id}" &>/dev/null && ok=$((ok+1)) || fail=$((fail+1)) ;;
+      repoout:decline)
+        gh api --method DELETE "repos/${subject}/invitations/${id}" &>/dev/null && ok=$((ok+1)) || fail=$((fail+1)) ;;
+      *) manual=$((manual+1)) ;;
+    esac
+  done < "$items"
+
+  echo ""
+  echo -e "${GREEN}Done!${NC} ${verb}d: ${BOLD}${ok}${NC}, Manual: ${BOLD}${manual}${NC}, Failed: ${BOLD}${fail}${NC}"
+  print_skips
+}
+# =============================================================================
+# COMMAND: org-audit
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+ORG_AUDIT_ORG=""
+ORG_AUDIT_FORMAT="text"
+ORG_AUDIT_ONLY_2FA=false
+ORG_AUDIT_ONLY_ADMINS=false
+ORG_AUDIT_FAIL_ON_ISSUES=false
+ORG_AUDIT_CHECKS=""
+
+cmd_org_audit_usage() {
+  cat <<EOF
+${BOLD}github-helpers org-audit${NC} ${DIM}v${VERSION}${NC} — Organization security and membership posture
+
+${BOLD}USAGE${NC}
+  github-helpers org-audit --org NAME [options]
+
+${BOLD}OPTIONS${NC}
+  --org NAME              Organization to audit ${DIM}(required)${NC}
+  --2fa                   Only the two-factor checks
+  --admins                Only the owner-count check
+  --format FORMAT         text, json or csv (default: text)
+  --fail-on-issues        Exit non-zero when the audit finds problems
+  -v, --verbose           Show more detail
+  -h, --help              Show this help
+
+${BOLD}CHECKS${NC}
+  2fa_required            Two-factor enforced organization-wide
+  2fa_members             Members with two-factor disabled
+  owner_count             Too many, or too few, owners
+  outside_collaborators   Number of outside collaborators
+  pending_invitations     Stale invitations still outstanding
+  default_repo_permission Base permission granted on every new repo
+  member_repo_creation    Whether members can create public repos
+  teams                   Access managed through teams rather than per person
+
+${BOLD}EXIT CODES${NC} (only with --fail-on-issues)
+  0  no problems            2  at least one FAIL
+  1  fatal error            3  no FAIL or SKIP, at least one WARN
+                            4  no FAIL, but a check could not run (SKIP)
+  ${DIM}An incomplete audit outranks a known warning: you cannot know what the${NC}
+  ${DIM}check that did not run would have found.${NC}
+
+${BOLD}EXAMPLES${NC}
+  github-helpers org-audit --org my-company
+  github-helpers org-audit --org my-company --format json | jq .summary
+  github-helpers org-audit --org my-company --fail-on-issues   ${DIM}# in CI${NC}
+
+${BOLD}NOTE${NC}
+  This is org-level only and never iterates repositories. For per-repository
+  outside-collaborator access, use ${BOLD}collaborator-audit${NC}.
+
+  Several endpoints are owner-only; as a plain member most checks report SKIP:
+    gh auth refresh -h github.com -s read:org,admin:org
+EOF
+  exit 0
+}
+
+cmd_org_audit_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --org)            need_arg "--org" "${2:-}"; ORG_AUDIT_ORG="$2"; shift 2 ;;
+      --format)         need_arg "--format" "${2:-}"; ORG_AUDIT_FORMAT="$2"; shift 2 ;;
+      --2fa)            ORG_AUDIT_ONLY_2FA=true; shift ;;
+      --admins)         ORG_AUDIT_ONLY_ADMINS=true; shift ;;
+      --fail-on-issues) ORG_AUDIT_FAIL_ON_ISSUES=true; shift ;;
+      -v|--verbose)     VERBOSE=true; shift ;;
+      -h|--help)        cmd_org_audit_usage ;;
+      *) die "org-audit: unknown option: $1" ;;
+    esac
+  done
+  [ -z "$ORG_AUDIT_ORG" ] && die "org-audit: --org is required"
+  case "$ORG_AUDIT_FORMAT" in text|json|csv) ;; *) die "org-audit: invalid --format '${ORG_AUDIT_FORMAT}' (use text, json or csv)" ;; esac
+  return 0
+}
+
+# audit_check <id> <PASS|WARN|FAIL|SKIP> <message> [json-value]
+# One JSON line per check. Text, JSON, CSV and the exit code are all pure
+# functions of this ledger, so they cannot drift, and it survives subshells.
+audit_check() {
+  jq -nc --arg id "$1" --arg status "$2" --arg message "$3" \
+         --argjson value "${4:-null}" \
+         '{id:$id, status:$status, message:$message, value:$value}' >> "$ORG_AUDIT_CHECKS"
+}
+
+cmd_org_audit_wants() {
+  # With no --2fa/--admins selector every check runs.
+  if ! $ORG_AUDIT_ONLY_2FA && ! $ORG_AUDIT_ONLY_ADMINS; then return 0; fi
+  case "$1" in
+    2fa_required|2fa_members) $ORG_AUDIT_ONLY_2FA ;;
+    owner_count)              $ORG_AUDIT_ONLY_ADMINS ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_org_audit_main() {
+  cmd_org_audit_parse_args "$@"
+  preflight_check
+  skip_init
+  ORG_AUDIT_CHECKS=$(tmp_new)
+
+  local out=1
+  [ "$ORG_AUDIT_FORMAT" != "text" ] && out=2
+
+  {
+    header "Org Audit"
+    echo -e "  Org: ${BOLD}${ORG_AUDIT_ORG}${NC}"
+    echo ""
+  } >&$out
+
+  # One request feeds four checks plus the plan line.
+  local org_json
+  org_json=$(gh_api_try "$ORG_AUDIT_ORG" "orgs/${ORG_AUDIT_ORG}") || {
+    scope_hint "read:org,admin:org"
+    die "org-audit: cannot read organization '${ORG_AUDIT_ORG}'"
+  }
+
+  local members_total=0 mem
+  mem=$(gh_paginate "${ORG_AUDIT_ORG} members" "orgs/${ORG_AUDIT_ORG}/members?per_page=100") \
+    && members_total=$(printf '%s' "$mem" | jq 'length') || members_total=0
+
+  # ── 1. 2FA enforced org-wide ───────────────────────────────────────────────
+  local twofa
+  twofa=$(printf '%s' "$org_json" | jq -r '.two_factor_requirement_enabled // "null"')
+  if cmd_org_audit_wants 2fa_required; then
+    case "$twofa" in
+      true)  audit_check 2fa_required PASS "enforced organization-wide" true ;;
+      false) audit_check 2fa_required FAIL "not enforced organization-wide" false ;;
+      *)     audit_check 2fa_required SKIP "only visible to organization owners" ;;
+    esac
+  fi
+
+  # ── 2. Members without 2FA (pointless when 2FA is already enforced) ────────
+  if cmd_org_audit_wants 2fa_members && [ "$twofa" != "true" ]; then
+    local nofa
+    if nofa=$(gh_paginate "${ORG_AUDIT_ORG} 2fa_disabled" "orgs/${ORG_AUDIT_ORG}/members?filter=2fa_disabled&per_page=100"); then
+      local n
+      n=$(printf '%s' "$nofa" | jq 'length')
+      if [ "$n" -eq 0 ]; then
+        audit_check 2fa_members PASS "every member has two-factor enabled" 0
+      else
+        audit_check 2fa_members FAIL "${n} member(s) without two-factor: $(printf '%s' "$nofa" | jq -r '.[0:20] | map(.login) | join(", ")')" "$n"
+      fi
+    else
+      audit_check 2fa_members SKIP "owner-only endpoint"
+    fi
+  elif cmd_org_audit_wants 2fa_members; then
+    audit_check 2fa_members PASS "not applicable — two-factor is enforced for everyone" 0
+  fi
+
+  # ── 3. Owner count ─────────────────────────────────────────────────────────
+  if cmd_org_audit_wants owner_count; then
+    local admins
+    if admins=$(gh_paginate "${ORG_AUDIT_ORG} admins" "orgs/${ORG_AUDIT_ORG}/members?role=admin&per_page=100"); then
+      local n cap
+      n=$(printf '%s' "$admins" | jq 'length')
+      cap=$(( members_total / 10 )); [ "$cap" -lt 3 ] && cap=3
+      if [ "$n" -eq 0 ]; then
+        audit_check owner_count FAIL "no owner visible" 0
+      elif [ "$n" -eq 1 ]; then
+        audit_check owner_count WARN "a single owner — bus factor of one" 1
+      elif [ "$n" -gt "$cap" ]; then
+        audit_check owner_count WARN "${n} owners for ${members_total} members" "$n"
+      else
+        audit_check owner_count PASS "${n} owner(s) for ${members_total} members" "$n"
+      fi
+    else
+      audit_check owner_count SKIP "cannot list organization admins"
+    fi
+  fi
+
+  # ── 4. Outside collaborators ───────────────────────────────────────────────
+  if cmd_org_audit_wants outside_collaborators; then
+    local oc
+    if oc=$(gh_paginate "${ORG_AUDIT_ORG} outside collaborators" "orgs/${ORG_AUDIT_ORG}/outside_collaborators?per_page=100"); then
+      local n
+      n=$(printf '%s' "$oc" | jq 'length')
+      if [ "$n" -eq 0 ]; then
+        audit_check outside_collaborators PASS "none" 0
+      elif [ "$members_total" -gt 0 ] && [ "$n" -gt "$members_total" ]; then
+        audit_check outside_collaborators FAIL "${n} outside collaborators for ${members_total} members" "$n"
+      else
+        audit_check outside_collaborators WARN "${n} outside collaborator(s) — audit their per-repo access" "$n"
+      fi
+    else
+      audit_check outside_collaborators SKIP "cannot list outside collaborators"
+    fi
+  fi
+
+  # ── 5. Pending invitations ─────────────────────────────────────────────────
+  if cmd_org_audit_wants pending_invitations; then
+    local inv
+    if inv=$(gh_paginate "${ORG_AUDIT_ORG} invitations" "orgs/${ORG_AUDIT_ORG}/invitations?per_page=100"); then
+      local n stale cut
+      n=$(printf '%s' "$inv" | jq 'length')
+      cut=$(cutoff_date 30 days)
+      stale=$(printf '%s' "$inv" | jq --arg c "$cut" '[.[] | select((.created_at // "") < $c)] | length')
+      if [ "$n" -eq 0 ]; then
+        audit_check pending_invitations PASS "none outstanding" 0
+      elif [ "$stale" -gt 0 ]; then
+        audit_check pending_invitations WARN "${stale} of ${n} invitation(s) older than 30 days" "$stale"
+      else
+        audit_check pending_invitations PASS "${n} recent invitation(s)" "$n"
+      fi
+    else
+      audit_check pending_invitations SKIP "cannot list organization invitations"
+    fi
+  fi
+
+  # ── 6. Default repository permission ───────────────────────────────────────
+  if cmd_org_audit_wants default_repo_permission; then
+    local perm
+    perm=$(printf '%s' "$org_json" | jq -r '.default_repository_permission // "null"')
+    case "$perm" in
+      none|read) audit_check default_repo_permission PASS "every member gets '${perm}' on new repos" "\"$perm\"" ;;
+      write)     audit_check default_repo_permission WARN "every member gets 'write' on new repos" "\"$perm\"" ;;
+      admin)     audit_check default_repo_permission FAIL "every member gets 'admin' on new repos" "\"$perm\"" ;;
+      *)         audit_check default_repo_permission SKIP "only visible to organization owners" ;;
+    esac
+  fi
+
+  # ── 7. Member repository creation ──────────────────────────────────────────
+  if cmd_org_audit_wants member_repo_creation; then
+    local can_pub can_any
+    can_pub=$(printf '%s' "$org_json" | jq -r '.members_can_create_public_repositories // "null"')
+    can_any=$(printf '%s' "$org_json" | jq -r '.members_can_create_repositories // "null"')
+    if [ "$can_pub" = "null" ] && [ "$can_any" = "null" ]; then
+      audit_check member_repo_creation SKIP "only visible to organization owners"
+    elif [ "$can_pub" = "true" ]; then
+      audit_check member_repo_creation WARN "any member can create PUBLIC repositories" true
+    else
+      audit_check member_repo_creation PASS "members cannot create public repositories" false
+    fi
+  fi
+
+  # ── 8. Teams ───────────────────────────────────────────────────────────────
+  if cmd_org_audit_wants teams; then
+    local teams
+    if teams=$(gh_paginate "${ORG_AUDIT_ORG} teams" "orgs/${ORG_AUDIT_ORG}/teams?per_page=100"); then
+      local n
+      n=$(printf '%s' "$teams" | jq 'length')
+      if [ "$n" -eq 0 ] && [ "$members_total" -gt 5 ]; then
+        audit_check teams WARN "no teams for ${members_total} members — access is managed person by person" 0
+      else
+        audit_check teams PASS "${n} team(s)" "$n"
+      fi
+    else
+      audit_check teams SKIP "cannot list teams"
+    fi
+  fi
+
+  # ── Render ─────────────────────────────────────────────────────────────────
+  local n_fail n_warn n_skip n_pass
+  n_fail=$(grep -c '"status":"FAIL"' "$ORG_AUDIT_CHECKS" || true)
+  n_warn=$(grep -c '"status":"WARN"' "$ORG_AUDIT_CHECKS" || true)
+  n_skip=$(grep -c '"status":"SKIP"' "$ORG_AUDIT_CHECKS" || true)
+  n_pass=$(grep -c '"status":"PASS"' "$ORG_AUDIT_CHECKS" || true)
+
+  case "$ORG_AUDIT_FORMAT" in
+    json)
+      jq -s --arg org "$ORG_AUDIT_ORG" \
+        '{org:$org, checks:., summary:(group_by(.status) | map({key:.[0].status, value:length}) | from_entries)}' \
+        "$ORG_AUDIT_CHECKS"
+      ;;
+    csv)
+      jq -s -r '["check","status","message","value"], (.[] | [.id, .status, .message, (.value|tostring)]) | @csv' \
+        "$ORG_AUDIT_CHECKS"
+      ;;
+    text)
+      local id status message col pad
+      while IFS=$'\t' read -r id status message; do
+        case "$status" in
+          PASS) col="$GREEN" ;; WARN) col="$YELLOW" ;; FAIL) col="$RED" ;; *) col="$DIM" ;;
+        esac
+        printf -v pad '%-4s' "$status"
+        printf -v id_pad '%-24s' "$id"
+        echo -e "  ${col}${pad}${NC}  ${id_pad} ${message}"
+        [ "$id" = "outside_collaborators" ] && [ "$status" != "PASS" ] \
+          && echo -e "        ${DIM}-> github-helpers collaborator-audit --org ${ORG_AUDIT_ORG}${NC}"
+      done < <(jq -r '[.id, .status, .message] | @tsv' "$ORG_AUDIT_CHECKS")
+
+      local seats filled
+      seats=$(printf '%s' "$org_json" | jq -r '.plan.seats // empty')
+      filled=$(printf '%s' "$org_json" | jq -r '.plan.filled_seats // empty')
+      # Free plans report seats: 0, which would render as "150/0".
+      if [ -n "$filled" ]; then
+        echo ""
+        if [ -n "$seats" ] && [ "$seats" -gt 0 ] 2>/dev/null; then
+          echo -e "  ${DIM}INFO  plan: $(printf '%s' "$org_json" | jq -r '.plan.name // "?"') — ${filled}/${seats} seats filled${NC}"
+        else
+          echo -e "  ${DIM}INFO  plan: $(printf '%s' "$org_json" | jq -r '.plan.name // "?"') — ${filled} member(s)${NC}"
+        fi
+      fi
+      echo ""
+      echo -e "  ${GREEN}PASS ${n_pass}${NC}   ${YELLOW}WARN ${n_warn}${NC}   ${RED}FAIL ${n_fail}${NC}   ${DIM}SKIP ${n_skip}${NC}"
+      ;;
+  esac
+
+  print_skips
+
+  # Precedence FAIL > SKIP > WARN. An incomplete audit outranks a known
+  # warning: you do not know what the check that did not run would have found.
+  local code=0
+  if $ORG_AUDIT_FAIL_ON_ISSUES; then
+    if   [ "$n_fail" -gt 0 ]; then code=2
+    elif [ "$n_skip" -gt 0 ]; then code=4
+    elif [ "$n_warn" -gt 0 ]; then code=3
+    fi
+  fi
+  exit "$code"
+}
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -7053,6 +7827,9 @@ main() {
     run-cleanup)           cmd_run_cleanup_main "$@" ;;
     gist|gists)            cmd_gist_main "$@" ;;
     traffic)               cmd_traffic_main "$@" ;;
+    notifications|notifs)  cmd_notifications_main "$@" ;;
+    invite-cleanup)        cmd_invite_cleanup_main "$@" ;;
+    org-audit)             cmd_org_audit_main "$@" ;;
     cleanup-branches)      cmd_cleanup_branches_main "$@" ;;
     archive-repos)         cmd_archive_repos_main "$@" ;;
     repo-audit|audit)      cmd_repo_audit_main "$@" ;;
