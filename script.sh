@@ -3,15 +3,18 @@ set -euo pipefail
 
 # =============================================================================
 # github-helpers — GitHub maintenance toolkit
-# Subcommands: unstar, clone-org, cleanup-forks, cleanup-branches,
-#              archive-repos, repo-audit, stats, bulk-topic,
-#              workflow-status, sync-labels, export-stars,
-#              rename-default-branch, secret-audit, license-check,
-#              dependabot-enable, mirror, release-cleanup,
-#              vulnerability-check, branch-protection, stale-issues,
-#              bulk-settings, webhook-audit, cleanup-packages,
-#              collaborator-audit, repo-template, pr-cleanup,
-#              activity-report
+# Subcommands:
+#   Cleanup & maintenance: unstar, cleanup-forks (forks), sync-forks,
+#     cleanup-branches, archive-repos, release-cleanup, pr-cleanup,
+#     cleanup-packages, stale-issues, cache-cleanup, artifact-cleanup,
+#     run-cleanup, gist (gists), notifications (notifs), invite-cleanup
+#   Audit & visibility: repo-audit (audit), stats, workflow-status (ci),
+#     secret-audit, license-check, vulnerability-check, branch-protection,
+#     webhook-audit, collaborator-audit, activity-report, traffic, org-audit,
+#     follow-audit (follow)
+#   Bulk operations: clone-org, bulk-topic, sync-labels, export-stars,
+#     rename-default-branch, dependabot-enable, mirror, bulk-settings,
+#     repo-template, bulk-merge, backup
 # =============================================================================
 
 VERSION="1.3.3"
