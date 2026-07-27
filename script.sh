@@ -462,6 +462,7 @@ ${BOLD}COMMANDS${NC}
   bulk-settings       Apply repo settings in batch
   bulk-merge          Merge green dependency-update PRs in batch
   repo-template       Sync settings from a template repo
+  backup              Export repos and their metadata locally
 
 ${BOLD}FLAGS${NC}
   --no-color    Disable colored output
@@ -8372,6 +8373,429 @@ cmd_bulk_merge_main() {
   print_skips
 }
 # =============================================================================
+# COMMAND: backup
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+BACKUP_OUT=""
+BACKUP_TARGET=""
+BACKUP_TARGET_TYPE=""
+BACKUP_REPO=""
+BACKUP_GIT=true
+BACKUP_METADATA=true
+BACKUP_MODE="bundle"
+BACKUP_GISTS=false
+BACKUP_ASSETS=false
+BACKUP_INCLUDE_FORKS=false
+BACKUP_LIMIT=1000
+BACKUP_RESUME=false
+BACKUP_VERIFY_DIR=""
+BACKUP_JOURNAL=""
+
+cmd_backup_usage() {
+  cat <<EOF
+${BOLD}github-helpers backup${NC} ${DIM}v${VERSION}${NC} — Export repositories and their metadata locally
+
+${BOLD}USAGE${NC}
+  github-helpers backup [options]
+  github-helpers backup --verify DIR
+
+${BOLD}OPTIONS${NC}
+  --out DIR               Destination (default: github-backup-YYYY-MM-DD)
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --repo OWNER/NAME       Single repository
+  --no-git                Skip git data
+  --no-metadata           Skip issues, PRs, releases, labels, milestones
+  --mirror                Keep a bare mirror instead of a bundle
+  --gists                 Also back up your gists
+  --assets                Also download release binaries ${DIM}(can be large)${NC}
+  --include-forks         Include forks (excluded by default)
+  --limit N               Max repos (default: ${BACKUP_LIMIT})
+  --resume                Skip repos already recorded as done
+  --verify DIR            Check an existing backup against its manifest
+  -v, --verbose           Show every artifact
+  -h, --help              Show this help
+
+${BOLD}LAYOUT${NC}
+  DIR/manifest.json                    counts, timestamps, checksums
+  DIR/.repos.jsonl                     append-only journal, drives --resume
+  DIR/<owner>/<repo>/repo.bundle       git history (or repo.git/ with --mirror)
+  DIR/<owner>/<repo>/wiki.bundle       wiki, when one exists
+  DIR/<owner>/<repo>/issues.json       issues only, pull requests stripped out
+  DIR/<owner>/<repo>/pulls.json
+  DIR/<owner>/<repo>/issue_comments.json
+  DIR/<owner>/<repo>/review_comments.json
+  DIR/<owner>/<repo>/{releases,labels,milestones,metadata}.json
+  DIR/gists/<id>/                      with --gists
+
+${BOLD}EXAMPLES${NC}
+  github-helpers backup --repo me/proj --out /tmp/bk
+  github-helpers backup --gists
+  github-helpers backup --org my-company --mirror --out /backups/org
+  github-helpers backup --resume --out github-backup-2026-07-27
+  github-helpers backup --verify /tmp/bk
+
+${BOLD}NOTE${NC}
+  Every file is written as .part and renamed on success, so the presence of a
+  final file proves the write completed — that is what makes --resume safe.
+
+  --resume trusts the journal and will not notice a file you deleted or
+  corrupted afterwards. Use --verify for integrity, --resume for interruptions.
+
+  issues.json holds the opening message but NOT the thread; the conversation
+  lives in issue_comments.json and review_comments.json, which are the biggest
+  omission in a naive backup.
+
+  ${BOLD}Not included:${NC} Git LFS objects, release binaries (unless --assets),
+  Actions logs, Projects, Discussions and Packages.
+
+  Exits 2 if any repository produced no artifacts at all.
+EOF
+  exit 0
+}
+
+cmd_backup_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out)            need_arg "--out" "${2:-}"; BACKUP_OUT="$2"; shift 2 ;;
+      --user)           need_arg "--user" "${2:-}"; BACKUP_TARGET="$2"; BACKUP_TARGET_TYPE="user"; shift 2 ;;
+      --org)            need_arg "--org" "${2:-}"; BACKUP_TARGET="$2"; BACKUP_TARGET_TYPE="org"; shift 2 ;;
+      --repo)           need_arg "--repo" "${2:-}"; BACKUP_REPO="$2"; shift 2 ;;
+      --limit)          need_arg "--limit" "${2:-}"; BACKUP_LIMIT="$2"; shift 2 ;;
+      --verify)         need_arg "--verify" "${2:-}"; BACKUP_VERIFY_DIR="$2"; shift 2 ;;
+      --no-git)         BACKUP_GIT=false; shift ;;
+      --no-metadata)    BACKUP_METADATA=false; shift ;;
+      --mirror)         BACKUP_MODE="mirror"; shift ;;
+      --bundle)         BACKUP_MODE="bundle"; shift ;;
+      --gists)          BACKUP_GISTS=true; shift ;;
+      --assets)         BACKUP_ASSETS=true; shift ;;
+      --include-forks)  BACKUP_INCLUDE_FORKS=true; shift ;;
+      --resume)         BACKUP_RESUME=true; shift ;;
+      -v|--verbose)     VERBOSE=true; shift ;;
+      -h|--help)        cmd_backup_usage ;;
+      *) die "backup: unknown option: $1" ;;
+    esac
+  done
+
+  [ -n "$BACKUP_VERIFY_DIR" ] && return 0
+  [[ "$BACKUP_LIMIT" =~ ^[0-9]+$ ]] || die "backup: --limit must be a whole number"
+  [ -n "$BACKUP_REPO" ] && [[ "$BACKUP_REPO" != */* ]] && die "backup: --repo must be OWNER/NAME"
+  $BACKUP_GIT || $BACKUP_METADATA || die "backup: nothing to back up (--no-git and --no-metadata)"
+  $BACKUP_ASSETS && ! $BACKUP_METADATA && die "backup: --assets needs the release metadata (drop --no-metadata)"
+  [ -z "$BACKUP_OUT" ] && BACKUP_OUT="github-backup-$(date -u +%Y-%m-%d)"
+  return 0
+}
+
+# backup_save <dest> <content> — atomic write; echoes a JSON file record.
+backup_save() {
+  local dest="$1" content="$2"
+  printf '%s' "$content" > "${dest}.part" || return 1
+  mv "${dest}.part" "$dest" || return 1
+  jq -nc --arg path "$dest" --argjson bytes "$(wc -c < "$dest" | tr -d ' ')" \
+         --arg sha "$(sha256_of "$dest")" '{path:$path, bytes:$bytes, sha256:$sha}'
+}
+
+# cmd_backup_one <nwo> <root> — writes one repo, echoes its journal line.
+cmd_backup_one() {
+  local nwo="$1" root="$2" dir="${2}/${1}" ok=0 failed=0
+  local files="" artifacts="" json rec
+  mkdir -p "$dir"
+
+  fetch_artifact() { # <name> <api path> [jq filter]
+    local name="$1" path="$2" filter="${3:-.}" body dest="${dir}/$1.json"
+    if $BACKUP_RESUME && [ -f "$dest" ]; then
+      artifacts="${artifacts}$(jq -nc --arg n "$name" '{key:$n, value:{status:"skipped-resume"}}')"$'\n'
+      return 0
+    fi
+    if ! body=$(gh_paginate "${nwo}:${name}" "$path"); then
+      artifacts="${artifacts}$(jq -nc --arg n "$name" '{key:$n, value:{status:"skipped"}}')"$'\n'
+      failed=$((failed + 1))
+      return 1
+    fi
+    body=$(printf '%s' "$body" | jq "$filter")
+    rec=$(backup_save "$dest" "$body") || { failed=$((failed + 1)); return 1; }
+    files="${files}${rec}"$'\n'
+    artifacts="${artifacts}$(jq -nc --arg n "$name" --argjson c "$(printf '%s' "$body" | jq 'length')" \
+      '{key:$n, value:{status:"ok", count:$c}}')"$'\n'
+    ok=$((ok + 1))
+    $VERBOSE && echo -e "      ${DIM}${name}: $(printf '%s' "$body" | jq 'length')${NC}" >&2
+    return 0
+  }
+
+  # ── Metadata ───────────────────────────────────────────────────────────────
+  if $BACKUP_METADATA; then
+    local meta
+    if meta=$(gh_api_try "${nwo}:metadata" "repos/${nwo}"); then
+      rec=$(backup_save "${dir}/metadata.json" "$(printf '%s' "$meta" | jq '.')") && {
+        files="${files}${rec}"$'\n'; ok=$((ok + 1)); }
+    else
+      failed=$((failed + 1))
+    fi
+    # direction=asc keeps pagination stable: with the default desc order an
+    # item created mid-run shifts every later page.
+    # GET /issues returns pull requests too; they carry a pull_request key.
+    fetch_artifact issues          "repos/${nwo}/issues?state=all&direction=asc&per_page=100" \
+                                   'map(select(has("pull_request") | not))' || true
+    fetch_artifact pulls           "repos/${nwo}/pulls?state=all&direction=asc&per_page=100" || true
+    fetch_artifact issue_comments  "repos/${nwo}/issues/comments?per_page=100" || true
+    fetch_artifact review_comments "repos/${nwo}/pulls/comments?per_page=100" || true
+    fetch_artifact releases        "repos/${nwo}/releases?per_page=100" || true
+    fetch_artifact labels          "repos/${nwo}/labels?per_page=100" || true
+    fetch_artifact milestones      "repos/${nwo}/milestones?state=all&per_page=100" || true
+
+    if $BACKUP_ASSETS && [ -f "${dir}/releases.json" ]; then
+      local tag aname aurl adir
+      while IFS=$'\t' read -r tag aname aurl; do
+        [ -z "$aurl" ] && continue
+        adir="${dir}/releases/${tag}"
+        mkdir -p "$adir"
+        [ -f "${adir}/${aname}" ] && continue
+        if gh api -H "Accept: application/octet-stream" "$aurl" > "${adir}/${aname}.part" 2>/dev/null; then
+          mv "${adir}/${aname}.part" "${adir}/${aname}"
+          $VERBOSE && echo -e "      ${DIM}asset ${tag}/${aname}${NC}" >&2
+        else
+          rm -f "${adir}/${aname}.part"
+          skip_note "${nwo} asset ${tag}/${aname}" "download failed"
+        fi
+      done < <(jq -r '.[] | .tag_name as $t | .assets[]? | [$t, .name, ("repos/'"${nwo}"'/releases/assets/" + (.id|tostring))] | @tsv' "${dir}/releases.json")
+    fi
+  fi
+
+  # ── Git ────────────────────────────────────────────────────────────────────
+  if $BACKUP_GIT; then
+    local target="${dir}/repo.bundle"
+    [ "$BACKUP_MODE" = "mirror" ] && target="${dir}/repo.git"
+    if $BACKUP_RESUME && [ -e "$target" ]; then
+      : # already there
+    elif [ "$BACKUP_MODE" = "mirror" ]; then
+      rm -rf "${target}.part"
+      if git_mirror_clone "$nwo" "${target}.part" 2>/dev/null; then
+        rm -rf "$target"; mv "${target}.part" "$target"; ok=$((ok + 1))
+      else
+        rm -rf "${target}.part"; failed=$((failed + 1)); skip_note "$nwo" "git mirror failed"
+      fi
+    else
+      local tmpdir="${dir}/.mirror.tmp"
+      rm -rf "$tmpdir"
+      if git_mirror_clone "$nwo" "$tmpdir" 2>/dev/null; then
+        local brc=0
+        git_bundle_from_mirror "$tmpdir" "${target}.part" || brc=$?
+        if [ "$brc" -eq 0 ]; then
+          mv "${target}.part" "$target"
+          rec=$(jq -nc --arg path "$target" --argjson bytes "$(wc -c < "$target" | tr -d ' ')" \
+                       --arg sha "$(sha256_of "$target")" '{path:$path, bytes:$bytes, sha256:$sha}')
+          files="${files}${rec}"$'\n'
+          ok=$((ok + 1))
+        elif [ "$brc" -eq 2 ]; then
+          $VERBOSE && echo -e "      ${DIM}git: empty repository, no bundle${NC}" >&2
+        else
+          rm -f "${target}.part"; failed=$((failed + 1)); skip_note "$nwo" "git bundle failed"
+        fi
+        rm -rf "$tmpdir"
+      else
+        rm -rf "$tmpdir"; failed=$((failed + 1)); skip_note "$nwo" "git clone failed"
+      fi
+    fi
+
+    # Wiki: has_wiki only means the feature is on, not that content exists.
+    # gh repo clone cannot take the .wiki suffix, so this one uses git directly.
+    if [ ! -f "${dir}/wiki.bundle" ] && git clone --mirror --quiet "https://github.com/${nwo}.wiki.git" "${dir}/.wiki.tmp" 2>/dev/null; then
+      if git_bundle_from_mirror "${dir}/.wiki.tmp" "${dir}/wiki.bundle.part"; then
+        mv "${dir}/wiki.bundle.part" "${dir}/wiki.bundle"
+        ok=$((ok + 1))
+      else
+        rm -f "${dir}/wiki.bundle.part"
+      fi
+      rm -rf "${dir}/.wiki.tmp"
+    fi
+  fi
+
+  local status="ok"
+  [ "$failed" -gt 0 ] && status="partial"
+  [ "$ok" -eq 0 ] && status="failed"
+
+  jq -nc --arg nwo "$nwo" --arg status "$status" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson files "$(printf '%s' "$files" | jq -sc '.')" \
+    --argjson artifacts "$(printf '%s' "$artifacts" | jq -sc 'from_entries')" \
+    '{nwo:$nwo, status:$status, backed_up_at:$at, files:$files, artifacts:$artifacts}'
+}
+
+cmd_backup_verify() {
+  # Two statements on purpose: bash declares every name in a `local` list
+  # before evaluating any assignment, so `local a="$1" b="${a}"` reads an
+  # unset `a` and trips `set -u`.
+  local dir="$1"
+  local manifest="${dir}/manifest.json"
+  [ -f "$manifest" ] || die "backup: no manifest.json in ${dir}"
+
+  header "Backup Verify"
+  echo -e "  Dir: ${BOLD}${dir}${NC}"
+  echo ""
+
+  local okc=0 missing=0 mismatch=0 path bytes sha actual
+  while IFS=$'\t' read -r path bytes sha; do
+    [ -z "$path" ] && continue
+    if [ ! -f "$path" ]; then
+      missing=$((missing + 1)); echo -e "  ${RED}MISSING${NC}   ${path}"; continue
+    fi
+    actual=$(sha256_of "$path")
+    if [ "$actual" != "$sha" ]; then
+      mismatch=$((mismatch + 1)); echo -e "  ${RED}MISMATCH${NC}  ${path}"; continue
+    fi
+    okc=$((okc + 1))
+    $VERBOSE && echo -e "  ${GREEN}OK${NC}        ${path}"
+  done < <(jq -r '.repos[]?.files[]? | [.path, (.bytes|tostring), .sha256] | @tsv' "$manifest")
+
+  local failed_repos
+  failed_repos=$(jq -r '[.repos[]? | select(.status == "failed")] | length' "$manifest")
+
+  echo ""
+  echo -e "${GREEN}Verified:${NC} ${BOLD}${okc}${NC} file(s), Missing: ${BOLD}${missing}${NC}, Mismatched: ${BOLD}${mismatch}${NC}, Failed repos: ${BOLD}${failed_repos}${NC}"
+  if [ "$missing" -gt 0 ] || [ "$mismatch" -gt 0 ] || [ "$failed_repos" -gt 0 ]; then
+    exit 2
+  fi
+  exit 0
+}
+
+cmd_backup_main() {
+  cmd_backup_parse_args "$@"
+  preflight_check
+  skip_init
+
+  [ -n "$BACKUP_VERIFY_DIR" ] && cmd_backup_verify "$BACKUP_VERIFY_DIR"
+
+  command -v git &>/dev/null || $BACKUP_GIT && { command -v git &>/dev/null || die "backup: git is required (or pass --no-git)"; }
+
+  if [ -z "$BACKUP_TARGET" ]; then
+    BACKUP_TARGET=$(get_username)
+    BACKUP_TARGET_TYPE="user"
+  fi
+
+  header "Backup"
+  if [ -n "$BACKUP_REPO" ]; then
+    echo -e "  Repo:   ${BOLD}${BACKUP_REPO}${NC}"
+  else
+    echo -e "  Target: ${BOLD}${BACKUP_TARGET}${NC}"
+  fi
+  echo -e "  Out:    ${BOLD}${BACKUP_OUT}${NC}"
+  echo -e "  Git:    ${BOLD}$($BACKUP_GIT && echo "$BACKUP_MODE" || echo "skipped")${NC}"
+  echo -e "  Meta:   ${BOLD}$($BACKUP_METADATA && echo included || echo skipped)${NC}"
+  $BACKUP_RESUME && echo -e "  Mode:   ${CYAN}RESUME${NC}"
+  echo ""
+
+  mkdir -p "$BACKUP_OUT" || die "backup: cannot create ${BACKUP_OUT}"
+  BACKUP_JOURNAL="${BACKUP_OUT}/.repos.jsonl"
+  touch "$BACKUP_JOURNAL"
+
+  local remaining
+  remaining=$(gh api rate_limit --jq '.resources.core.remaining' 2>/dev/null || echo "?")
+  echo -e "  ${DIM}Rate limit: ${remaining} requests remaining${NC}"
+
+  local repo_file
+  if [ -n "$BACKUP_REPO" ]; then
+    repo_file=$(tmp_new); printf '%s\n' "$BACKUP_REPO" > "$repo_file"
+  else
+    repo_file=$(tmp_new)
+    local -a flags=("--limit" "$BACKUP_LIMIT")
+    $BACKUP_INCLUDE_FORKS || flags+=("--source")
+    gh repo list "$BACKUP_TARGET" --json nameWithOwner "${flags[@]}" --jq '.[].nameWithOwner' > "$repo_file" \
+      || die "backup: failed to list repos for ${BACKUP_TARGET}"
+  fi
+
+  local total done_n=0 nwo line status
+  total=$(count_lines "$repo_file")
+  echo -e "Backing up ${BOLD}${total}${NC} repo(s)..."
+  echo ""
+
+  local n_ok=0 n_partial=0 n_failed=0
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    done_n=$((done_n + 1))
+    # The journal is consulted before any request, so a run that died at repo
+    # 180 of 200 resumes without re-fetching the first 179.
+    if $BACKUP_RESUME && grep -qF "\"nwo\":\"${nwo}\",\"status\":\"ok\"" "$BACKUP_JOURNAL" 2>/dev/null; then
+      echo -e "  ${DIM}[${done_n}/${total}] SKIP     ${nwo} (already done)${NC}"
+      continue
+    fi
+    line=$(cmd_backup_one "$nwo" "$BACKUP_OUT") || line=""
+    if [ -z "$line" ]; then
+      line=$(jq -nc --arg nwo "$nwo" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              '{nwo:$nwo, status:"failed", backed_up_at:$at, files:[], artifacts:{}}')
+    fi
+    printf '%s\n' "$line" >> "$BACKUP_JOURNAL"
+    status=$(printf '%s' "$line" | jq -r '.status')
+    case "$status" in
+      ok)      n_ok=$((n_ok + 1));      echo -e "  ${GREEN}[${done_n}/${total}] OK${NC}       ${nwo}" ;;
+      partial) n_partial=$((n_partial + 1)); echo -e "  ${YELLOW}[${done_n}/${total}] PARTIAL${NC}  ${nwo}" ;;
+      *)       n_failed=$((n_failed + 1)); echo -e "  ${RED}[${done_n}/${total}] FAILED${NC}   ${nwo}" ;;
+    esac
+  done < "$repo_file"
+
+  # ── Gists ──────────────────────────────────────────────────────────────────
+  local n_gists=0
+  if $BACKUP_GISTS; then
+    echo ""
+    echo -e "${DIM}Backing up gists...${NC}"
+    local gists gid gdir
+    if gists=$(gh_paginate "gists" "gists?per_page=100"); then
+      mkdir -p "${BACKUP_OUT}/gists"
+      printf '%s' "$gists" | jq '.' > "${BACKUP_OUT}/gists/index.json"
+      while IFS= read -r gid; do
+        [ -z "$gid" ] && continue
+        gdir="${BACKUP_OUT}/gists/${gid}"
+        mkdir -p "$gdir"
+        if [ ! -f "${gdir}/gist.bundle" ]; then
+          if git clone --mirror --quiet "https://gist.github.com/${gid}.git" "${gdir}/.tmp" 2>/dev/null; then
+            git_bundle_from_mirror "${gdir}/.tmp" "${gdir}/gist.bundle.part" \
+              && mv "${gdir}/gist.bundle.part" "${gdir}/gist.bundle" \
+              || rm -f "${gdir}/gist.bundle.part"
+            rm -rf "${gdir}/.tmp"
+          else
+            skip_note "gist ${gid}" "clone failed"
+          fi
+        fi
+        n_gists=$((n_gists + 1))
+      done < <(printf '%s' "$gists" | jq -r '.[].id')
+      echo -e "  ${GREEN}${n_gists}${NC} gist(s)"
+    fi
+  fi
+
+  # ── Manifest, assembled from the journal ───────────────────────────────────
+  jq -s --arg version "$VERSION" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg target "$BACKUP_TARGET" --arg ttype "${BACKUP_TARGET_TYPE:-user}" \
+        --argjson gists "$n_gists" \
+        --argjson opts "$(jq -nc --argjson git "$BACKUP_GIT" --arg mode "$BACKUP_MODE" \
+            --argjson metadata "$BACKUP_METADATA" --argjson gists "$BACKUP_GISTS" \
+            --argjson assets "$BACKUP_ASSETS" --argjson forks "$BACKUP_INCLUDE_FORKS" \
+            '{git:$git, mode:$mode, metadata:$metadata, gists:$gists, assets:$assets, include_forks:$forks}')" '
+    { tool: "github-helpers", version: $version, schema: 1,
+      completed_at: $at,
+      target: {type: $ttype, name: $target},
+      options: $opts,
+      totals: {
+        repos: length,
+        ok:      ([.[] | select(.status == "ok")]      | length),
+        partial: ([.[] | select(.status == "partial")] | length),
+        failed:  ([.[] | select(.status == "failed")]  | length),
+        gists: $gists,
+        bytes: ([.[].files[]?.bytes] | add // 0)
+      },
+      repos: . }' "$BACKUP_JOURNAL" > "${BACKUP_OUT}/manifest.json.part" \
+    && mv "${BACKUP_OUT}/manifest.json.part" "${BACKUP_OUT}/manifest.json"
+
+  local bytes
+  bytes=$(jq -r '.totals.bytes' "${BACKUP_OUT}/manifest.json")
+  echo ""
+  echo -e "${GREEN}Done!${NC} OK: ${BOLD}${n_ok}${NC}, Partial: ${BOLD}${n_partial}${NC}, Failed: ${BOLD}${n_failed}${NC}, Size: ${BOLD}$(human_bytes "$bytes")${NC}"
+  echo -e "Manifest: ${BOLD}${BACKUP_OUT}/manifest.json${NC}"
+  echo -e "Verify with: ${BOLD}github-helpers backup --verify ${BACKUP_OUT}${NC}"
+  print_skips
+
+  [ "$n_failed" -gt 0 ] && exit 2
+  exit 0
+}
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -8409,6 +8833,7 @@ main() {
     org-audit)             cmd_org_audit_main "$@" ;;
     follow-audit|follow)   cmd_follow_audit_main "$@" ;;
     bulk-merge)            cmd_bulk_merge_main "$@" ;;
+    backup)                cmd_backup_main "$@" ;;
     cleanup-branches)      cmd_cleanup_branches_main "$@" ;;
     archive-repos)         cmd_archive_repos_main "$@" ;;
     repo-audit|audit)      cmd_repo_audit_main "$@" ;;
