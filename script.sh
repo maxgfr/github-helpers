@@ -447,6 +447,7 @@ ${BOLD}COMMANDS${NC}
   webhook-audit       List webhooks across repos
   collaborator-audit  Audit outside collaborators and permissions
   org-audit           Org-level security and membership posture
+  follow-audit        Who follows you back, and who does not
   activity-report     Generate activity summary for a period
   traffic             Snapshot repo views and clones (14-day window)
 
@@ -459,6 +460,7 @@ ${BOLD}COMMANDS${NC}
   dependabot-enable   Enable Dependabot on repos
   mirror              Mirror repos to another remote
   bulk-settings       Apply repo settings in batch
+  bulk-merge          Merge green dependency-update PRs in batch
   repo-template       Sync settings from a template repo
 
 ${BOLD}FLAGS${NC}
@@ -7795,6 +7797,581 @@ cmd_org_audit_main() {
   exit "$code"
 }
 # =============================================================================
+# COMMAND: follow-audit
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+FA_NOT_FOLLOWING_BACK=false
+FA_NOT_FOLLOWED_BY_ME=false
+FA_MUTUALS=false
+FA_UNFOLLOW=false
+FA_EXCLUDE=""
+FA_INACTIVE=""
+FA_FORMAT="text"
+FA_OUT="unfollow.txt"
+FA_SAVE_LIST=false
+FA_FROM=""
+FA_LIMIT=0
+
+cmd_follow_audit_usage() {
+  cat <<EOF
+${BOLD}github-helpers follow-audit${NC} ${DIM}v${VERSION}${NC} — Who follows you back, and who does not
+                                        ${DIM}(alias: github-helpers follow)${NC}
+
+${BOLD}USAGE${NC}
+  github-helpers follow-audit
+  github-helpers follow-audit --not-following-back --inactive 365
+  github-helpers follow-audit --not-following-back --unfollow --dry-run
+
+${BOLD}SELECTORS${NC}
+  --not-following-back    You follow them, they do not follow you ${DIM}(default view)${NC}
+  --not-followed-by-me    They follow you, you do not follow back
+  --mutuals               Mutual follows
+
+${BOLD}FILTERS${NC}
+  --exclude FILE          Logins never to unfollow, one per line ${DIM}(# comments ok)${NC}
+  --inactive N            No push to a public repo of theirs in N days
+  --limit N               Cap the number listed
+
+${BOLD}ACTION${NC}
+  --unfollow              Unfollow ${DIM}(only applies to --not-following-back)${NC}
+
+${BOLD}I/O${NC}
+  --dry-run               Preview only — writes an annotated list
+  --out FILE              List file (default: ${FA_OUT}), or report file with --format
+  --save-list             Save the list even outside --dry-run
+  --from FILE             Unfollow the logins listed in FILE
+  --format FORMAT         text, json, csv or md (default: text)
+
+${BOLD}FLAGS${NC}
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show more detail
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers follow-audit
+  github-helpers follow-audit --not-followed-by-me
+  github-helpers follow-audit --format csv --out follows.csv
+  github-helpers follow-audit --not-following-back --exclude keep.txt --unfollow --dry-run
+
+${BOLD}NOTE${NC}
+  The default is read-only. Unfollowing needs --unfollow, and goes through the
+  dry-run -> edit the file -> --from loop so a human reads every login first.
+
+  --inactive measures the last push to a PUBLIC repository they own. Someone
+  working only in private repos will look inactive; it is a hint, not proof.
+
+  Unfollowing requires the 'user:follow' scope:
+    gh auth refresh -h github.com -s user:follow
+EOF
+  exit 0
+}
+
+cmd_follow_audit_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --exclude)             need_arg "--exclude" "${2:-}"; FA_EXCLUDE="$2"; shift 2 ;;
+      --inactive)            need_arg "--inactive" "${2:-}"; FA_INACTIVE="$2"; shift 2 ;;
+      --limit)               need_arg "--limit" "${2:-}"; FA_LIMIT="$2"; shift 2 ;;
+      --format)              need_arg "--format" "${2:-}"; FA_FORMAT="$2"; shift 2 ;;
+      --out)                 need_arg "--out" "${2:-}"; FA_OUT="$2"; FA_SAVE_LIST=true; shift 2 ;;
+      --from)                need_arg "--from" "${2:-}"; FA_FROM="$2"; shift 2 ;;
+      --not-following-back)  FA_NOT_FOLLOWING_BACK=true; shift ;;
+      --not-followed-by-me)  FA_NOT_FOLLOWED_BY_ME=true; shift ;;
+      --mutuals)             FA_MUTUALS=true; shift ;;
+      --unfollow)            FA_UNFOLLOW=true; shift ;;
+      --save-list)           FA_SAVE_LIST=true; shift ;;
+      --dry-run)             DRY_RUN=true; shift ;;
+      -y|--yes)              AUTO_YES=true; shift ;;
+      -v|--verbose)          VERBOSE=true; shift ;;
+      -h|--help)             cmd_follow_audit_usage ;;
+      *) die "follow-audit: unknown option: $1" ;;
+    esac
+  done
+
+  case "$FA_FORMAT" in text|json|csv|md) ;; *) die "follow-audit: invalid --format '${FA_FORMAT}' (use text, json, csv or md)" ;; esac
+  [ -n "$FA_INACTIVE" ] && { [[ "$FA_INACTIVE" =~ ^[0-9]+$ ]] || die "follow-audit: --inactive must be a whole number of days"; }
+  [[ "$FA_LIMIT" =~ ^[0-9]+$ ]] || die "follow-audit: --limit must be a whole number"
+
+  # A silently-missing whitelist is the disaster case for this command.
+  [ -n "$FA_EXCLUDE" ] && [ ! -f "$FA_EXCLUDE" ] && die "follow-audit: file not found: ${FA_EXCLUDE}"
+  [ -n "$FA_FROM" ] && [ ! -f "$FA_FROM" ] && die "follow-audit: file not found: ${FA_FROM}"
+
+  if $FA_UNFOLLOW && { $FA_NOT_FOLLOWED_BY_ME || $FA_MUTUALS; }; then
+    die "follow-audit: --unfollow only applies to --not-following-back"
+  fi
+  if [ "$FA_FORMAT" != "text" ] && { $FA_UNFOLLOW || $DRY_RUN; }; then
+    die "follow-audit: --format is for reporting — drop --unfollow/--dry-run"
+  fi
+  # Default view.
+  if ! $FA_NOT_FOLLOWING_BACK && ! $FA_NOT_FOLLOWED_BY_ME && ! $FA_MUTUALS; then
+    FA_NOT_FOLLOWING_BACK=true
+  fi
+  return 0
+}
+
+# cmd_follow_audit_fetch <following|followers> -> TSV: login  reciprocal  followers  last_push
+# GraphQL answers "do they follow me back" inside the same page, so
+# --not-following-back never has to fetch the followers list at all.
+cmd_follow_audit_fetch() {
+  local which="$1" has_next="true" fetched=0 rc result recip
+  local -a cursor_arg=("-F" "cursor=null")
+  [ "$which" = "following" ] && recip="isFollowingViewer" || recip="viewerIsFollowing"
+
+  while [ "$has_next" = "true" ]; do
+    rc=0
+    result=$(gh_api_retry graphql -f query="
+      query(\$cursor: String) {
+        viewer {
+          ${which}(first: 100, after: \$cursor) {
+            totalCount
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              login
+              ${recip}
+              followers { totalCount }
+              repositories(first: 1, ownerAffiliations: [OWNER], privacy: PUBLIC,
+                           orderBy: {field: PUSHED_AT, direction: DESC}) { nodes { pushedAt } }
+            }
+          }
+        }
+      }" "${cursor_arg[@]}") || rc=$?
+
+    local gql_error
+    gql_error=$(printf '%s' "$result" | jq -r '.errors[0].message // empty' 2>/dev/null || true)
+    [ -n "$gql_error" ] && warn "GitHub API: ${gql_error}"
+    if [ "$rc" -ne 0 ] && [ -z "$gql_error" ]; then
+      die "follow-audit: GraphQL request failed"
+    fi
+
+    printf '%s' "$result" | jq -r --arg w "$which" --arg r "$recip" '
+      .data.viewer[$w].nodes[]? |
+      [ .login, (.[$r] | tostring), (.followers.totalCount | tostring),
+        (.repositories.nodes[0].pushedAt // "") ] | @tsv'
+
+    local count total
+    count=$(printf '%s' "$result" | jq --arg w "$which" '.data.viewer[$w].nodes | length' 2>/dev/null || echo 0)
+    total=$(printf '%s' "$result" | jq --arg w "$which" '.data.viewer[$w].totalCount' 2>/dev/null || echo 0)
+    fetched=$((fetched + count))
+    $VERBOSE && [ "$count" -gt 0 ] && echo -e "  ${DIM}Fetched ${fetched}/${total} ${which}...${NC}" >&2
+
+    has_next=$(printf '%s' "$result" | jq -r --arg w "$which" '.data.viewer[$w].pageInfo.hasNextPage' 2>/dev/null || echo false)
+    local end_cursor
+    end_cursor=$(printf '%s' "$result" | jq -r --arg w "$which" '.data.viewer[$w].pageInfo.endCursor // empty' 2>/dev/null || true)
+    [ -z "$end_cursor" ] && break
+    cursor_arg=("-f" "cursor=${end_cursor}")
+  done
+}
+
+cmd_follow_audit_unfollow() {
+  local list_file="$1" total ok=0 fail=0 login
+  total=$(sed 's/#.*//' "$list_file" | awk 'NF' | wc -l | tr -d ' ')
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}Nobody to unfollow.${NC}"
+    exit 0
+  fi
+  echo -e "${YELLOW}${total} account(s) to unfollow${NC}"
+  if ! confirm "Unfollow ${total} account(s)?"; then
+    echo "Cancelled."
+    exit 0
+  fi
+  while IFS= read -r login; do
+    [ -z "$login" ] && continue
+    if gh api --method DELETE "user/following/${login}" &>/dev/null; then
+      ok=$((ok + 1))
+      $VERBOSE && echo -e "  ${GREEN}UNFOLLOWED${NC} ${login}"
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC}     ${login}"
+    fi
+  done < <(sed 's/#.*//' "$list_file" | awk 'NF {print $1}')
+  echo ""
+  echo -e "${GREEN}Done!${NC} Unfollowed: ${BOLD}${ok}${NC}, Failed: ${BOLD}${fail}${NC}"
+}
+
+cmd_follow_audit_main() {
+  cmd_follow_audit_parse_args "$@"
+  preflight_check
+  skip_init
+
+  local out=1
+  [ "$FA_FORMAT" != "text" ] && out=2
+  { header "Follow Audit"; } >&$out
+
+  if [ -n "$FA_FROM" ]; then
+    echo -e "  From: ${BOLD}${FA_FROM}${NC}"
+    echo ""
+    cmd_follow_audit_unfollow "$FA_FROM"
+    exit 0
+  fi
+
+  local excl_file
+  excl_file=$(tmp_new)
+  if [ -n "$FA_EXCLUDE" ]; then
+    sed 's/#.*//' "$FA_EXCLUDE" | awk 'NF {print tolower($1)}' | sort -u > "$excl_file"
+    echo -e "  Excluded: ${BOLD}$(count_lines "$excl_file")${NC} ${DIM}(from ${FA_EXCLUDE})${NC}" >&$out
+  fi
+
+  local cutoff=""
+  [ -n "$FA_INACTIVE" ] && cutoff=$(cutoff_date "$FA_INACTIVE" days)
+
+  echo -e "${DIM}Fetching follow graph...${NC}" >&$out
+  local following_file followers_file
+  following_file=$(tmp_new)
+  cmd_follow_audit_fetch following > "$following_file"
+
+  local n_following n_mutual n_notback
+  n_following=$(count_lines "$following_file")
+  n_mutual=$(awk -F'\t' '$2=="true"' "$following_file" | wc -l | tr -d ' ')
+  n_notback=$((n_following - n_mutual))
+
+  local rows_file
+  rows_file=$(tmp_new)
+  if $FA_NOT_FOLLOWING_BACK; then
+    awk -F'\t' -v OFS='\t' '$2=="false" {print $1, "not-following-back", $3, $4}' "$following_file" >> "$rows_file"
+  fi
+  if $FA_MUTUALS; then
+    awk -F'\t' -v OFS='\t' '$2=="true" {print $1, "mutual", $3, $4}' "$following_file" >> "$rows_file"
+  fi
+  if $FA_NOT_FOLLOWED_BY_ME; then
+    followers_file=$(tmp_new)
+    cmd_follow_audit_fetch followers > "$followers_file"
+    awk -F'\t' -v OFS='\t' '$2=="false" {print $1, "not-followed-by-me", $3, $4}' "$followers_file" >> "$rows_file"
+  fi
+
+  # Excluded logins are dropped from the actionable set entirely.
+  if [ -s "$excl_file" ]; then
+    local kept
+    kept=$(tmp_new)
+    awk -F'\t' 'NR==FNR {x[$1]; next} !(tolower($1) in x)' "$excl_file" "$rows_file" > "$kept"
+    mv "$kept" "$rows_file"
+  fi
+  if [ -n "$cutoff" ]; then
+    local kept
+    kept=$(tmp_new)
+    awk -F'\t' -v c="$cutoff" '$4 == "" || $4 < c' "$rows_file" > "$kept"
+    mv "$kept" "$rows_file"
+  fi
+  if [ "$FA_LIMIT" -gt 0 ]; then
+    local kept
+    kept=$(tmp_new)
+    head -n "$FA_LIMIT" "$rows_file" > "$kept"
+    mv "$kept" "$rows_file"
+  fi
+
+  {
+    echo ""
+    echo -e "  Following: ${BOLD}${n_following}${NC}   Mutuals: ${BOLD}${n_mutual}${NC}   Not following back: ${BOLD}${n_notback}${NC}"
+    echo ""
+  } >&$out
+
+  local total
+  total=$(count_lines "$rows_file")
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}Nothing matches.${NC}" >&$out
+    print_skips
+    exit 0
+  fi
+
+  if [ "$FA_FORMAT" != "text" ]; then
+    local payload outfile=""
+    $FA_SAVE_LIST && outfile="$FA_OUT"
+    payload=$(jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+      | {login: .[0], relationship: .[1], followers: (.[2] | tonumber),
+         last_public_push: (.[3] // ""),
+         url: ("https://github.com/" + .[0])})' < "$rows_file")
+    write_output "$outfile" "$(render_rows "$FA_FORMAT" "$payload")"
+    print_skips
+    exit 0
+  fi
+
+  printf "  ${BOLD}%-24s %-20s %10s  %s${NC}\n" "LOGIN" "RELATIONSHIP" "FOLLOWERS" "LAST PUBLIC PUSH"
+  local login rel fol push
+  while IFS=$'\t' read -r login rel fol push; do
+    printf "  %-24s %-20s %10s  %s\n" "$login" "$rel" "$fol" "${push%%T*}"
+  done < "$rows_file"
+  echo ""
+  echo -e "  ${BOLD}${total}${NC} account(s)"
+
+  if ! $FA_UNFOLLOW; then
+    print_skips
+    exit 0
+  fi
+
+  local list_file
+  if $DRY_RUN || $FA_SAVE_LIST; then
+    list_file="$FA_OUT"
+  else
+    list_file=$(tmp_new)
+  fi
+  awk -F'\t' '{printf "%s  # %s followers · last public push %s\n", $1, $3, ($4 == "" ? "never" : substr($4, 1, 10))}' \
+    "$rows_file" > "$list_file"
+
+  echo ""
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — nobody was unfollowed.${NC}"
+    echo -e "List saved to: ${BOLD}${list_file}${NC}"
+    echo -e "Review it, then run:"
+    echo -e "  ${BOLD}github-helpers follow-audit --from ${list_file}${NC}"
+    print_skips
+    exit 0
+  fi
+
+  cmd_follow_audit_unfollow "$list_file"
+  print_skips
+}
+# =============================================================================
+# COMMAND: bulk-merge
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+BULK_MERGE_TARGET=""
+BULK_MERGE_TARGET_TYPE=""
+BULK_MERGE_REPO=""
+BULK_MERGE_AUTHOR="app/dependabot"
+BULK_MERGE_LABEL=""
+BULK_MERGE_TITLE_MATCH=""
+BULK_MERGE_STRATEGY="squash"
+BULK_MERGE_MAX=10
+BULK_MERGE_LIMIT=200
+BULK_MERGE_DELETE_BRANCH=false
+BULK_MERGE_NO_CHECKS=false
+BULK_MERGE_ALLOW_UNSTABLE=false
+BULK_MERGE_PATCH_ONLY=false
+BULK_MERGE_MINOR_ONLY=false
+
+cmd_bulk_merge_usage() {
+  cat <<EOF
+${BOLD}github-helpers bulk-merge${NC} ${DIM}v${VERSION}${NC} — Merge green dependency-update PRs in batch
+
+${BOLD}USAGE${NC}
+  github-helpers bulk-merge --dry-run
+  github-helpers bulk-merge --patch-only -y
+
+${BOLD}TARGET${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --repo OWNER/NAME       Single repository
+  --limit N               Max repos to scan (default: ${BULK_MERGE_LIMIT})
+
+${BOLD}SELECTION${NC}
+  --author LOGIN          PR author (default: ${BULK_MERGE_AUTHOR}; try app/renovate)
+  --label NAME            Only PRs carrying this label
+  --title-match REGEX     Only PRs whose title matches
+  --patch-only            Only patch bumps (1.2.3 -> 1.2.4)
+  --minor-only            Only patch and minor bumps, never major
+  --max N                 Max PRs merged per repo (default: ${BULK_MERGE_MAX})
+
+${BOLD}SAFETY${NC}
+  --no-checks             Merge even when checks have not passed ${DIM}(dangerous)${NC}
+  --allow-unstable        Allow UNSTABLE ${DIM}(non-required checks failing)${NC}
+  --strategy S            squash, merge or rebase (default: ${BULK_MERGE_STRATEGY})
+  --delete-branch         Delete the head branch after merging
+
+${BOLD}FLAGS${NC}
+  --dry-run               Preview only, merge nothing
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show PRs that were skipped and why
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers bulk-merge --dry-run
+  github-helpers bulk-merge --patch-only --delete-branch -y
+  github-helpers bulk-merge --author app/renovate --minor-only --dry-run
+  github-helpers bulk-merge --repo me/proj --max 50
+
+${BOLD}NOTE${NC}
+  This writes to default branches. Checks must pass unless you pass
+  --no-checks, drafts are always skipped, and only mergeStateStatus CLEAN is
+  merged — DIRTY, BLOCKED, BEHIND and UNKNOWN never are. Every PR that will be
+  merged is listed before the single confirmation.
+EOF
+  exit 0
+}
+
+cmd_bulk_merge_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)           need_arg "--user" "${2:-}"; BULK_MERGE_TARGET="$2"; BULK_MERGE_TARGET_TYPE="user"; shift 2 ;;
+      --org)            need_arg "--org" "${2:-}"; BULK_MERGE_TARGET="$2"; BULK_MERGE_TARGET_TYPE="org"; shift 2 ;;
+      --repo)           need_arg "--repo" "${2:-}"; BULK_MERGE_REPO="$2"; shift 2 ;;
+      --author)         need_arg "--author" "${2:-}"; BULK_MERGE_AUTHOR="$2"; shift 2 ;;
+      --label)          need_arg "--label" "${2:-}"; BULK_MERGE_LABEL="$2"; shift 2 ;;
+      --title-match)    need_arg "--title-match" "${2:-}"; BULK_MERGE_TITLE_MATCH="$2"; shift 2 ;;
+      --strategy)       need_arg "--strategy" "${2:-}"; BULK_MERGE_STRATEGY="$2"; shift 2 ;;
+      --max)            need_arg "--max" "${2:-}"; BULK_MERGE_MAX="$2"; shift 2 ;;
+      --limit)          need_arg "--limit" "${2:-}"; BULK_MERGE_LIMIT="$2"; shift 2 ;;
+      --delete-branch)  BULK_MERGE_DELETE_BRANCH=true; shift ;;
+      --no-checks)      BULK_MERGE_NO_CHECKS=true; shift ;;
+      --allow-unstable) BULK_MERGE_ALLOW_UNSTABLE=true; shift ;;
+      --patch-only)     BULK_MERGE_PATCH_ONLY=true; shift ;;
+      --minor-only)     BULK_MERGE_MINOR_ONLY=true; shift ;;
+      --dry-run)        DRY_RUN=true; shift ;;
+      -y|--yes)         AUTO_YES=true; shift ;;
+      -v|--verbose)     VERBOSE=true; shift ;;
+      -h|--help)        cmd_bulk_merge_usage ;;
+      *) die "bulk-merge: unknown option: $1" ;;
+    esac
+  done
+
+  case "$BULK_MERGE_STRATEGY" in squash|merge|rebase) ;; *) die "bulk-merge: --strategy must be squash, merge or rebase" ;; esac
+  [[ "$BULK_MERGE_MAX" =~ ^[0-9]+$ ]] || die "bulk-merge: --max must be a whole number"
+  [[ "$BULK_MERGE_LIMIT" =~ ^[0-9]+$ ]] || die "bulk-merge: --limit must be a whole number"
+  [ -n "$BULK_MERGE_REPO" ] && [[ "$BULK_MERGE_REPO" != */* ]] && die "bulk-merge: --repo must be OWNER/NAME"
+  $BULK_MERGE_PATCH_ONLY && $BULK_MERGE_MINOR_ONLY && die "bulk-merge: --patch-only and --minor-only are mutually exclusive"
+  if [ -n "$BULK_MERGE_TITLE_MATCH" ]; then
+    jq -n --arg p "$BULK_MERGE_TITLE_MATCH" '"" | test($p)' >/dev/null 2>&1 \
+      || die "bulk-merge: --title-match is not a valid regex: ${BULK_MERGE_TITLE_MATCH}"
+  fi
+  return 0
+}
+
+# cmd_bulk_merge_bump_kind "<pr title>" -> major | minor | patch | unknown
+# Pure: parses the semver bump out of a Dependabot or Renovate title. Accepts
+# one to three version components, because GitHub Action tags are often bare
+# majors ("from 4 to 7") and those are still major bumps.
+#   "Bump foo from 1.2.3 to 1.2.4"              -> patch
+#   "Bump actions/checkout from 4 to 7"         -> major
+#   "Bump jest and @types/jest"                 -> unknown
+# unknown is the safe answer: --patch-only and --minor-only both exclude it.
+cmd_bulk_merge_bump_kind() {
+  local title="$1"
+  if [[ "$title" =~ [Ff]rom[[:space:]]+v?([0-9]+)(\.([0-9]+))?(\.([0-9]+))?[^[:space:]]*[[:space:]]+to[[:space:]]+v?([0-9]+)(\.([0-9]+))?(\.([0-9]+))? ]]; then
+    if   [ "${BASH_REMATCH[1]}"    != "${BASH_REMATCH[6]}" ];    then printf 'major'
+    elif [ "${BASH_REMATCH[3]:-0}" != "${BASH_REMATCH[8]:-0}" ]; then printf 'minor'
+    else printf 'patch'
+    fi
+    return 0
+  fi
+  printf 'unknown'
+}
+
+cmd_bulk_merge_main() {
+  cmd_bulk_merge_parse_args "$@"
+  preflight_check
+  skip_init
+
+  if [ -z "$BULK_MERGE_TARGET" ]; then
+    BULK_MERGE_TARGET=$(get_username)
+    BULK_MERGE_TARGET_TYPE="user"
+  fi
+
+  header "Bulk Merge"
+  if [ -n "$BULK_MERGE_REPO" ]; then
+    echo -e "  Repo:     ${BOLD}${BULK_MERGE_REPO}${NC}"
+  else
+    echo -e "  Target:   ${BOLD}${BULK_MERGE_TARGET}${NC}"
+  fi
+  echo -e "  Author:   ${BOLD}${BULK_MERGE_AUTHOR}${NC}"
+  echo -e "  Strategy: ${BOLD}${BULK_MERGE_STRATEGY}${NC}"
+  $BULK_MERGE_PATCH_ONLY && echo -e "  Bumps:    ${BOLD}patch only${NC}"
+  $BULK_MERGE_MINOR_ONLY && echo -e "  Bumps:    ${BOLD}patch and minor only${NC}"
+  $BULK_MERGE_NO_CHECKS && echo -e "  Checks:   ${RED}NOT required${NC}"
+  $DRY_RUN && echo -e "  Mode:     ${YELLOW}DRY RUN${NC}"
+  echo ""
+
+  local repo_file cand_file
+  repo_file=$(resolve_repo_list "$BULK_MERGE_TARGET" "$BULK_MERGE_REPO" "$BULK_MERGE_LIMIT" "bulk-merge")
+  cand_file=$(tmp_new)
+
+  echo -e "${DIM}Scanning $(count_lines "$repo_file") repo(s)...${NC}"
+  local nwo prs
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    prs=$(gh pr list --repo "$nwo" --author "$BULK_MERGE_AUTHOR" --state open --limit 100 \
+            --json number,title,mergeable,mergeStateStatus,isDraft,labels,createdAt,headRefName 2>/dev/null) \
+      || { skip_note "$nwo" "cannot list pull requests"; continue; }
+    [ -z "$prs" ] && continue
+
+    printf '%s' "$prs" | jq -r \
+      --arg repo "$nwo" --arg label "$BULK_MERGE_LABEL" --arg tm "$BULK_MERGE_TITLE_MATCH" \
+      --argjson allowUnstable "$BULK_MERGE_ALLOW_UNSTABLE" --argjson noChecks "$BULK_MERGE_NO_CHECKS" '
+      map(select(.isDraft | not))
+      | map(select($label == "" or ([.labels[].name] | index($label))))
+      | map(select($tm == "" or (.title | test($tm))))
+      | map(. + {verdict:
+          (if .mergeable != "MERGEABLE" then "blocked: mergeable=" + (.mergeable // "?")
+           elif .mergeStateStatus == "CLEAN" then "ok"
+           elif .mergeStateStatus == "UNSTABLE" then
+             (if $allowUnstable or $noChecks then "ok" else "blocked: UNSTABLE (non-required checks failing)" end)
+           elif $noChecks and (["DIRTY","UNKNOWN"] | index(.mergeStateStatus) | not) then "ok"
+           else "blocked: " + (.mergeStateStatus // "?") end)})
+      | .[] | [$repo, (.number|tostring), .title, .verdict, .headRefName] | @tsv' >> "$cand_file"
+  done < "$repo_file"
+
+  # Semver gate and per-repo cap, applied in bash so the parser stays testable.
+  local filtered
+  filtered=$(tmp_new)
+  local repo num title verdict branch kind
+  declare -A per_repo=()
+  while IFS=$'\t' read -r repo num title verdict branch; do
+    kind=$(cmd_bulk_merge_bump_kind "$title")
+    if $BULK_MERGE_PATCH_ONLY && [ "$kind" != "patch" ]; then
+      $VERBOSE && echo -e "  ${DIM}skip ${repo}#${num}: ${kind} bump${NC}"
+      continue
+    fi
+    if $BULK_MERGE_MINOR_ONLY && [ "$kind" != "patch" ] && [ "$kind" != "minor" ]; then
+      $VERBOSE && echo -e "  ${DIM}skip ${repo}#${num}: ${kind} bump${NC}"
+      continue
+    fi
+    if [ "$verdict" != "ok" ]; then
+      $VERBOSE && echo -e "  ${DIM}skip ${repo}#${num}: ${verdict}${NC}"
+      continue
+    fi
+    per_repo["$repo"]=$(( ${per_repo["$repo"]:-0} + 1 ))
+    if [ "${per_repo["$repo"]}" -gt "$BULK_MERGE_MAX" ]; then
+      $VERBOSE && echo -e "  ${DIM}skip ${repo}#${num}: over --max ${BULK_MERGE_MAX}${NC}"
+      continue
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "$num" "$title" "$kind" "$branch" >> "$filtered"
+  done < "$cand_file"
+
+  local total
+  total=$(count_lines "$filtered")
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No mergeable pull requests match.${NC}"
+    print_skips
+    exit 0
+  fi
+
+  echo ""
+  echo -e "${YELLOW}${total} pull request(s) ready to merge${NC}"
+  echo ""
+  printf "  ${BOLD}%-34s %6s %-7s %s${NC}\n" "REPOSITORY" "PR" "BUMP" "TITLE"
+  while IFS=$'\t' read -r repo num title kind branch; do
+    printf "  %-34s %6s %-7s %s\n" "$repo" "#${num}" "$kind" "${title:0:60}"
+  done < "$filtered"
+  echo ""
+
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — nothing was merged.${NC}"
+    print_skips
+    exit 0
+  fi
+
+  if ! confirm "Merge ${total} pull request(s) into their default branches?"; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  local merged=0 fail=0
+  local -a merge_flags=("--${BULK_MERGE_STRATEGY}")
+  $BULK_MERGE_DELETE_BRANCH && merge_flags+=("--delete-branch")
+  while IFS=$'\t' read -r repo num title kind branch; do
+    if gh pr merge "$num" --repo "$repo" "${merge_flags[@]}" &>/dev/null; then
+      merged=$((merged + 1))
+      echo -e "  ${GREEN}MERGED${NC}  ${repo}#${num} ${DIM}${title:0:50}${NC}"
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC}  ${repo}#${num} ${DIM}${title:0:50}${NC}"
+    fi
+  done < "$filtered"
+
+  echo ""
+  echo -e "${GREEN}Done!${NC} Merged: ${BOLD}${merged}${NC}, Failed: ${BOLD}${fail}${NC}"
+  print_skips
+}
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -7830,6 +8407,8 @@ main() {
     notifications|notifs)  cmd_notifications_main "$@" ;;
     invite-cleanup)        cmd_invite_cleanup_main "$@" ;;
     org-audit)             cmd_org_audit_main "$@" ;;
+    follow-audit|follow)   cmd_follow_audit_main "$@" ;;
+    bulk-merge)            cmd_bulk_merge_main "$@" ;;
     cleanup-branches)      cmd_cleanup_branches_main "$@" ;;
     archive-repos)         cmd_archive_repos_main "$@" ;;
     repo-audit|audit)      cmd_repo_audit_main "$@" ;;
