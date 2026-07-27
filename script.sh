@@ -432,6 +432,7 @@ ${BOLD}COMMANDS${NC}
   cache-cleanup       Purge GitHub Actions caches (10 GB/repo quota)
   artifact-cleanup    Delete GitHub Actions artifacts
   run-cleanup         Delete old workflow runs (and their logs)
+  gist                List, export and bulk-delete your gists
 
   ${BOLD}Audit & visibility${NC}
   repo-audit          Scan repos for missing LICENSE, README, description, topics
@@ -444,6 +445,7 @@ ${BOLD}COMMANDS${NC}
   webhook-audit       List webhooks across repos
   collaborator-audit  Audit outside collaborators and permissions
   activity-report     Generate activity summary for a period
+  traffic             Snapshot repo views and clones (14-day window)
 
   ${BOLD}Bulk operations${NC}
   clone-org           Clone all repos from a GitHub org or user
@@ -6487,6 +6489,538 @@ cmd_run_cleanup_main() {
   print_skips
 }
 # =============================================================================
+# COMMAND: gist
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+GIST_VIS=""
+GIST_OLDER_THAN=""
+GIST_UNTOUCHED=""
+GIST_EMPTY=false
+GIST_NO_DESC=false
+GIST_MATCH=""
+GIST_STARRED=false
+GIST_LIMIT=1000
+GIST_DELETE=false
+GIST_FORMAT="text"
+GIST_OUT="gist-delete.txt"
+GIST_SAVE_LIST=false
+GIST_FROM=""
+
+cmd_gist_usage() {
+  cat <<EOF
+${BOLD}github-helpers gist${NC} ${DIM}v${VERSION}${NC} — List, export and bulk-delete your gists
+
+${BOLD}USAGE${NC}
+  github-helpers gist [filters]
+  github-helpers gist [filters] --delete --dry-run
+  github-helpers gist --from ${GIST_OUT}
+
+${BOLD}FILTERS${NC} (combined with AND — see NOTE)
+  --public / --secret     Only public, or only secret, gists
+  --older-than N          Created more than N days ago
+  --untouched N           Not updated in N days
+  --empty                 All files are empty or whitespace-only
+  --no-description        No description
+  --match PATTERN         Regex on the description or any filename
+  --starred               Operate on gists you starred ${DIM}(read-only)${NC}
+  --limit N               Max gists to fetch (default: ${GIST_LIMIT})
+
+${BOLD}ACTION${NC}
+  --delete                Delete the matched gists ${DIM}(needs at least one filter)${NC}
+
+${BOLD}I/O${NC}
+  --dry-run               Preview only — writes an annotated list, deletes nothing
+  --out FILE              List file (default: ${GIST_OUT}), or report file with --format
+  --save-list             Save the list even outside --dry-run
+  --from FILE             Delete the ids listed in FILE (comments after # are ignored)
+  --format FORMAT         text, json, csv or md (default: text)
+
+${BOLD}FLAGS${NC}
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show every gist
+  -h, --help              Show this help
+
+${BOLD}WORKFLOW${NC}
+  1. Preview:  github-helpers gist --empty --delete --dry-run
+  2. Edit:     vim ${GIST_OUT}
+  3. Execute:  github-helpers gist --from ${GIST_OUT}
+
+${BOLD}EXAMPLES${NC}
+  github-helpers gist --secret
+  github-helpers gist --format csv --out gists.csv
+  github-helpers gist --empty --no-description --delete --dry-run
+  github-helpers gist --older-than 1825 --untouched 1825 --delete
+
+${BOLD}NOTE${NC}
+  Filters are ANDed, unlike unstar's default OR. You are building a deletion
+  set here, and an OR would be a trap.
+
+  Gists are deleted permanently — there is no trash. --empty checks file sizes
+  from the listing for free, and only fetches the content of gists whose
+  largest file is under 64 bytes.
+EOF
+  exit 0
+}
+
+cmd_gist_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --older-than)     need_arg "--older-than" "${2:-}"; GIST_OLDER_THAN="$2"; shift 2 ;;
+      --untouched)      need_arg "--untouched" "${2:-}"; GIST_UNTOUCHED="$2"; shift 2 ;;
+      --match)          need_arg "--match" "${2:-}"; GIST_MATCH="$2"; shift 2 ;;
+      --limit)          need_arg "--limit" "${2:-}"; GIST_LIMIT="$2"; shift 2 ;;
+      --out)            need_arg "--out" "${2:-}"; GIST_OUT="$2"; GIST_SAVE_LIST=true; shift 2 ;;
+      --from)           need_arg "--from" "${2:-}"; GIST_FROM="$2"; shift 2 ;;
+      --format)         need_arg "--format" "${2:-}"; GIST_FORMAT="$2"; shift 2 ;;
+      --public)         GIST_VIS="true"; shift ;;
+      --secret)         GIST_VIS="false"; shift ;;
+      --empty)          GIST_EMPTY=true; shift ;;
+      --no-description) GIST_NO_DESC=true; shift ;;
+      --starred)        GIST_STARRED=true; shift ;;
+      --delete)         GIST_DELETE=true; shift ;;
+      --save-list)      GIST_SAVE_LIST=true; shift ;;
+      --dry-run)        DRY_RUN=true; shift ;;
+      -y|--yes)         AUTO_YES=true; shift ;;
+      -v|--verbose)     VERBOSE=true; shift ;;
+      -h|--help)        cmd_gist_usage ;;
+      *) die "gist: unknown option: $1" ;;
+    esac
+  done
+
+  case "$GIST_FORMAT" in
+    text|json|csv|md) ;;
+    *) die "gist: invalid --format '${GIST_FORMAT}' (use text, json, csv or md)" ;;
+  esac
+  [ -n "$GIST_OLDER_THAN" ] && { [[ "$GIST_OLDER_THAN" =~ ^[0-9]+$ ]] || die "gist: --older-than must be a whole number of days"; }
+  [ -n "$GIST_UNTOUCHED" ] && { [[ "$GIST_UNTOUCHED" =~ ^[0-9]+$ ]] || die "gist: --untouched must be a whole number of days"; }
+  [[ "$GIST_LIMIT" =~ ^[0-9]+$ ]] || die "gist: --limit must be a whole number"
+
+  if [ -n "$GIST_FROM" ]; then
+    [ -f "$GIST_FROM" ] || die "gist: file not found: ${GIST_FROM}"
+    GIST_DELETE=true
+    return 0
+  fi
+
+  # Validate the regex before spending a single request on it.
+  if [ -n "$GIST_MATCH" ]; then
+    jq -n --arg p "$GIST_MATCH" '"" | test($p; "i")' >/dev/null 2>&1 \
+      || die "gist: --match is not a valid regex: ${GIST_MATCH}"
+  fi
+
+  $GIST_DELETE && $GIST_STARRED && die "gist: --starred gists belong to other people and cannot be deleted"
+  if [ "$GIST_FORMAT" != "text" ] && { $GIST_DELETE || $DRY_RUN; }; then
+    die "gist: --format is for reporting — drop --delete/--dry-run"
+  fi
+
+  local nfilters=0
+  [ -n "$GIST_VIS" ] && nfilters=$((nfilters + 1))
+  [ -n "$GIST_OLDER_THAN" ] && nfilters=$((nfilters + 1))
+  [ -n "$GIST_UNTOUCHED" ] && nfilters=$((nfilters + 1))
+  [ -n "$GIST_MATCH" ] && nfilters=$((nfilters + 1))
+  $GIST_EMPTY && nfilters=$((nfilters + 1))
+  $GIST_NO_DESC && nfilters=$((nfilters + 1))
+  if $GIST_DELETE && [ "$nfilters" -eq 0 ]; then
+    die "gist: --delete requires at least one filter (refusing to delete every gist)"
+  fi
+  return 0
+}
+
+cmd_gist_delete_from() {
+  local list_file="$1" total deleted=0 fail=0 id
+  total=$(sed 's/#.*//' "$list_file" | awk 'NF' | wc -l | tr -d ' ')
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No gists to delete.${NC}"
+    exit 0
+  fi
+  echo -e "${YELLOW}${total} gist(s) to delete${NC}"
+  echo ""
+  if ! confirm "Delete ${total} gist(s)? This is permanent."; then
+    echo "Cancelled."
+    exit 0
+  fi
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    if gh api --method DELETE "gists/${id}" &>/dev/null; then
+      deleted=$((deleted + 1))
+      $VERBOSE && echo -e "  ${GREEN}DELETED${NC}  ${id}"
+    else
+      fail=$((fail + 1))
+      echo -e "  ${RED}FAILED${NC}   ${id}"
+    fi
+  done < <(sed 's/#.*//' "$list_file" | awk 'NF {print $1}')
+  echo ""
+  echo -e "${GREEN}Done!${NC} Deleted: ${BOLD}${deleted}${NC}, Failed: ${BOLD}${fail}${NC}"
+}
+
+cmd_gist_main() {
+  cmd_gist_parse_args "$@"
+  preflight_check
+  skip_init
+
+  local out=1
+  [ "$GIST_FORMAT" != "text" ] && out=2
+
+  { header "Gists"; } >&$out
+
+  if [ -n "$GIST_FROM" ]; then
+    echo -e "  From: ${BOLD}${GIST_FROM}${NC}"
+    echo ""
+    cmd_gist_delete_from "$GIST_FROM"
+    exit 0
+  fi
+
+  local older_cut="" untouched_cut=""
+  [ -n "$GIST_OLDER_THAN" ] && older_cut=$(cutoff_date "$GIST_OLDER_THAN" days)
+  [ -n "$GIST_UNTOUCHED" ] && untouched_cut=$(cutoff_date "$GIST_UNTOUCHED" days)
+
+  {
+    $GIST_STARRED && echo -e "  Source:   ${BOLD}starred gists${NC}"
+    [ "$GIST_VIS" = "true" ]  && echo -e "  Filter:   ${BOLD}public only${NC}"
+    [ "$GIST_VIS" = "false" ] && echo -e "  Filter:   ${BOLD}secret only${NC}"
+    [ -n "$older_cut" ] && echo -e "  Created:  ${BOLD}before ${older_cut%%T*}${NC}"
+    [ -n "$untouched_cut" ] && echo -e "  Updated:  ${BOLD}before ${untouched_cut%%T*}${NC}"
+    [ -n "$GIST_MATCH" ] && echo -e "  Match:    ${BOLD}${GIST_MATCH}${NC}"
+    $GIST_EMPTY && echo -e "  Filter:   ${BOLD}empty content${NC}"
+    $GIST_NO_DESC && echo -e "  Filter:   ${BOLD}no description${NC}"
+    $DRY_RUN && echo -e "  Mode:     ${YELLOW}DRY RUN${NC}"
+    echo ""
+    echo -e "${DIM}Fetching gists...${NC}"
+  } >&$out
+
+  local path="gists?per_page=100"
+  $GIST_STARRED && path="gists/starred?per_page=100"
+  local all
+  all=$(gh_paginate "gists" "$path") || die "gist: failed to list gists"
+  all=$(printf '%s' "$all" | jq --argjson lim "$GIST_LIMIT" '.[0:$lim]')
+
+  # emptiness: "yes" when every file is zero bytes, "probe" when the largest
+  # file is tiny enough that whitespace-only is plausible, "no" otherwise.
+  local rows
+  rows=$(printf '%s' "$all" | jq -c \
+    --arg vis "$GIST_VIS" --arg older "$older_cut" --arg untouched "$untouched_cut" \
+    --arg pat "$GIST_MATCH" --argjson nodesc "$GIST_NO_DESC" '
+    map(select($vis == "" or ((.public | tostring) == $vis)))
+    | map(select($older == "" or .created_at < $older))
+    | map(select($untouched == "" or .updated_at < $untouched))
+    | map(select($nodesc == false or (((.description // "") | gsub("\\s"; "") | length) == 0)))
+    | map(select($pat == "" or ((.description // "") | test($pat; "i"))
+                            or ([.files | keys[]] | any(test($pat; "i")))))
+    | map({ id, description: (.description // ""), public, files: (.files | length),
+            bytes: ([.files[].size] | add // 0),
+            maxsize: ([.files[].size] | max // 0),
+            comments, created_at, updated_at, url: .html_url })
+    | map(. + {empty: (if .bytes == 0 then "yes" elif .maxsize <= 64 then "probe" else "no" end)})')
+
+  if $GIST_EMPTY; then
+    local probes
+    probes=$(printf '%s' "$rows" | jq -r '.[] | select(.empty == "probe") | .id')
+    if [ -n "$probes" ]; then
+      echo -e "  ${DIM}Checking $(printf '%s\n' "$probes" | wc -l | tr -d ' ') small gist(s) for whitespace-only content...${NC}" >&$out
+      local confirmed_file id body
+      confirmed_file=$(tmp_new)
+      while IFS= read -r id; do
+        [ -z "$id" ] && continue
+        body=$(gh_api_try "gist ${id}" "gists/${id}") || continue
+        if printf '%s' "$body" | jq -e '[.files[].content // ""] | join("") | gsub("\\s"; "") | length == 0' >/dev/null 2>&1; then
+          printf '%s\n' "$id" >> "$confirmed_file"
+        fi
+      done <<< "$probes"
+      rows=$(printf '%s' "$rows" | jq -c --slurpfile ok <(jq -R . "$confirmed_file" 2>/dev/null || echo '[]') '
+        ($ok | map(select(type == "string"))) as $ids
+        | map(select(.empty == "yes" or (.empty == "probe" and (.id as $i | $ids | index($i)))))')
+    else
+      rows=$(printf '%s' "$rows" | jq -c 'map(select(.empty == "yes"))')
+    fi
+  fi
+
+  local total
+  total=$(printf '%s' "$rows" | jq 'length')
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No gists match.${NC}" >&$out
+    print_skips
+    exit 0
+  fi
+
+  # ── Report mode ────────────────────────────────────────────────────────────
+  if [ "$GIST_FORMAT" != "text" ]; then
+    local payload outfile=""
+    # NOT ${GIST_SAVE_LIST:+...}: the variable holds the string "false", which
+    # is non-empty, so :+ would always fire and swallow stdout.
+    $GIST_SAVE_LIST && outfile="$GIST_OUT"
+    payload=$(printf '%s' "$rows" | jq 'map({id, description, public, files, bytes, comments,
+                                             created: (.created_at[0:10]), updated: (.updated_at[0:10]), url})')
+    write_output "$outfile" "$(render_rows "$GIST_FORMAT" "$payload")"
+    print_skips
+    exit 0
+  fi
+
+  echo ""
+  echo -e "${YELLOW}${total} gist(s)${NC}"
+  local n_pub n_sec
+  n_pub=$(printf '%s' "$rows" | jq '[.[] | select(.public)] | length')
+  n_sec=$((total - n_pub))
+  echo -e "  ${DIM}public: ${n_pub}   secret: ${n_sec}${NC}"
+  echo ""
+  if $VERBOSE || ! $GIST_DELETE; then
+    printf "  ${BOLD}%-34s %-8s %-6s %-11s %s${NC}\n" "ID" "VIS" "FILES" "CREATED" "DESCRIPTION"
+    printf '%s' "$rows" | jq -r '.[] | [.id, (if .public then "public" else "secret" end),
+      (.files | tostring), (.created_at[0:10]), (.description // "")] | @tsv' \
+      | while IFS=$'\t' read -r id vis files created desc; do
+          printf "  %-34s %-8s %-6s %-11s %s\n" "$id" "$vis" "$files" "$created" "${desc:0:50}"
+        done
+    echo ""
+  fi
+
+  if ! $GIST_DELETE; then
+    print_skips
+    exit 0
+  fi
+
+  # ── Deletion path: annotate the list, ids alone tell a human nothing ───────
+  local list_file
+  if $DRY_RUN || $GIST_SAVE_LIST; then
+    list_file="$GIST_OUT"
+  else
+    list_file=$(tmp_new)
+  fi
+  printf '%s' "$rows" | jq -r '.[] |
+    "\(.id)  # \(if .public then "public" else "secret" end) · created \(.created_at[0:10]) · \(.files) file(s) · \(if (.description // "") == "" then "(no description)" else "\"\(.description)\"" end)"' \
+    > "$list_file"
+
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — no gists were deleted.${NC}"
+    echo -e "List saved to: ${BOLD}${list_file}${NC}"
+    echo -e "Review it, then run:"
+    echo -e "  ${BOLD}github-helpers gist --from ${list_file}${NC}"
+    print_skips
+    exit 0
+  fi
+
+  cmd_gist_delete_from "$list_file"
+  print_skips
+}
+# =============================================================================
+# COMMAND: traffic
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+TRAFFIC_TARGET=""
+TRAFFIC_TARGET_TYPE=""
+TRAFFIC_REPO=""
+TRAFFIC_PER="day"
+TRAFFIC_SORT="views"
+TRAFFIC_TOP=0
+TRAFFIC_PATHS=false
+TRAFFIC_REFERRERS=false
+TRAFFIC_FORMAT="text"
+TRAFFIC_OUT=""
+TRAFFIC_APPEND=false
+TRAFFIC_LIMIT=200
+
+cmd_traffic_usage() {
+  cat <<EOF
+${BOLD}github-helpers traffic${NC} ${DIM}v${VERSION}${NC} — Snapshot repository views and clones
+
+${BOLD}USAGE${NC}
+  github-helpers traffic [options]
+  github-helpers traffic --format csv --out traffic.csv --append
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --repo OWNER/NAME       Single repository
+  --per day|week          Granularity (default: ${TRAFFIC_PER})
+  --sort views|clones     Sort the summary by this metric (default: ${TRAFFIC_SORT})
+  --top N                 Only the top N repos in the summary
+  --paths                 Also show the most visited paths
+  --referrers             Also show the top referring sites
+  --format FORMAT         text, json, csv or md (default: text)
+  --out FILE              Write the report to FILE instead of stdout
+  --append                Append only new (date, repo) rows to --out
+  --limit N               Max repos to scan (default: ${TRAFFIC_LIMIT})
+  -v, --verbose           Show repos with no traffic too
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers traffic
+  github-helpers traffic --sort clones --top 10
+  github-helpers traffic --repo me/proj --paths --referrers
+  github-helpers traffic --format csv --out traffic.csv --append   ${DIM}# cron this${NC}
+
+${BOLD}NOTE${NC}
+  GitHub only keeps 14 days of traffic data, so the point of this command is
+  to build your own history: --append writes only (date, repo) pairs the file
+  does not already have, which makes repeated runs idempotent.
+
+  These endpoints require push access, so repos you do not own are skipped.
+EOF
+  exit 0
+}
+
+cmd_traffic_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)       need_arg "--user" "${2:-}"; TRAFFIC_TARGET="$2"; TRAFFIC_TARGET_TYPE="user"; shift 2 ;;
+      --org)        need_arg "--org" "${2:-}"; TRAFFIC_TARGET="$2"; TRAFFIC_TARGET_TYPE="org"; shift 2 ;;
+      --repo)       need_arg "--repo" "${2:-}"; TRAFFIC_REPO="$2"; shift 2 ;;
+      --per)        need_arg "--per" "${2:-}"; TRAFFIC_PER="$2"; shift 2 ;;
+      --sort)       need_arg "--sort" "${2:-}"; TRAFFIC_SORT="$2"; shift 2 ;;
+      --top)        need_arg "--top" "${2:-}"; TRAFFIC_TOP="$2"; shift 2 ;;
+      --format)     need_arg "--format" "${2:-}"; TRAFFIC_FORMAT="$2"; shift 2 ;;
+      --out)        need_arg "--out" "${2:-}"; TRAFFIC_OUT="$2"; shift 2 ;;
+      --limit)      need_arg "--limit" "${2:-}"; TRAFFIC_LIMIT="$2"; shift 2 ;;
+      --paths)      TRAFFIC_PATHS=true; shift ;;
+      --referrers)  TRAFFIC_REFERRERS=true; shift ;;
+      --append)     TRAFFIC_APPEND=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)    cmd_traffic_usage ;;
+      *) die "traffic: unknown option: $1" ;;
+    esac
+  done
+
+  case "$TRAFFIC_PER" in day|week) ;; *) die "traffic: --per must be day or week" ;; esac
+  case "$TRAFFIC_SORT" in views|clones) ;; *) die "traffic: --sort must be views or clones" ;; esac
+  case "$TRAFFIC_FORMAT" in text|json|csv|md) ;; *) die "traffic: invalid --format '${TRAFFIC_FORMAT}' (use text, json, csv or md)" ;; esac
+  [[ "$TRAFFIC_TOP" =~ ^[0-9]+$ ]] || die "traffic: --top must be a whole number"
+  [[ "$TRAFFIC_LIMIT" =~ ^[0-9]+$ ]] || die "traffic: --limit must be a whole number"
+  [ -n "$TRAFFIC_REPO" ] && [[ "$TRAFFIC_REPO" != */* ]] && die "traffic: --repo must be OWNER/NAME"
+  $TRAFFIC_APPEND && [ -z "$TRAFFIC_OUT" ] && die "traffic: --append needs --out FILE"
+  $TRAFFIC_APPEND && [ "$TRAFFIC_FORMAT" != "csv" ] && die "traffic: --append only makes sense with --format csv"
+  return 0
+}
+
+cmd_traffic_main() {
+  cmd_traffic_parse_args "$@"
+  preflight_check
+  skip_init
+
+  if [ -z "$TRAFFIC_TARGET" ]; then
+    TRAFFIC_TARGET=$(get_username)
+    TRAFFIC_TARGET_TYPE="user"
+  fi
+
+  {
+    header "Traffic"
+    if [ -n "$TRAFFIC_REPO" ]; then
+      echo -e "  Repo:   ${BOLD}${TRAFFIC_REPO}${NC}"
+    else
+      echo -e "  Target: ${BOLD}${TRAFFIC_TARGET}${NC}"
+    fi
+    echo -e "  Per:    ${BOLD}${TRAFFIC_PER}${NC}"
+    echo ""
+  } >&2
+
+  local repo_file daily_file totals_file
+  repo_file=$(resolve_repo_list "$TRAFFIC_TARGET" "$TRAFFIC_REPO" "$TRAFFIC_LIMIT" "traffic")
+  daily_file=$(tmp_new); totals_file=$(tmp_new)
+
+  echo -e "${DIM}Reading traffic for $(count_lines "$repo_file") repo(s)...${NC}" >&2
+  local nwo views clones
+  while IFS= read -r nwo; do
+    [ -z "$nwo" ] && continue
+    views=$(gh_api_try "$nwo" "repos/${nwo}/traffic/views?per=${TRAFFIC_PER}") || { scope_hint "repo"; continue; }
+    clones=$(gh_api_try "$nwo" "repos/${nwo}/traffic/clones?per=${TRAFFIC_PER}") || continue
+
+    # One row per bucket, views and clones joined on the timestamp.
+    jq -rn --argjson v "$views" --argjson c "$clones" --arg repo "$nwo" '
+      ( [ ($v.views // [])[]  | {k: .timestamp, vc: .count, vu: .uniques} ]
+      + [ ($c.clones // [])[] | {k: .timestamp, cc: .count, cu: .uniques} ] )
+      | group_by(.k)
+      | map({date: (.[0].k[0:10]),
+             views:  (map(.vc // 0) | add), unique_views:  (map(.vu // 0) | add),
+             clones: (map(.cc // 0) | add), unique_clones: (map(.cu // 0) | add)})
+      | .[] | [$repo, .date, (.views|tostring), (.unique_views|tostring),
+               (.clones|tostring), (.unique_clones|tostring)] | @tsv' >> "$daily_file"
+
+    printf '%s\t%s\t%s\t%s\t%s\n' "$nwo" \
+      "$(printf '%s' "$views"  | jq -r '.count // 0')" \
+      "$(printf '%s' "$views"  | jq -r '.uniques // 0')" \
+      "$(printf '%s' "$clones" | jq -r '.count // 0')" \
+      "$(printf '%s' "$clones" | jq -r '.uniques // 0')" >> "$totals_file"
+  done < "$repo_file"
+
+  if [ "$(count_lines "$totals_file")" -eq 0 ]; then
+    echo -e "${YELLOW}No traffic data available.${NC}" >&2
+    print_skips
+    exit 0
+  fi
+
+  # ── Machine-readable: the daily rows are what you historize ────────────────
+  if [ "$TRAFFIC_FORMAT" != "text" ]; then
+    local rows
+    rows=$(awk -F'\t' 'BEGIN {print "["} {printf "%s{\"date\":\"%s\",\"repo\":\"%s\",\"views\":%s,\"unique_views\":%s,\"clones\":%s,\"unique_clones\":%s}", (NR>1?",":""), $2, $1, $3, $4, $5, $6} END {print "]"}' "$daily_file" | jq -c 'sort_by(.date, .repo)')
+
+    if $TRAFFIC_APPEND && [ -f "$TRAFFIC_OUT" ]; then
+      local keys new_rows
+      keys=$(tmp_new)
+      # Existing keys are the first two CSV columns: date then repo.
+      awk -F'","' 'NR > 1 {gsub(/^"/, "", $1); print $1 "\t" $2}' "$TRAFFIC_OUT" | sort -u > "$keys"
+      new_rows=$(printf '%s' "$rows" | jq -c --rawfile k "$keys" '
+        ($k | split("\n") | map(select(length > 0))) as $seen
+        | map(select((.date + "\t" + .repo) as $key | ($seen | index($key)) == null))')
+      local n_new
+      n_new=$(printf '%s' "$new_rows" | jq 'length')
+      if [ "$n_new" -eq 0 ]; then
+        echo -e "${GREEN}Nothing new — ${TRAFFIC_OUT} is already up to date.${NC}" >&2
+      else
+        render_rows csv "$new_rows" | tail -n +2 >> "$TRAFFIC_OUT"
+        echo -e "${GREEN}Done!${NC} Appended ${BOLD}${n_new}${NC} new row(s) to ${BOLD}${TRAFFIC_OUT}${NC}" >&2
+      fi
+      print_skips
+      exit 0
+    fi
+
+    write_output "$TRAFFIC_OUT" "$(render_rows "$TRAFFIC_FORMAT" "$rows")"
+    print_skips
+    exit 0
+  fi
+
+  # ── Text summary ───────────────────────────────────────────────────────────
+  local sort_col=2
+  [ "$TRAFFIC_SORT" = "clones" ] && sort_col=4
+  echo ""
+  printf "  ${BOLD}%-45s %8s %8s %8s %8s${NC}\n" "REPOSITORY" "VIEWS" "UNIQUE" "CLONES" "UNIQUE"
+  local shown=0 nwo v uv c uc tv=0 tuv=0 tc=0 tuc=0
+  while IFS=$'\t' read -r nwo v uv c uc; do
+    tv=$((tv + v)); tuv=$((tuv + uv)); tc=$((tc + c)); tuc=$((tuc + uc))
+    if [ "$v" -eq 0 ] && [ "$c" -eq 0 ] && ! $VERBOSE; then continue; fi
+    if [ "$TRAFFIC_TOP" -gt 0 ] && [ "$shown" -ge "$TRAFFIC_TOP" ]; then continue; fi
+    shown=$((shown + 1))
+    printf "  %-45s %8s %8s %8s %8s\n" "$nwo" "$v" "$uv" "$c" "$uc"
+  done < <(sort -t$'\t' -k${sort_col} -rn "$totals_file")
+  printf "  ${DIM}%-45s %8s %8s %8s %8s${NC}\n" "TOTAL" "$tv" "$tuv" "$tc" "$tuc"
+
+  if $TRAFFIC_PATHS || $TRAFFIC_REFERRERS; then
+    while IFS= read -r nwo; do
+      [ -z "$nwo" ] && continue
+      if $TRAFFIC_PATHS; then
+        local paths
+        paths=$(gh_api_try "$nwo" "repos/${nwo}/traffic/popular/paths") || continue
+        if [ "$(printf '%s' "$paths" | jq 'length')" -gt 0 ]; then
+          echo ""
+          echo -e "  ${BOLD}Top paths — ${nwo}${NC}"
+          printf '%s' "$paths" | jq -r '.[0:10][] | "    \(.count)\t\(.uniques)\t\(.path)"' \
+            | while IFS=$'\t' read -r cnt uq p; do printf "    %6s %6s  %s\n" "$cnt" "$uq" "$p"; done
+        fi
+      fi
+      if $TRAFFIC_REFERRERS; then
+        local refs
+        refs=$(gh_api_try "$nwo" "repos/${nwo}/traffic/popular/referrers") || continue
+        if [ "$(printf '%s' "$refs" | jq 'length')" -gt 0 ]; then
+          echo ""
+          echo -e "  ${BOLD}Top referrers — ${nwo}${NC}"
+          printf '%s' "$refs" | jq -r '.[0:10][] | "    \(.count)\t\(.uniques)\t\(.referrer)"' \
+            | while IFS=$'\t' read -r cnt uq r; do printf "    %6s %6s  %s\n" "$cnt" "$uq" "$r"; done
+        fi
+      fi
+    done < "$repo_file"
+  fi
+
+  echo ""
+  print_skips
+}
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -6517,6 +7051,8 @@ main() {
     cache-cleanup)         cmd_cache_cleanup_main "$@" ;;
     artifact-cleanup)      cmd_artifact_cleanup_main "$@" ;;
     run-cleanup)           cmd_run_cleanup_main "$@" ;;
+    gist|gists)            cmd_gist_main "$@" ;;
+    traffic)               cmd_traffic_main "$@" ;;
     cleanup-branches)      cmd_cleanup_branches_main "$@" ;;
     archive-repos)         cmd_archive_repos_main "$@" ;;
     repo-audit|audit)      cmd_repo_audit_main "$@" ;;
