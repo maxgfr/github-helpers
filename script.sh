@@ -400,6 +400,7 @@ ${BOLD}COMMANDS${NC}
   ${BOLD}Cleanup & maintenance${NC}
   unstar              Clean up your GitHub stars (filter & bulk-unstar)
   cleanup-forks       Audit forks; delete only those with zero activity
+  sync-forks          Update your forks from their upstream
   cleanup-branches    Delete merged or stale remote branches
   archive-repos       Archive inactive repos in batch
   release-cleanup     Delete old releases
@@ -5690,6 +5691,212 @@ cmd_activity_report_main() {
 }
 
 # =============================================================================
+# COMMAND: sync-forks
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+SYNC_FORKS_TARGET=""
+SYNC_FORKS_TARGET_TYPE=""
+SYNC_FORKS_REPO=""
+SYNC_FORKS_BRANCH=""
+SYNC_FORKS_LIMIT=1000
+
+cmd_sync_forks_usage() {
+  cat <<EOF
+${BOLD}github-helpers sync-forks${NC} ${DIM}v${VERSION}${NC} — Update your forks from their upstream
+
+${BOLD}USAGE${NC}
+  github-helpers sync-forks [options]
+
+${BOLD}OPTIONS${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --repo OWNER/NAME       Sync a single fork
+  --branch NAME           Branch to sync (default: each fork's default branch)
+  --limit N               Max forks to examine (default: ${SYNC_FORKS_LIMIT})
+  --dry-run               Show what would be synced, change nothing
+  -v, --verbose           Also list forks that are already up to date
+  -h, --help              Show this help
+
+${BOLD}RESULTS${NC}
+  SYNCED      Fast-forwarded (or merged) from the upstream
+  UP-TO-DATE  Already level with the upstream — no request sent
+  CONFLICT    Upstream cannot be merged automatically; resolve it locally
+  SKIPPED     Archived fork, or the upstream is gone or private
+
+${BOLD}EXAMPLES${NC}
+  github-helpers sync-forks --dry-run
+  github-helpers sync-forks
+  github-helpers sync-forks --repo me/my-fork --branch main
+  github-helpers sync-forks --org my-company --limit 50
+
+${BOLD}NOTE${NC}
+  This only fast-forwards or merges FROM the upstream, so it never discards
+  your work and needs no confirmation. Use --dry-run to preview.
+EOF
+  exit 0
+}
+
+cmd_sync_forks_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)       need_arg "--user" "${2:-}"; SYNC_FORKS_TARGET="$2"; SYNC_FORKS_TARGET_TYPE="user"; shift 2 ;;
+      --org)        need_arg "--org" "${2:-}"; SYNC_FORKS_TARGET="$2"; SYNC_FORKS_TARGET_TYPE="org"; shift 2 ;;
+      --repo)       need_arg "--repo" "${2:-}"; SYNC_FORKS_REPO="$2"; shift 2 ;;
+      --branch)     need_arg "--branch" "${2:-}"; SYNC_FORKS_BRANCH="$2"; shift 2 ;;
+      --limit)      need_arg "--limit" "${2:-}"; SYNC_FORKS_LIMIT="$2"; shift 2 ;;
+      --dry-run)    DRY_RUN=true; shift ;;
+      -y|--yes)     AUTO_YES=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)    cmd_sync_forks_usage ;;
+      *) die "sync-forks: unknown option: $1" ;;
+    esac
+  done
+
+  [[ "$SYNC_FORKS_LIMIT" =~ ^[0-9]+$ ]] || die "sync-forks: --limit must be a whole number"
+  if [ -n "$SYNC_FORKS_REPO" ] && [[ "$SYNC_FORKS_REPO" != */* ]]; then
+    die "sync-forks: --repo must be OWNER/NAME"
+  fi
+}
+
+# cmd_sync_forks_one <nwo> <branch> -> "<STATUS>\t<detail>"
+cmd_sync_forks_one() {
+  local nwo="$1" branch="$2" body rc=0 errfile err merge_type
+  errfile=$(mktemp)
+  body=$(gh_api_retry --method POST "repos/${nwo}/merge-upstream" -f branch="$branch" 2>"$errfile") || rc=$?
+  err=$(cat "$errfile" 2>/dev/null || true)
+  rm -f "$errfile"
+
+  if [ "$rc" -eq 0 ]; then
+    merge_type=$(printf '%s' "$body" | jq -r '.merge_type // "unknown"' 2>/dev/null || echo unknown)
+    case "$merge_type" in
+      none) printf 'UP-TO-DATE\talready level with upstream\n' ;;
+      *)    printf 'SYNCED\t%s on %s\n' "$merge_type" "$branch" ;;
+    esac
+    return 0
+  fi
+
+  case "$err" in
+    *"HTTP 409"*|*[Cc]onflict*) printf 'CONFLICT\tmerge conflict on %s — resolve locally\n' "$branch" ;;
+    *"HTTP 422"*)               printf 'CONFLICT\tnot fast-forwardable on %s\n' "$branch" ;;
+    *"HTTP 404"*)               printf 'SKIPPED\tbranch %s or upstream not found\n' "$branch" ;;
+    *"HTTP 403"*)               printf 'SKIPPED\tno write access\n' ;;
+    *)                          printf 'SKIPPED\tmerge-upstream failed\n' ;;
+  esac
+}
+
+cmd_sync_forks_main() {
+  cmd_sync_forks_parse_args "$@"
+  preflight_check
+  skip_init
+
+  if [ -z "$SYNC_FORKS_TARGET" ]; then
+    SYNC_FORKS_TARGET=$(get_username)
+    SYNC_FORKS_TARGET_TYPE="user"
+  fi
+
+  header "Sync Forks"
+  if [ -n "$SYNC_FORKS_REPO" ]; then
+    echo -e "  Repo:   ${BOLD}${SYNC_FORKS_REPO}${NC}"
+  else
+    echo -e "  Target: ${BOLD}${SYNC_FORKS_TARGET}${NC}"
+  fi
+  [ -n "$SYNC_FORKS_BRANCH" ] && echo -e "  Branch: ${BOLD}${SYNC_FORKS_BRANCH}${NC}"
+  $DRY_RUN && echo -e "  Mode:   ${YELLOW}DRY RUN${NC}"
+  echo ""
+
+  local meta_file
+  meta_file=$(tmp_new)
+
+  if [ -n "$SYNC_FORKS_REPO" ]; then
+    # Single repo: same 15-column shape as cmd_forks_fetch_meta, columns 1-6 only.
+    local one
+    one=$(gh_api_try "$SYNC_FORKS_REPO" "repos/${SYNC_FORKS_REPO}") || {
+      print_skips; die "sync-forks: cannot read ${SYNC_FORKS_REPO}"
+    }
+    printf '%s' "$one" | jq -r '[
+      .full_name,
+      (.parent.full_name // ""),
+      (.parent.default_branch // ""),
+      "",
+      (.default_branch // ""),
+      "",
+      (.archived | tostring), "false", "false", "0", "0", "0", "", "", "0"
+    ] | @tsv' > "$meta_file"
+  else
+    echo -e "${DIM}Fetching forks...${NC}"
+    cmd_forks_fetch_meta "$SYNC_FORKS_TARGET" "$SYNC_FORKS_LIMIT" > "$meta_file"
+  fi
+
+  local total
+  total=$(count_lines "$meta_file")
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No forks found.${NC}"
+    print_skips
+    exit 0
+  fi
+  echo -e "Found ${BOLD}${total}${NC} fork(s)"
+  echo ""
+
+  local synced=0 uptodate=0 conflict=0 skipped=0
+  local nwo parent parent_ref parent_oid fork_ref fork_oid archived locked empty \
+        stars forks watchers pushed created disk branch status detail
+  while IFS=$'\t' read -r nwo parent parent_ref parent_oid fork_ref fork_oid \
+                          archived locked empty stars forks watchers pushed created disk; do
+    [ -z "$nwo" ] && continue
+
+    if [ "$archived" = "true" ]; then
+      skip_note "$nwo" "archived — read-only"; skipped=$((skipped + 1))
+      echo -e "  ${DIM}SKIPPED   ${nwo} (archived)${NC}"
+      continue
+    fi
+    if [ -z "$parent" ]; then
+      skip_note "$nwo" "upstream unavailable (deleted or private)"; skipped=$((skipped + 1))
+      echo -e "  ${DIM}SKIPPED   ${nwo} (no upstream)${NC}"
+      continue
+    fi
+
+    branch="${SYNC_FORKS_BRANCH:-$fork_ref}"
+    if [ -z "$branch" ]; then
+      skip_note "$nwo" "no default branch (empty repo)"; skipped=$((skipped + 1))
+      echo -e "  ${DIM}SKIPPED   ${nwo} (empty)${NC}"
+      continue
+    fi
+
+    # Phase 1 already gave us both head oids: when they match on the default
+    # branch there is nothing to do and no request is worth sending.
+    if [ -z "$SYNC_FORKS_BRANCH" ] && [ -n "$parent_oid" ] && [ "$parent_oid" = "$fork_oid" ]; then
+      uptodate=$((uptodate + 1))
+      $VERBOSE && echo -e "  ${DIM}UP-TO-DATE ${nwo}${NC}"
+      continue
+    fi
+
+    if $DRY_RUN; then
+      echo -e "  ${YELLOW}WOULD SYNC${NC} ${nwo} ${DIM}(${branch} <- ${parent})${NC}"
+      synced=$((synced + 1))
+      continue
+    fi
+
+    IFS=$'\t' read -r status detail < <(cmd_sync_forks_one "$nwo" "$branch")
+    case "$status" in
+      SYNCED)     synced=$((synced + 1));    echo -e "  ${GREEN}SYNCED${NC}     ${nwo} ${DIM}(${detail})${NC}" ;;
+      UP-TO-DATE) uptodate=$((uptodate + 1)); $VERBOSE && echo -e "  ${DIM}UP-TO-DATE ${nwo}${NC}" ;;
+      CONFLICT)   conflict=$((conflict + 1)); echo -e "  ${RED}CONFLICT${NC}   ${nwo} ${DIM}(${detail})${NC}" ;;
+      *)          skipped=$((skipped + 1));  skip_note "$nwo" "$detail"
+                  echo -e "  ${DIM}SKIPPED   ${nwo} (${detail})${NC}" ;;
+    esac
+  done < "$meta_file"
+
+  echo ""
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — nothing was synced.${NC}"
+    echo -e "Would sync: ${BOLD}${synced}${NC}, Up to date: ${BOLD}${uptodate}${NC}, Skipped: ${BOLD}${skipped}${NC}"
+  else
+    echo -e "${GREEN}Done!${NC} Synced: ${BOLD}${synced}${NC}, Up to date: ${BOLD}${uptodate}${NC}, Conflicts: ${BOLD}${conflict}${NC}, Skipped: ${BOLD}${skipped}${NC}"
+  fi
+  print_skips
+}
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -5716,6 +5923,7 @@ main() {
     unstar)                cmd_unstar_main "$@" ;;
     clone-org)             cmd_clone_org_main "$@" ;;
     cleanup-forks|forks)   cmd_cleanup_forks_main "$@" ;;
+    sync-forks)            cmd_sync_forks_main "$@" ;;
     cleanup-branches)      cmd_cleanup_branches_main "$@" ;;
     archive-repos)         cmd_archive_repos_main "$@" ;;
     repo-audit|audit)      cmd_repo_audit_main "$@" ;;
