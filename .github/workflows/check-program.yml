@@ -105,6 +105,60 @@ jobs:
       - name: Test activity-report help
         run: ./script.sh activity-report --help
 
+      - name: Test sync-forks help
+        run: ./script.sh sync-forks --help
+
+      - name: Test cache-cleanup help
+        run: ./script.sh cache-cleanup --help
+
+      - name: Test artifact-cleanup help
+        run: ./script.sh artifact-cleanup --help
+
+      - name: Test run-cleanup help
+        run: ./script.sh run-cleanup --help
+
+      - name: Test gist help
+        run: ./script.sh gist --help
+
+      - name: Test traffic help
+        run: ./script.sh traffic --help
+
+      - name: Test notifications help
+        run: ./script.sh notifications --help
+
+      - name: Test invite-cleanup help
+        run: ./script.sh invite-cleanup --help
+
+      - name: Test org-audit help
+        run: ./script.sh org-audit --help
+
+      - name: Test follow-audit help
+        run: ./script.sh follow-audit --help
+
+      - name: Test bulk-merge help
+        run: ./script.sh bulk-merge --help
+
+      - name: Test backup help
+        run: ./script.sh backup --help
+
+      - name: Test forks alias (cleanup-forks) help
+        run: ./script.sh forks --help
+
+      - name: Test gists alias (gist) help
+        run: ./script.sh gists --help
+
+      - name: Test notifs alias (notifications) help
+        run: ./script.sh notifs --help
+
+      - name: Test follow alias (follow-audit) help
+        run: ./script.sh follow --help
+
+      - name: Test audit alias (repo-audit) help
+        run: ./script.sh audit --help
+
+      - name: Test ci alias (workflow-status) help
+        run: ./script.sh ci --help
+
       - name: Test unknown command fails
         run: |
           if ./script.sh nonexistent 2>/dev/null; then
@@ -120,6 +174,66 @@ jobs:
       - name: Test unstar requires filter
         run: |
           if ./script.sh unstar --dry-run 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test cleanup-forks rejects a bad --format
+        run: |
+          if ./script.sh cleanup-forks --format xml 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test cleanup-forks rejects a non-numeric --older-than
+        run: |
+          if ./script.sh cleanup-forks --older-than soon 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test cleanup-forks rejects a missing --from file
+        run: |
+          if ./script.sh cleanup-forks --from /nonexistent 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test org-audit requires --org
+        run: |
+          if ./script.sh org-audit 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test run-cleanup refuses to delete every run
+        run: |
+          if ./script.sh run-cleanup --dry-run 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test gist --delete requires a filter
+        run: |
+          if ./script.sh gist --delete 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test bulk-merge rejects a bad --strategy
+        run: |
+          if ./script.sh bulk-merge --strategy fast 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test invite-cleanup --outgoing requires a scope
+        run: |
+          if ./script.sh invite-cleanup --outgoing 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test follow-audit rejects --unfollow with --mutuals
+        run: |
+          if ./script.sh follow-audit --unfollow --mutuals 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test backup rejects an empty selection
+        run: |
+          if ./script.sh backup --no-git --no-metadata 2>/dev/null; then
             echo "Should have failed" && exit 1
           fi
 
