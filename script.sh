@@ -78,6 +78,14 @@ warn() {
   echo -e "${YELLOW}Warning: $1${NC}" >&2
 }
 
+# count_lines <file> — number of non-blank lines, always a single integer.
+# `grep -c '.' f || echo 0` is wrong: on an empty file grep prints 0 AND exits
+# 1, so the fallback fires too and the caller gets "0\n0".
+count_lines() {
+  [ -f "$1" ] || { printf '0'; return 0; }
+  awk 'NF {n++} END {printf "%d", n + 0}' "$1"
+}
+
 # ── Temp file registry ───────────────────────────────────────────────────────
 # One EXIT trap for the whole script. New commands must NOT install their own
 # EXIT trap (it would replace this one); they allocate through tmp_new instead.
@@ -391,7 +399,7 @@ ${BOLD}USAGE${NC}
 ${BOLD}COMMANDS${NC}
   ${BOLD}Cleanup & maintenance${NC}
   unstar              Clean up your GitHub stars (filter & bulk-unstar)
-  cleanup-forks       Remove forks you never modified (0 commits ahead)
+  cleanup-forks       Audit forks; delete only those with zero activity
   cleanup-branches    Delete merged or stale remote branches
   archive-repos       Archive inactive repos in batch
   release-cleanup     Delete old releases
@@ -429,7 +437,8 @@ ${BOLD}FLAGS${NC}
 
 ${BOLD}EXAMPLES${NC}
   github-helpers unstar --archived --dry-run
-  github-helpers cleanup-forks --dry-run
+  github-helpers forks --report
+  github-helpers cleanup-forks --older-than 180 --dry-run
   github-helpers stats --org my-company
   github-helpers repo-audit --language Shell
   github-helpers bulk-topic --add cli --language Shell --dry-run
@@ -705,7 +714,7 @@ cmd_unstar_do_unstar() {
   local list_file="$1"
 
   local total
-  total=$(grep -c '.' "$list_file" 2>/dev/null || echo "0")
+  total=$(count_lines "$list_file")
 
   if [ "$total" -eq 0 ]; then
     echo -e "${GREEN}No repos to unstar.${NC}"
@@ -828,7 +837,7 @@ cmd_unstar_main() {
 
   # ── Results ──────────────────────────────────────────────────────────────
   local total
-  total=$(sort -u "$MATCHFILE" | grep -c '.' 2>/dev/null || echo "0")
+  total=$(sort -u "$MATCHFILE" | awk 'NF {n++} END {printf "%d", n + 0}')
 
   if [ "$total" -eq 0 ]; then
     echo -e "${GREEN}No repos matched your filters. Your stars are clean!${NC}"
@@ -1172,123 +1181,465 @@ cmd_clone_org_main() {
 # COMMAND: cleanup-forks
 # =============================================================================
 
+# ── Defaults ─────────────────────────────────────────────────────────────────
+CLEANUP_FORKS_TARGET=""
+CLEANUP_FORKS_TARGET_TYPE=""
+CLEANUP_FORKS_OLDER_THAN=30
+CLEANUP_FORKS_LIMIT=1000
+CLEANUP_FORKS_MAX_BRANCHES=100
+CLEANUP_FORKS_BATCH=10
+CLEANUP_FORKS_IGNORE_PRS=false
+CLEANUP_FORKS_IGNORE_POPULARITY=false
+CLEANUP_FORKS_DEFAULT_BRANCH_ONLY=false
+CLEANUP_FORKS_INCLUDE_ARCHIVED=false
+CLEANUP_FORKS_INCLUDE_ORPHANS=false
+CLEANUP_FORKS_REPORT=false
+CLEANUP_FORKS_FORMAT="table"
+CLEANUP_FORKS_OUT="cleanup-forks.txt"
+CLEANUP_FORKS_SAVE_LIST=false
+CLEANUP_FORKS_FROM=""
+CLEANUP_FORKS_NO_VERIFY=false
+
 cmd_cleanup_forks_usage() {
   cat <<EOF
-${BOLD}github-helpers cleanup-forks${NC} ${DIM}v${VERSION}${NC} — Remove forks you never modified
+${BOLD}github-helpers cleanup-forks${NC} ${DIM}v${VERSION}${NC} — Audit forks, delete only the inactive ones
+                                        ${DIM}(alias: github-helpers forks)${NC}
 
 ${BOLD}USAGE${NC}
   github-helpers cleanup-forks [options]
+  github-helpers cleanup-forks --report -v
+  github-helpers cleanup-forks --from cleanup-forks.txt
 
-${BOLD}OPTIONS${NC}
-  --dry-run               List forks without deleting
+${BOLD}TARGET${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --limit N               Max forks to examine (default: ${CLEANUP_FORKS_LIMIT})
+
+${BOLD}PROTECTION${NC} (all ON by default — a fork is KEPT if any signal fires)
+  --older-than N          Only consider forks untouched for N days (default: ${CLEANUP_FORKS_OLDER_THAN})
+  --ignore-open-prs       Do NOT protect forks that have an open pull request
+  --ignore-popularity     Do NOT protect forks with stars / watchers / forks
+  --default-branch-only   Only inspect the default branch (ignore other branches)
+  --include-archived      Also consider archived forks
+  --include-orphans       Also consider forks whose upstream is gone or private
+                          ${DIM}(divergence CANNOT be verified — extra confirmation)${NC}
+  --max-branches N        Protect, without verifying, above N branches (max 100)
+
+${BOLD}I/O${NC}
+  --report                Audit only — classify every fork, never delete
+  --format FORMAT         Report format: table, json, csv (default: table)
+  --out FILE              Save deletion candidates to FILE
+                          (default: ${CLEANUP_FORKS_OUT}; implies --save-list)
+  --save-list             Save the candidate list even outside --dry-run
+  --from FILE             Skip scanning — delete the repos listed in FILE
+  --no-verify             With --from, skip re-checking protections ${DIM}(dangerous)${NC}
+
+${BOLD}FLAGS${NC}
+  --dry-run               Preview only — saves the candidate list, deletes nothing
   -y, --yes               Skip confirmation prompt
-  -v, --verbose           Show detailed output (commits ahead/behind)
+  -v, --verbose           Show protected forks and per-branch detail
   -h, --help              Show this help
 
+${BOLD}WORKFLOW${NC}
+  1. Audit:    github-helpers cleanup-forks --report -v
+  2. Preview:  github-helpers cleanup-forks --dry-run
+  3. Edit:     vim ${CLEANUP_FORKS_OUT}
+  4. Execute:  github-helpers cleanup-forks --from ${CLEANUP_FORKS_OUT}
+
 ${BOLD}EXAMPLES${NC}
-  github-helpers cleanup-forks --dry-run
-  github-helpers cleanup-forks -y
+  github-helpers forks --report
+  github-helpers cleanup-forks --older-than 180 --dry-run
+  github-helpers cleanup-forks --org my-company --older-than 365 --dry-run
+  github-helpers cleanup-forks --default-branch-only --ignore-popularity -y
+
+${BOLD}NOTE${NC}
+  Deleting a fork permanently closes any open pull request opened from it.
+  Deletion requires the 'delete_repo' token scope:
+    gh auth refresh -h github.com -s delete_repo
 EOF
   exit 0
 }
 
-cmd_cleanup_forks_main() {
-  local dry_run=false
+cmd_cleanup_forks_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --dry-run)    dry_run=true; shift ;;
-      -y|--yes)     AUTO_YES=true; shift ;;
-      -v|--verbose) VERBOSE=true; shift ;;
-      -h|--help)    cmd_cleanup_forks_usage ;;
+      --user)                     need_arg "--user" "${2:-}"; CLEANUP_FORKS_TARGET="$2"; CLEANUP_FORKS_TARGET_TYPE="user"; shift 2 ;;
+      --org)                      need_arg "--org" "${2:-}"; CLEANUP_FORKS_TARGET="$2"; CLEANUP_FORKS_TARGET_TYPE="org"; shift 2 ;;
+      --limit)                    need_arg "--limit" "${2:-}"; CLEANUP_FORKS_LIMIT="$2"; shift 2 ;;
+      --older-than)               need_arg "--older-than" "${2:-}"; CLEANUP_FORKS_OLDER_THAN="$2"; shift 2 ;;
+      --max-branches)             need_arg "--max-branches" "${2:-}"; CLEANUP_FORKS_MAX_BRANCHES="$2"; shift 2 ;;
+      --format)                   need_arg "--format" "${2:-}"; CLEANUP_FORKS_FORMAT="$2"; shift 2 ;;
+      --out)                      need_arg "--out" "${2:-}"; CLEANUP_FORKS_OUT="$2"; CLEANUP_FORKS_SAVE_LIST=true; shift 2 ;;
+      --from)                     need_arg "--from" "${2:-}"; CLEANUP_FORKS_FROM="$2"; shift 2 ;;
+      --ignore-open-prs)          CLEANUP_FORKS_IGNORE_PRS=true; shift ;;
+      --ignore-popularity|--ignore-stars) CLEANUP_FORKS_IGNORE_POPULARITY=true; shift ;;
+      --default-branch-only)      CLEANUP_FORKS_DEFAULT_BRANCH_ONLY=true; shift ;;
+      --include-archived)         CLEANUP_FORKS_INCLUDE_ARCHIVED=true; shift ;;
+      --include-orphans)          CLEANUP_FORKS_INCLUDE_ORPHANS=true; shift ;;
+      --report)                   CLEANUP_FORKS_REPORT=true; shift ;;
+      --save-list)                CLEANUP_FORKS_SAVE_LIST=true; shift ;;
+      --no-verify)                CLEANUP_FORKS_NO_VERIFY=true; shift ;;
+      --dry-run)                  DRY_RUN=true; shift ;;
+      -y|--yes)                   AUTO_YES=true; shift ;;
+      -v|--verbose)               VERBOSE=true; shift ;;
+      -h|--help)                  cmd_cleanup_forks_usage ;;
       *) die "cleanup-forks: unknown option: $1" ;;
     esac
   done
 
-  preflight_check
-  local USERNAME
-  USERNAME=$(get_username)
+  case "$CLEANUP_FORKS_FORMAT" in
+    table|json|csv) ;;
+    *) die "cleanup-forks: invalid --format '${CLEANUP_FORKS_FORMAT}' (use table, json or csv)" ;;
+  esac
+  [[ "$CLEANUP_FORKS_OLDER_THAN" =~ ^[0-9]+$ ]] || die "cleanup-forks: --older-than must be a whole number of days"
+  [[ "$CLEANUP_FORKS_LIMIT" =~ ^[0-9]+$ ]] || die "cleanup-forks: --limit must be a whole number"
+  [[ "$CLEANUP_FORKS_MAX_BRANCHES" =~ ^[0-9]+$ ]] || die "cleanup-forks: --max-branches must be a whole number"
 
-  echo -e "${BOLD}${CYAN}Cleanup Forks${NC} ${DIM}v${VERSION}${NC}"
-  echo -e "${DIM}─────────────────────────────────────────────${NC}"
-  echo -e "  User: ${BOLD}${USERNAME}${NC}"
-  if $dry_run; then
-    echo -e "  Mode: ${YELLOW}DRY RUN${NC}"
-  fi
-  echo ""
-
-  echo -e "${DIM}Fetching forked repos...${NC}"
-  local forks_json
-  forks_json=$(gh repo list "$USERNAME" --fork --json nameWithOwner,parent --limit 9999 2>/dev/null) || {
-    die "Failed to list forks"
-  }
-
-  local total
-  total=$(echo "$forks_json" | jq 'length')
-
-  if [ "$total" -eq 0 ]; then
-    echo -e "${GREEN}No forks found.${NC}"
-    exit 0
+  # A single GraphQL page tops out at 100 refs, so anything above that cannot
+  # be verified exhaustively. Clamp rather than silently judge partial data.
+  if [ "$CLEANUP_FORKS_MAX_BRANCHES" -gt 100 ]; then
+    CLEANUP_FORKS_MAX_BRANCHES=100
   fi
 
-  echo -e "Found ${BOLD}${total}${NC} forks. Checking for unmodified ones..."
-  echo ""
+  if $CLEANUP_FORKS_REPORT && [ -n "$CLEANUP_FORKS_FROM" ]; then
+    die "cleanup-forks: --report and --from are mutually exclusive"
+  fi
+  if [ -n "$CLEANUP_FORKS_FROM" ] && [ ! -f "$CLEANUP_FORKS_FROM" ]; then
+    die "cleanup-forks: file not found: ${CLEANUP_FORKS_FROM}"
+  fi
+}
 
-  local -a deletable=()
-  local idx=0
+# ── Cheap classifier (pure: no network, no side effects) ─────────────────────
+# cmd_cleanup_forks_cheap_verdict <nwo> <parent> <archived> <locked> <empty>
+#                                 <stars> <forks> <watchers> <pushed> <created> <cutoff>
+# echoes "<VERDICT>\t<reason>"; VERDICT is PROTECTED, SKIPPED or PROBE.
+#
+# INVARIANT: this function can never emit DELETABLE. Anything it cannot read
+# becomes SKIPPED, so a missing or malformed value is never a deletion.
+cmd_cleanup_forks_cheap_verdict() {
+  local nwo="$1" parent="$2" archived="$3" locked="$4" empty="$5" \
+        stars="$6" forks="$7" watchers="$8" pushed="$9" created="${10}" cutoff="${11}"
 
-  while IFS=$'\t' read -r nwo parent; do
-    idx=$((idx + 1))
-    local prefix="${DIM}[${idx}/${total}]${NC}"
+  if [ -z "$nwo" ]; then
+    printf 'SKIPPED\tmalformed record\n'; return 0
+  fi
 
-    # Check if fork is ahead of parent
-    local comparison
-    comparison=$(gh api "repos/${nwo}/compare/HEAD...HEAD" --jq '.ahead_by' 2>/dev/null || echo "")
+  # An unreadable counter means the record is corrupt -> skip, never delete.
+  local f
+  for f in "$stars" "$forks" "$watchers"; do
+    if [[ ! "$f" =~ ^[0-9]+$ ]]; then
+      printf 'SKIPPED\tunreadable metadata\n'; return 0
+    fi
+  done
 
-    # Use the parent's default branch for comparison
-    local ahead=0
-    comparison=$(gh api "repos/${nwo}" --jq '.parent.full_name as $p | .default_branch as $b | "\($p):\($b)"' 2>/dev/null || echo "")
-    if [ -n "$comparison" ]; then
-      local parent_ref="${comparison}"
-      ahead=$(gh api "repos/${nwo}/compare/${parent_ref}...${USERNAME}:HEAD" --jq '.ahead_by' 2>/dev/null || echo "-1")
+  if [ "$locked" = "true" ]; then
+    printf 'PROTECTED\tlocked (migration in progress)\n'; return 0
+  fi
+
+  # Orphan: upstream deleted, turned private, or otherwise inaccessible.
+  # Divergence cannot be computed, so this is never deletable by default.
+  if [ -z "$parent" ] && ! $CLEANUP_FORKS_INCLUDE_ORPHANS; then
+    printf 'PROTECTED\torphan: upstream unavailable (use --include-orphans)\n'; return 0
+  fi
+
+  if [ "$archived" = "true" ] && ! $CLEANUP_FORKS_INCLUDE_ARCHIVED; then
+    printf 'PROTECTED\tarchived (use --include-archived)\n'; return 0
+  fi
+
+  if ! $CLEANUP_FORKS_IGNORE_POPULARITY; then
+    if [ "$stars" -gt 0 ];    then printf 'PROTECTED\t%s star(s)\n' "$stars"; return 0; fi
+    if [ "$watchers" -gt 0 ]; then printf 'PROTECTED\t%s watcher(s)\n' "$watchers"; return 0; fi
+    if [ "$forks" -gt 0 ];    then printf 'PROTECTED\tforked %s time(s) by others\n' "$forks"; return 0; fi
+  fi
+
+  # ISO-8601 UTC sorts lexicographically, so [[ > ]] is a valid date compare.
+  if [ -n "$cutoff" ]; then
+    if [ -z "$pushed" ] && [ -z "$created" ]; then
+      printf 'SKIPPED\tno timestamps\n'; return 0
+    fi
+    if [ -n "$pushed" ] && [[ "$pushed" > "$cutoff" ]]; then
+      printf 'PROTECTED\tpushed %s (within --older-than)\n' "${pushed%%T*}"; return 0
+    fi
+    if [ -n "$created" ] && [[ "$created" > "$cutoff" ]]; then
+      printf 'PROTECTED\tcreated %s (within --older-than)\n' "${created%%T*}"; return 0
+    fi
+  fi
+
+  printf 'PROBE\t\n'
+}
+
+# ── Phase 1: fork metadata sweep (shared with sync-forks) ────────────────────
+# cmd_forks_fetch_meta <login> <limit> -> 15-column TSV on stdout
+#   1 nameWithOwner        6 fork default branch oid   11 forkCount
+#   2 parent nameWithOwner 7 isArchived                12 watchers
+#   3 parent default ref   8 isLocked                  13 pushedAt
+#   4 parent default oid   9 isEmpty                   14 createdAt
+#   5 fork default branch 10 stargazerCount            15 diskUsage
+# Costs 1 GraphQL point per 100 forks. Works for both users and orgs:
+# repositoryOwner resolves either without an inline fragment.
+cmd_forks_fetch_meta() {
+  local login="$1" limit="${2:-1000}"
+  local has_next="true" fetched=0 page=100 rc result gql_error count total
+  local -a cursor_arg=("-F" "cursor=null")
+
+  while [ "$has_next" = "true" ]; do
+    page=$(( limit - fetched ))
+    [ "$page" -gt 100 ] && page=100
+    if [ "$page" -le 0 ]; then break; fi
+
+    rc=0
+    result=$(gh_api_retry graphql -f query='
+      query($login: String!, $cursor: String, $page: Int!) {
+        repositoryOwner(login: $login) {
+          repositories(first: $page, isFork: true, ownerAffiliations: [OWNER],
+                       after: $cursor, orderBy: {field: PUSHED_AT, direction: DESC}) {
+            totalCount
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              nameWithOwner
+              isArchived
+              isLocked
+              isEmpty
+              diskUsage
+              stargazerCount
+              forkCount
+              watchers { totalCount }
+              pushedAt
+              createdAt
+              defaultBranchRef { name target { ... on Commit { oid } } }
+              parent {
+                nameWithOwner
+                defaultBranchRef { name target { ... on Commit { oid } } }
+              }
+            }
+          }
+        }
+      }' -f login="$login" -F page="$page" "${cursor_arg[@]}") || rc=$?
+
+    # A partial failure still carries usable data plus an errors[] array, so
+    # never `|| die` here: report and keep whatever resolved.
+    gql_error=$(printf '%s' "$result" | jq -r '.errors[0].message // empty' 2>/dev/null || true)
+    if [ -n "$gql_error" ]; then
+      warn "GitHub API: ${gql_error}"
+    fi
+    if [ "$rc" -ne 0 ] && [ -z "$gql_error" ]; then
+      die "GraphQL request failed. Check your network and gh auth."
+    fi
+    if ! printf '%s' "$result" | jq -e '.data.repositoryOwner' >/dev/null 2>&1; then
+      die "cleanup-forks: no such user or organization: ${login}"
     fi
 
-    if [ "$ahead" = "0" ]; then
-      deletable+=("$nwo")
-      echo -e "  ${prefix} ${YELLOW}UNMODIFIED${NC}  ${nwo} ${DIM}(0 commits ahead)${NC}"
-    else
-      if $VERBOSE; then
-        echo -e "  ${prefix} ${GREEN}MODIFIED${NC}    ${nwo} ${DIM}(${ahead} commits ahead)${NC}"
-      fi
+    printf '%s' "$result" | jq -r '
+      .data.repositoryOwner.repositories.nodes[]? | [
+        .nameWithOwner,
+        (.parent.nameWithOwner // ""),
+        (.parent.defaultBranchRef.name // ""),
+        (.parent.defaultBranchRef.target.oid // ""),
+        (.defaultBranchRef.name // ""),
+        (.defaultBranchRef.target.oid // ""),
+        (.isArchived | tostring),
+        (.isLocked | tostring),
+        (.isEmpty | tostring),
+        (.stargazerCount | tostring),
+        (.forkCount | tostring),
+        (.watchers.totalCount | tostring),
+        (.pushedAt // ""),
+        (.createdAt // ""),
+        ((.diskUsage // 0) | tostring)
+      ] | @tsv'
+
+    count=$(printf '%s' "$result" | jq '.data.repositoryOwner.repositories.nodes | length' 2>/dev/null || echo 0)
+    total=$(printf '%s' "$result" | jq '.data.repositoryOwner.repositories.totalCount' 2>/dev/null || echo 0)
+    fetched=$((fetched + count))
+    [ "$count" -gt 0 ] && echo -e "  ${DIM}Fetched ${fetched}/${total} forks...${NC}" >&2
+
+    has_next=$(printf '%s' "$result" | jq -r '.data.repositoryOwner.repositories.pageInfo.hasNextPage' 2>/dev/null || echo false)
+    local end_cursor
+    end_cursor=$(printf '%s' "$result" | jq -r '.data.repositoryOwner.repositories.pageInfo.endCursor // empty' 2>/dev/null || true)
+    [ -z "$end_cursor" ] && break
+    [ "$fetched" -ge "$limit" ] && break
+    cursor_arg=("-f" "cursor=${end_cursor}")
+  done
+}
+
+# ── Phase 2: aliased batch probe ─────────────────────────────────────────────
+# Builds one GraphQL document covering N forks. Repo names travel as GraphQL
+# variables, never interpolated into the query text.
+# Sets CF_QUERY, CF_GQL_ARGS (gh api argv) and CF_BATCH_META (jq --argjson
+# payload). These are globals rather than a return value on purpose: a command
+# substitution would run this in a subshell and drop every assignment.
+CF_QUERY=""
+CF_GQL_ARGS=()
+CF_BATCH_META=""
+cmd_cleanup_forks_build_batch_query() {
+  local -a items=("$@")
+  local i=0 decls="" body="" meta="" nwo parent parent_ref owner name alias
+  CF_GQL_ARGS=()
+
+  for entry in "${items[@]}"; do
+    IFS=$'\x1f' read -r nwo parent parent_ref _fork_ref <<< "$entry"
+    alias="f${i}"
+    owner="${nwo%%/*}"
+    name="${nwo#*/}"
+    decls="${decls}\$o${i}: String!, \$n${i}: String!, "
+    CF_GQL_ARGS+=("-f" "o${i}=${owner}" "-f" "n${i}=${name}")
+
+    local compare_field=""
+    if [ -n "$parent" ] && [ -n "$parent_ref" ]; then
+      decls="${decls}\$h${i}: String!, "
+      CF_GQL_ARGS+=("-f" "h${i}=${parent%%/*}:${parent_ref}")
+      compare_field="compare(headRef: \$h${i}) { aheadBy behindBy status }"
     fi
-  done < <(echo "$forks_json" | jq -r '.[] | [.nameWithOwner, (.parent.nameWithOwner // "")] | @tsv')
+
+    body="${body}
+  ${alias}: repository(owner: \$o${i}, name: \$n${i}) {
+    nameWithOwner
+    refs(refPrefix: \"refs/heads/\", first: 100) {
+      totalCount
+      nodes {
+        name
+        ${compare_field}
+        associatedPullRequests(states: [OPEN], first: 10) {
+          totalCount
+          nodes { number isDraft baseRepository { nameWithOwner } }
+        }
+      }
+    }
+  }"
+    meta="${meta}$(jq -nc --arg k "$alias" --arg nwo "$nwo" --arg parent "$parent" \
+      --arg def "$_fork_ref" '{key:$k, value:{nwo:$nwo, parent:$parent, default:$def}}')"$'\n'
+    i=$((i + 1))
+  done
+
+  decls="${decls%, }"
+  CF_BATCH_META=$(printf '%s' "$meta" | jq -sc 'from_entries')
+  CF_QUERY=$(printf 'query(%s) {%s\n}\n' "$decls" "$body")
+}
+
+# cmd_cleanup_forks_probe_batch <entry...> -> "<VERDICT>\t<nwo>\t<reason>" lines
+cmd_cleanup_forks_probe_batch() {
+  local rc=0 result
+  cmd_cleanup_forks_build_batch_query "$@"
+
+  result=$(gh_api_retry graphql -f query="$CF_QUERY" "${CF_GQL_ARGS[@]}") || rc=$?
+  if [ -z "$result" ]; then
+    # Total failure: every fork in the batch is unverified, so none is deletable.
+    printf '%s' "$CF_BATCH_META" | jq -r '.[] | ["SKIPPED", .nwo, "API error: batch request failed"] | @tsv'
+    return 0
+  fi
+
+  printf '%s' "$result" | jq -r \
+    --argjson meta "$CF_BATCH_META" \
+    --argjson opt "$(jq -nc \
+        --argjson maxBranches "$CLEANUP_FORKS_MAX_BRANCHES" \
+        --argjson ignorePrs "$CLEANUP_FORKS_IGNORE_PRS" \
+        --argjson defaultOnly "$CLEANUP_FORKS_DEFAULT_BRANCH_ONLY" \
+        '{maxBranches:$maxBranches, ignorePrs:$ignorePrs, defaultOnly:$defaultOnly}')" '
+    # NOTE: compare() is evaluated FROM the fork ref, so the names are inverted:
+    #   compare.behindBy == commits the FORK branch has that the parent lacks  <- "ahead"
+    #   compare.aheadBy  == commits the parent has that the fork branch lacks  <- "behind"
+    # Verified: fork branch with 1 own commit -> GraphQL behindBy=1, and
+    # REST /compare/main...user:branch -> ahead_by=1.
+    def classify($m; $o):
+      if . == null then ["SKIPPED", "API error: repository unreadable"]
+      elif ((.refs.totalCount // 0) > $o.maxBranches) then
+        ["PROTECTED", "\(.refs.totalCount) branches (> --max-branches \($o.maxBranches)), not verified"]
+      else
+        (.refs.nodes // []) as $refs
+        | [ $refs[] | .associatedPullRequests.nodes[]? ] as $prs
+        | if (($o.ignorePrs | not) and (($prs | length) > 0)) then
+            ($prs | map(select(.baseRepository.nameWithOwner != $m.nwo))) as $up
+            | if ($up | length) > 0 then
+                ["PROTECTED", "open PR " + ($up | map("#\(.number)->\(.baseRepository.nameWithOwner)") | join(", "))]
+              else
+                ["PROTECTED", "\($prs | length) open PR(s) (internal)"]
+              end
+          else
+            (if $o.defaultOnly then [ $refs[] | select(.name == $m.default) ] else $refs end) as $c
+            | if ($c | length) == 0 then ["SKIPPED", "no branches resolved"]
+              elif ($m.parent == "") then
+                (if ($c | length) == 1
+                 then ["DELETABLE", "orphan; 1 branch, no open PRs - divergence UNVERIFIED"]
+                 else ["PROTECTED", "orphan with \($c | length) branches - divergence UNVERIFIED"]
+                 end)
+              elif (([ $c[] | select(.compare == null) ] | length) > 0) then
+                ["SKIPPED", "compare failed on: " + ([ $c[] | select(.compare == null) | .name ] | join(", "))]
+              else
+                ([ $c[] | {n: .name, a: .compare.behindBy} ] | max_by(.a)) as $top
+                | if (($top.a // 0) > 0)
+                  then ["PROTECTED", "\($top.a) commit(s) ahead on \($top.n)"]
+                  else ["DELETABLE", "0 ahead on \($c | length) branch(es)"]
+                  end
+              end
+          end
+      end;
+
+    . as $resp
+    | ([ ($resp.errors // [])[] | select(.path != null) | .path[0] ] | unique) as $failed
+    | ($resp.data // {}) as $data
+    | [ $meta | keys[] ]
+    | map(
+        . as $k
+        | $meta[$k] as $m
+        | (if ($failed | index($k)) then ["SKIPPED", "API error on this repository"]
+           else ($data[$k] | classify($m; $opt)) end) as $v
+        | [$v[0], $m.nwo, $v[1]] | @tsv
+      ) | .[]'
+}
+
+# ── Rendering ────────────────────────────────────────────────────────────────
+# Escape sequences are allowed in the printf FORMAT string but never in an
+# argument to a padded conversion, which is what breaks column alignment.
+cmd_cleanup_forks_row() {
+  printf "  %s%-9s%s %-45s %s%s%s\n" "$1" "$2" "$NC" "$3" "$DIM" "$4" "$NC"
+}
+
+cmd_cleanup_forks_render() {
+  local class_file="$1" total="$2"
+
+  if [ "$CLEANUP_FORKS_FORMAT" != "table" ]; then
+    local rows
+    rows=$(jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+             | {verdict: .[0], repo: .[1], reason: .[2]})' < "$class_file")
+    render_rows "$CLEANUP_FORKS_FORMAT" "$rows"
+    return 0
+  fi
 
   echo ""
+  printf "  ${BOLD}%-9s %-45s %s${NC}\n" "STATUS" "REPOSITORY" "REASON"
+  printf "  ${DIM}%-9s %-45s %s${NC}\n" "─────────" "─────────────────────────────────────────────" "──────────────────────────"
 
-  if [ ${#deletable[@]} -eq 0 ]; then
-    echo -e "${GREEN}All forks have modifications. Nothing to clean up!${NC}"
-    exit 0
+  local verdict nwo reason
+  # DELETE first (next to the prompt), then SKIP (a warning the user must see),
+  # then PROTECT (only under -v or --report; the counts suffice otherwise).
+  while IFS=$'\t' read -r verdict nwo reason; do
+    [ "$verdict" = "DELETABLE" ] && cmd_cleanup_forks_row "$YELLOW" "DELETE" "$nwo" "$reason"
+  done < "$class_file"
+  while IFS=$'\t' read -r verdict nwo reason; do
+    [ "$verdict" = "SKIPPED" ] && cmd_cleanup_forks_row "$RED" "SKIP" "$nwo" "$reason"
+  done < "$class_file"
+  if $VERBOSE || $CLEANUP_FORKS_REPORT; then
+    while IFS=$'\t' read -r verdict nwo reason; do
+      [ "$verdict" = "PROTECTED" ] && cmd_cleanup_forks_row "$GREEN" "PROTECT" "$nwo" "$reason"
+    done < "$class_file"
   fi
 
-  echo -e "${YELLOW}Found ${#deletable[@]} unmodified forks${NC}"
-
-  if $dry_run; then
-    echo ""
-    echo -e "${YELLOW}DRY RUN — no forks were deleted.${NC}"
-    echo -e "Unmodified forks:"
-    for repo in "${deletable[@]}"; do
-      echo -e "  ${DIM}•${NC} $repo"
-    done
-    exit 0
-  fi
-
+  local n_prot n_del n_skip n_orph
+  n_prot=$(awk -F'\t' '$1=="PROTECTED"' "$class_file" | wc -l | tr -d ' ')
+  n_del=$(awk -F'\t' '$1=="DELETABLE"' "$class_file" | wc -l | tr -d ' ')
+  n_skip=$(awk -F'\t' '$1=="SKIPPED"' "$class_file" | wc -l | tr -d ' ')
+  n_orph=$(grep -c 'orphan' "$class_file" || true)
   echo ""
-  if ! confirm "Delete ${#deletable[@]} unmodified forks?"; then
-    echo "Cancelled."
-    exit 0
-  fi
+  echo -e "  ${BOLD}${total}${NC} forks   •   ${GREEN}PROTECTED ${n_prot}${NC}   •   ${YELLOW}DELETABLE ${n_del}${NC}   •   ${RED}SKIPPED ${n_skip}${NC}   •   ${DIM}ORPHANS ${n_orph}${NC}"
+}
 
-  local deleted=0 fail=0
-  for repo in "${deletable[@]}"; do
+# ── Deletion ─────────────────────────────────────────────────────────────────
+cmd_cleanup_forks_delete() {
+  local list_file="$1"
+  local deleted=0 fail=0 repo
+
+  while IFS= read -r repo; do
+    [ -z "$repo" ] && continue
     if gh repo delete "$repo" --yes 2>/dev/null; then
       deleted=$((deleted + 1))
       echo -e "  ${GREEN}DELETED${NC}  $repo"
@@ -1296,10 +1647,209 @@ cmd_cleanup_forks_main() {
       fail=$((fail + 1))
       echo -e "  ${RED}FAILED${NC}   $repo"
     fi
-  done
+  done < "$list_file"
 
   echo ""
   echo -e "${GREEN}Done!${NC} Deleted: ${BOLD}${deleted}${NC}, Failed: ${BOLD}${fail}${NC}"
+}
+
+cmd_cleanup_forks_main() {
+  cmd_cleanup_forks_parse_args "$@"
+  preflight_check
+  skip_init
+
+  if ! $CLEANUP_FORKS_REPORT && ! require_scope "delete_repo"; then
+    warn "your token has no 'delete_repo' scope — deletions will fail with 403."
+    warn "run: gh auth refresh -h github.com -s delete_repo"
+  fi
+
+  if [ -z "$CLEANUP_FORKS_TARGET" ]; then
+    CLEANUP_FORKS_TARGET=$(get_username)
+    CLEANUP_FORKS_TARGET_TYPE="user"
+  fi
+
+  # Chrome goes to stderr whenever stdout carries a machine-readable payload.
+  local out=1
+  [ "$CLEANUP_FORKS_FORMAT" != "table" ] && out=2
+
+  {
+    header "Fork Cleanup"
+    echo -e "  Target:      ${BOLD}${CLEANUP_FORKS_TARGET}${NC}"
+  } >&$out
+
+  local cutoff=""
+  if [ "$CLEANUP_FORKS_OLDER_THAN" -gt 0 ]; then
+    cutoff=$(cutoff_date "$CLEANUP_FORKS_OLDER_THAN" days)
+    echo -e "  Older than:  ${BOLD}${CLEANUP_FORKS_OLDER_THAN}${NC} days (before ${cutoff%%T*})" >&$out
+  fi
+
+  local -a protections=()
+  $CLEANUP_FORKS_IGNORE_PRS         || protections+=("open PRs")
+  $CLEANUP_FORKS_DEFAULT_BRANCH_ONLY && protections+=("default branch only") || protections+=("all branches")
+  $CLEANUP_FORKS_IGNORE_POPULARITY  || protections+=("popularity")
+  $CLEANUP_FORKS_INCLUDE_ARCHIVED   || protections+=("archived")
+  $CLEANUP_FORKS_INCLUDE_ORPHANS    || protections+=("orphans")
+  local prot_str
+  prot_str=$(printf '%s, ' "${protections[@]}")
+  {
+    echo -e "  Protections: ${BOLD}${prot_str%, }${NC}"
+    $DRY_RUN && echo -e "  Mode:        ${YELLOW}DRY RUN${NC}"
+    $CLEANUP_FORKS_REPORT && echo -e "  Mode:        ${CYAN}REPORT (read-only)${NC}"
+    echo ""
+  } >&$out
+
+  # ── --from --no-verify: straight to deletion, no scan ──────────────────────
+  if [ -n "$CLEANUP_FORKS_FROM" ] && $CLEANUP_FORKS_NO_VERIFY; then
+    warn "--no-verify: protections are NOT re-checked for the listed repos"
+    local n_from
+    n_from=$(count_lines "$CLEANUP_FORKS_FROM")
+    [ "$n_from" -eq 0 ] && { echo -e "${GREEN}Nothing to delete.${NC}"; exit 0; }
+    if $DRY_RUN; then
+      echo -e "${YELLOW}DRY RUN — no forks were deleted.${NC}"; exit 0
+    fi
+    if ! confirm "Delete ${n_from} fork(s) WITHOUT verification? This is irreversible."; then
+      echo "Cancelled."; exit 0
+    fi
+    cmd_cleanup_forks_delete "$CLEANUP_FORKS_FROM"
+    exit 0
+  fi
+
+  # ── Phase 1 ────────────────────────────────────────────────────────────────
+  local meta_file class_file probe_file
+  meta_file=$(tmp_new); class_file=$(tmp_new); probe_file=$(tmp_new)
+
+  echo -e "${DIM}Fetching forks...${NC}" >&$out
+  cmd_forks_fetch_meta "$CLEANUP_FORKS_TARGET" "$CLEANUP_FORKS_LIMIT" > "$meta_file"
+
+  # --from restricts the scan to the listed repos, but still re-verifies them:
+  # a list from last week may name a fork that has since gained a pull request.
+  if [ -n "$CLEANUP_FORKS_FROM" ]; then
+    local want_file kept_file
+    want_file=$(tmp_new); kept_file=$(tmp_new)
+    sed 's/#.*//' "$CLEANUP_FORKS_FROM" | awk 'NF {print $1}' | sort -u > "$want_file"
+    awk -F'\t' 'NR==FNR {want[$1]; next} $1 in want' "$want_file" "$meta_file" > "$kept_file"
+    local missing
+    missing=$(awk -F'\t' 'NR==FNR {have[$1]; next} !($1 in have)' "$kept_file" "$want_file" || true)
+    if [ -n "$missing" ]; then
+      while IFS= read -r m; do
+        [ -n "$m" ] && skip_note "$m" "not a fork of ${CLEANUP_FORKS_TARGET} (or already gone)"
+      done <<< "$missing"
+    fi
+    mv "$kept_file" "$meta_file"
+  fi
+
+  local total
+  total=$(count_lines "$meta_file")
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No forks found.${NC}" >&$out
+    print_skips
+    exit 0
+  fi
+
+  # ── Cheap pass (no network) ────────────────────────────────────────────────
+  # `done < file`, never a pipe: a subshell would lose everything written here.
+  local nwo parent parent_ref parent_oid fork_ref fork_oid archived locked empty \
+        stars forks watchers pushed created disk verdict reason
+  while IFS=$'\t' read -r nwo parent parent_ref parent_oid fork_ref fork_oid \
+                          archived locked empty stars forks watchers pushed created disk; do
+    IFS=$'\t' read -r verdict reason < <(cmd_cleanup_forks_cheap_verdict \
+      "$nwo" "$parent" "$archived" "$locked" "$empty" \
+      "$stars" "$forks" "$watchers" "$pushed" "$created" "$cutoff")
+    if [ "$verdict" = "PROBE" ]; then
+      printf '%s\x1f%s\x1f%s\x1f%s\n' "$nwo" "$parent" "$parent_ref" "$fork_ref" >> "$probe_file"
+    else
+      printf '%s\t%s\t%s\n' "$verdict" "$nwo" "$reason" >> "$class_file"
+    fi
+  done < "$meta_file"
+
+  # ── Phase 2 (batched GraphQL) ──────────────────────────────────────────────
+  local n_probe
+  n_probe=$(count_lines "$probe_file")
+  if [ "$n_probe" -gt 0 ]; then
+    local batches=$(( (n_probe + CLEANUP_FORKS_BATCH - 1) / CLEANUP_FORKS_BATCH ))
+    echo -e "  ${DIM}Probing ${n_probe} candidate forks (${batches} batch(es))...${NC}" >&$out
+    local -a batch=()
+    local entry
+    while IFS= read -r entry; do
+      [ -z "$entry" ] && continue
+      batch+=("$entry")
+      if [ "${#batch[@]}" -ge "$CLEANUP_FORKS_BATCH" ]; then
+        cmd_cleanup_forks_probe_batch "${batch[@]}" >> "$class_file"
+        batch=()
+      fi
+    done < "$probe_file"
+    if [ "${#batch[@]}" -gt 0 ]; then
+      cmd_cleanup_forks_probe_batch "${batch[@]}" >> "$class_file"
+    fi
+  fi
+
+  # Every skip is a fork we could NOT verify. Say so out loud.
+  while IFS=$'\t' read -r verdict nwo reason; do
+    [ "$verdict" = "SKIPPED" ] && warn "${nwo}: ${reason} — skipped, will NOT be deleted"
+  done < "$class_file"
+
+  cmd_cleanup_forks_render "$class_file" "$total"
+
+  if $CLEANUP_FORKS_REPORT; then
+    print_skips
+    exit 0
+  fi
+
+  # ── Candidate list ─────────────────────────────────────────────────────────
+  local cand_file
+  if $DRY_RUN || $CLEANUP_FORKS_SAVE_LIST; then
+    cand_file="$CLEANUP_FORKS_OUT"
+  else
+    cand_file=$(tmp_new)
+  fi
+  awk -F'\t' '$1=="DELETABLE" {print $2}' "$class_file" | sort -u > "$cand_file"
+
+  local n_cand
+  n_cand=$(count_lines "$cand_file")
+  if [ "$n_cand" -eq 0 ]; then
+    echo ""
+    echo -e "${GREEN}Nothing to clean up — every fork is protected.${NC}"
+    print_skips
+    exit 0
+  fi
+
+  if $DRY_RUN; then
+    echo ""
+    echo -e "${YELLOW}DRY RUN — no forks were deleted.${NC}"
+    echo -e "List saved to: ${BOLD}${cand_file}${NC}"
+    echo -e "Review it, then run:"
+    echo -e "  ${BOLD}github-helpers cleanup-forks --from ${cand_file}${NC}"
+    print_skips
+    exit 0
+  fi
+
+  # ── Orphan gate: unverifiable divergence gets its own confirmation ─────────
+  local orphan_count orphan_file
+  orphan_file=$(tmp_new)
+  awk -F'\t' '$1=="DELETABLE" && $3 ~ /orphan/ {print $2}' "$class_file" | sort -u > "$orphan_file"
+  orphan_count=$(count_lines "$orphan_file")
+  if [ "$orphan_count" -gt 0 ]; then
+    echo ""
+    warn "${orphan_count} candidate(s) are orphaned forks — their commit divergence could NOT be verified."
+    if ! confirm "Include ${orphan_count} UNVERIFIED orphan fork(s) in the deletion?"; then
+      local trimmed
+      trimmed=$(tmp_new)
+      grep -vxF -f "$orphan_file" "$cand_file" > "$trimmed" || true
+      mv "$trimmed" "$cand_file"
+      n_cand=$(count_lines "$cand_file")
+      echo -e "  ${DIM}Orphans excluded — ${n_cand} candidate(s) left.${NC}"
+      [ "$n_cand" -eq 0 ] && { echo -e "${GREEN}Nothing left to delete.${NC}"; print_skips; exit 0; }
+    fi
+  fi
+
+  echo ""
+  if ! confirm "Delete ${n_cand} fork(s)? This is irreversible and closes any open PR from them."; then
+    echo "Cancelled."
+    exit 0
+  fi
+
+  cmd_cleanup_forks_delete "$cand_file"
+  print_skips
 }
 
 # =============================================================================
@@ -4094,7 +4644,7 @@ cmd_bulk_settings_main() {
   fi
 
   local total
-  total=$(echo "$repo_list" | grep -c '.' || echo "0")
+  total=$(printf '%s\n' "$repo_list" | awk 'NF {n++} END {printf "%d", n + 0}')
 
   if [ "$total" -eq 0 ]; then
     echo -e "${GREEN}No repos found.${NC}"
@@ -4693,7 +5243,7 @@ cmd_repo_template_main() {
   repo_list=$(echo "$repo_list" | grep -v "^${REPO_TEMPLATE_FROM}$" || true)
 
   local total
-  total=$(echo "$repo_list" | grep -c '.' || echo "0")
+  total=$(printf '%s\n' "$repo_list" | awk 'NF {n++} END {printf "%d", n + 0}')
 
   if [ "$total" -eq 0 ]; then
     echo -e "${GREEN}No target repos found.${NC}"
@@ -5165,7 +5715,7 @@ main() {
   case "$command" in
     unstar)                cmd_unstar_main "$@" ;;
     clone-org)             cmd_clone_org_main "$@" ;;
-    cleanup-forks)         cmd_cleanup_forks_main "$@" ;;
+    cleanup-forks|forks)   cmd_cleanup_forks_main "$@" ;;
     cleanup-branches)      cmd_cleanup_branches_main "$@" ;;
     archive-repos)         cmd_archive_repos_main "$@" ;;
     repo-audit|audit)      cmd_repo_audit_main "$@" ;;
