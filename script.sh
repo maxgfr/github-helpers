@@ -74,6 +74,312 @@ get_username() {
   echo "$user"
 }
 
+warn() {
+  echo -e "${YELLOW}Warning: $1${NC}" >&2
+}
+
+# ── Temp file registry ───────────────────────────────────────────────────────
+# One EXIT trap for the whole script. New commands must NOT install their own
+# EXIT trap (it would replace this one); they allocate through tmp_new instead.
+TMP_FILES=""
+
+tmp_new() {
+  local f
+  f=$(mktemp)
+  TMP_FILES="${TMP_FILES} ${f}"
+  printf '%s' "$f"
+}
+
+# Intentionally unquoted: TMP_FILES is a space-separated list to word-split.
+# shellcheck disable=SC2086
+tmp_cleanup() {
+  [ -n "${TMP_FILES:-}" ] && rm -f ${TMP_FILES}
+  return 0
+}
+
+trap tmp_cleanup EXIT
+
+# ── Confirmation ─────────────────────────────────────────────────────────────
+# confirm "<prompt>" — returns 0 to proceed, 1 to abort.
+# Auto-proceeds under --yes and under --dry-run.
+# ALWAYS call from a conditional context:  if ! confirm "..."; then ... fi
+# A bare `confirm "..."` would trip `set -e` when the user declines.
+confirm() {
+  local prompt="${1:-Continue?}"
+  if $DRY_RUN || $AUTO_YES; then
+    return 0
+  fi
+  local reply=""
+  read -rp "${prompt} [y/N] " reply || reply=""
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# ── Dates ────────────────────────────────────────────────────────────────────
+# cutoff_date <n> <days|months|years> — ISO-8601 UTC timestamp, N units ago.
+# BSD (macOS) `date -v` first, GNU `date -d` fallback. Both emit the trailing
+# `Z` form, so lexicographic comparison against GitHub timestamps is valid.
+cutoff_date() {
+  local n="${1:-}" unit="${2:-days}" suffix word
+  case "$unit" in
+    d|day|days)     suffix="d"; word="days"   ;;
+    m|month|months) suffix="m"; word="months" ;;
+    y|year|years)   suffix="y"; word="years"  ;;
+    *) die "cutoff_date: unknown unit '${unit}' (use days, months or years)" ;;
+  esac
+  [[ "$n" =~ ^[0-9]+$ ]] || die "cutoff_date: '${n}' is not a whole number"
+  if date -u -v-1d +%Y >/dev/null 2>&1; then
+    date -u -v-"${n}${suffix}" +"%Y-%m-%dT%H:%M:%SZ"
+  else
+    date -u -d "${n} ${word} ago" +"%Y-%m-%dT%H:%M:%SZ"
+  fi
+}
+
+# ── Sizes ────────────────────────────────────────────────────────────────────
+# parse_size <str> — "100", "500K", "100MB", "1.5GiB" -> bytes (base 1024).
+parse_size() {
+  local input="${1:-}" num unit mult
+  [ -n "$input" ] || die "parse_size: empty size"
+  input="${input// /}"
+  num="${input%%[A-Za-z]*}"
+  unit="${input#"$num"}"
+  [[ "$num" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "parse_size: invalid size: $1"
+  case "$(printf '%s' "$unit" | tr '[:lower:]' '[:upper:]')" in
+    ""|B)     mult=1 ;;
+    K|KB|KIB) mult=1024 ;;
+    M|MB|MIB) mult=1048576 ;;
+    G|GB|GIB) mult=1073741824 ;;
+    T|TB|TIB) mult=1099511627776 ;;
+    *) die "parse_size: unknown unit '${unit}' in '$1' (use B, KB, MB, GB, TB)" ;;
+  esac
+  LC_ALL=C awk -v n="$num" -v m="$mult" 'BEGIN { printf "%d\n", (n * m) }'
+}
+
+# human_bytes <n> — bytes -> "1.2 GB". LC_ALL=C so the decimal separator is a dot.
+human_bytes() {
+  local b="${1:-0}"
+  [[ "$b" =~ ^[0-9]+$ ]] || { printf '0 B'; return 0; }
+  LC_ALL=C awk -v b="$b" 'BEGIN {
+    split("B KB MB GB TB PB", u, " ")
+    i = 1
+    while (b >= 1024 && i < 6) { b /= 1024; i++ }
+    if (i == 1) printf "%d %s", b, u[i]
+    else        printf "%.1f %s", b, u[i]
+  }'
+}
+
+# ── Degraded access: note, continue, summarize ───────────────────────────────
+SKIP_LOG=""
+SKIP_COUNT=0
+SKIP_HINT_SHOWN=false
+
+skip_init() {
+  SKIP_LOG=$(tmp_new)
+  SKIP_COUNT=0
+  SKIP_HINT_SHOWN=false
+}
+
+# skip_note <target> <reason> — record a non-fatal skip. Never aborts.
+skip_note() {
+  SKIP_COUNT=$((SKIP_COUNT + 1))
+  [ -n "$SKIP_LOG" ] && printf '%s\t%s\n' "$1" "$2" >> "$SKIP_LOG"
+  $VERBOSE && echo -e "    ${YELLOW}SKIP${NC} $1 ${DIM}($2)${NC}" >&2
+  return 0
+}
+
+# scope_hint <scopes> — actionable hint, printed at most once per run.
+# Deliberately not a pre-flight check: fine-grained PATs report no scopes at
+# all, so pre-checking produces false negatives.
+scope_hint() {
+  $SKIP_HINT_SHOWN && return 0
+  SKIP_HINT_SHOWN=true
+  echo -e "  ${DIM}hint: gh auth refresh -h github.com -s $1${NC}" >&2
+  return 0
+}
+
+print_skips() {
+  [ "${SKIP_COUNT:-0}" -eq 0 ] && return 0
+  echo -e "  ${YELLOW}Skipped: ${BOLD}${SKIP_COUNT}${NC}" >&2
+  cut -f2 "$SKIP_LOG" | sort | uniq -c | sort -rn | while read -r n reason; do
+    echo -e "    ${DIM}${n}x ${reason}${NC}" >&2
+  done
+  if $VERBOSE; then
+    echo -e "  ${DIM}Details:${NC}" >&2
+    sed 's/^/    /' "$SKIP_LOG" >&2
+  fi
+  return 0
+}
+
+# ── GitHub API wrappers ──────────────────────────────────────────────────────
+GH_RETRY_MAX="${GH_RETRY_MAX:-4}"      # total attempts
+GH_RETRY_SLEEP="${GH_RETRY_SLEEP:-2}"  # seconds, doubled each attempt
+
+# gh_api_retry <gh api args...>
+# Behaves like `gh api`: stdout is the body, exit code is gh's.
+# Retries only on secondary rate limits, 429/5xx and transport errors.
+# Also retries GraphQL RATE_LIMITED, which arrives as HTTP 200 with an error
+# in the body. Never swallows a real error: on give-up it re-emits the body on
+# stdout (so partial GraphQL data stays usable) and gh's stderr on stderr.
+gh_api_retry() {
+  local attempt=1 rc out err errfile wait limited
+  errfile=$(mktemp)
+  while :; do
+    rc=0
+    out=$(gh api "$@" 2>"$errfile") || rc=$?
+    limited=false
+    case "$out" in *'"RATE_LIMITED"'*) limited=true ;; esac
+    if [ "$rc" -eq 0 ] && ! $limited; then
+      rm -f "$errfile"
+      printf '%s' "$out"
+      return 0
+    fi
+    err=$(cat "$errfile" 2>/dev/null || true)
+    if [ "$attempt" -lt "$GH_RETRY_MAX" ] && { $limited || printf '%s' "$err" | grep -qiE \
+        'secondary rate limit|rate limit|abuse detection|submitted too quickly|retry after|HTTP (429|50[0-4])|timeout|connection reset|unexpected EOF'; }; then
+      wait=$(( GH_RETRY_SLEEP * (2 ** (attempt - 1)) ))
+      warn "gh api transient failure (attempt ${attempt}/${GH_RETRY_MAX}); retrying in ${wait}s"
+      sleep "$wait"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    rm -f "$errfile"
+    printf '%s' "$out"
+    [ -n "$err" ] && printf '%s\n' "$err" >&2
+    [ "$rc" -eq 0 ] && rc=1
+    return "$rc"
+  done
+}
+
+# gh_api_try <label> <gh api args...>
+# stdout = body on success. Returns 1 after recording a skip on failure.
+# ALWAYS call as:  json=$(gh_api_try "lbl" ...) || continue
+gh_api_try() {
+  local label="$1"; shift
+  local body rc=0 errfile err reason
+  errfile=$(mktemp)
+  body=$(gh_api_retry "$@" 2>"$errfile") || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$errfile"
+    printf '%s' "$body"
+    return 0
+  fi
+  err=$(cat "$errfile" 2>/dev/null || true)
+  rm -f "$errfile"
+  case "$err" in
+    *SAML*|*saml*)              reason="SAML SSO not authorized for this org" ;;
+    *"HTTP 401"*)               reason="not authenticated (401)" ;;
+    *"HTTP 403"*|*Forbidden*)   reason="forbidden - missing scope or permission (403)" ;;
+    *"HTTP 404"*|*"Not Found"*) reason="not found or no access (404)" ;;
+    *"HTTP 410"*)               reason="feature disabled (410)" ;;
+    *"HTTP 5"*)                 reason="GitHub server error" ;;
+    *)                          reason="request failed" ;;
+  esac
+  skip_note "$label" "$reason"
+  return 1
+}
+
+# gh_paginate <label> <path> — full pagination as one JSON array on stdout.
+# Always include per_page=100 in <path>: --paginate does not raise gh's
+# default page size of 30.
+gh_paginate() {
+  local label="$1" path="$2" raw
+  raw=$(gh_api_try "$label" "$path" --paginate --jq '.[]') || return 1
+  printf '%s' "$raw" | jq -s '.'
+}
+
+# require_scope <scope> — 0 if the token carries it, or if scopes are
+# unknowable (fine-grained PAT / GitHub App emit no X-Oauth-Scopes header).
+require_scope() {
+  local want="$1" scopes
+  scopes=$(gh api user -i 2>/dev/null | tr -d '\r' \
+    | awk 'tolower($1) == "x-oauth-scopes:" { sub(/^[^:]*:[ ]*/, ""); print; exit }') || scopes=""
+  [ -z "$scopes" ] && return 0
+  case ",${scopes// /}," in
+    *",${want},"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ── Repo listing ─────────────────────────────────────────────────────────────
+# list_repos <target> <limit> [extra gh repo list flags...] -> nameWithOwner lines
+list_repos() {
+  local target="$1" limit="${2:-9999}"
+  shift 2
+  gh repo list "$target" --json nameWithOwner --limit "$limit" "$@" --jq '.[].nameWithOwner'
+}
+
+# ── Output ───────────────────────────────────────────────────────────────────
+hr() {
+  echo -e "${DIM}─────────────────────────────────────────────${NC}"
+}
+
+# header "Title" — use `header "Title" >&2` in commands that render to stdout.
+header() {
+  echo -e "${BOLD}${CYAN}$1${NC} ${DIM}v${VERSION}${NC}"
+  hr
+}
+
+# render_rows <json|csv|md> <json-array-of-flat-objects>
+# Column order and headers come from the first object's key order.
+render_rows() {
+  local format="$1" rows="$2"
+  case "$format" in
+    json) printf '%s\n' "$rows" | jq '.' ;;
+    csv)  printf '%s\n' "$rows" | jq -r '
+            if length == 0 then empty else
+              (.[0] | keys_unsorted) as $k
+              | ($k | @csv),
+                (.[] as $r | [$k[] | $r[.] |
+                   if . == null then "" elif type == "string" then gsub("[\r\n]+"; " ") else tostring end
+                 ] | @csv)
+            end' ;;
+    md)   printf '%s\n' "$rows" | jq -r '
+            if length == 0 then empty else
+              (.[0] | keys_unsorted) as $k
+              | "| " + ($k | join(" | ")) + " |",
+                "|" + ($k | map("---") | join("|")) + "|",
+                (.[] as $r | "| " + ([$k[] | $r[.] |
+                   if . == null then "" elif type == "string" then gsub("[\r\n]+"; " ") | gsub("\\|"; "/") else tostring end
+                 ] | join(" | ")) + " |")
+            end' ;;
+    *) die "unknown format: ${format}" ;;
+  esac
+}
+
+# write_output <file-or-empty> <content>
+write_output() {
+  if [ -n "$1" ]; then
+    printf '%s\n' "$2" > "$1"
+    echo -e "${GREEN}Done!${NC} Saved to ${BOLD}$1${NC}" >&2
+  else
+    printf '%s\n' "$2"
+  fi
+}
+
+# ── Git ──────────────────────────────────────────────────────────────────────
+# git_mirror_clone <owner/name> <dest_dir>
+# Uses `gh repo clone` so gh's credential helper handles private repos; a raw
+# https:// URL fails on private repos unless the user ran `gh auth setup-git`.
+git_mirror_clone() {
+  gh repo clone "$1" "$2" -- --mirror --quiet
+}
+
+# git_bundle_from_mirror <mirror_dir> <bundle_path> — rc 2 when the repo is empty
+# (`git bundle create` refuses to create a bundle with no refs).
+git_bundle_from_mirror() {
+  if [ "$(git -C "$1" for-each-ref --count=1 | wc -l | tr -d ' ')" -eq 0 ]; then
+    return 2
+  fi
+  git -C "$1" bundle create "$2" --all HEAD >/dev/null 2>&1
+}
+
+sha256_of() {
+  if command -v shasum &>/dev/null; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
 # ── Top-level usage ──────────────────────────────────────────────────────────
 usage() {
   cat <<EOF
@@ -416,12 +722,9 @@ cmd_unstar_do_unstar() {
   done < "$list_file"
   echo ""
 
-  if ! $AUTO_YES; then
-    read -rp "Unstar all $total repos? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
+  if ! confirm "Unstar all $total repos?"; then
+    echo "Cancelled."
+    exit 0
   fi
 
   local count=0 failed=0
@@ -563,12 +866,9 @@ cmd_unstar_main() {
   fi
 
   # ── Confirm & unstar ────────────────────────────────────────────────────
-  if ! $AUTO_YES; then
-    read -rp "Unstar all $total repos? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
+  if ! confirm "Unstar all $total repos?"; then
+    echo "Cancelled."
+    exit 0
   fi
 
   local count=0 failed=0
@@ -802,14 +1102,11 @@ cmd_clone_org_main() {
   fi
 
   # ── Confirm ─────────────────────────────────────────────────────────────
-  if ! $AUTO_YES; then
-    local action="Clone"
-    $CLONE_ORG_PULL && action="Clone/pull"
-    read -rp "${action} ${total} repos into ${CLONE_ORG_DIR}? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
+  local action="Clone"
+  $CLONE_ORG_PULL && action="Clone/pull"
+  if ! confirm "${action} ${total} repos into ${CLONE_ORG_DIR}?"; then
+    echo "Cancelled."
+    exit 0
   fi
 
   # ── Create target directory ─────────────────────────────────────────────
@@ -985,12 +1282,9 @@ cmd_cleanup_forks_main() {
   fi
 
   echo ""
-  if ! $AUTO_YES; then
-    read -rp "Delete ${#deletable[@]} unmodified forks? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
+  if ! confirm "Delete ${#deletable[@]} unmodified forks?"; then
+    echo "Cancelled."
+    exit 0
   fi
 
   local deleted=0 fail=0
@@ -1062,15 +1356,13 @@ cmd_archive_repos_main() {
     target_type="user"
   fi
 
-  local cutoff_date
-  cutoff_date=$(date -v-"${inactive_months}"m +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
-    date -d "${inactive_months} months ago" --iso-8601=seconds 2>/dev/null || \
-    die "Cannot compute date. Provide --inactive-months as a number.")
+  local cutoff
+  cutoff=$(cutoff_date "$inactive_months" months)
 
   echo -e "${BOLD}${CYAN}Archive Repos${NC} ${DIM}v${VERSION}${NC}"
   echo -e "${DIM}─────────────────────────────────────────────${NC}"
   echo -e "  Target:   ${BOLD}${target}${NC}"
-  echo -e "  Inactive: ${BOLD}>${inactive_months} months${NC} (before ${cutoff_date%%T*})"
+  echo -e "  Inactive: ${BOLD}>${inactive_months} months${NC} (before ${cutoff%%T*})"
   if $dry_run; then
     echo -e "  Mode:     ${YELLOW}DRY RUN${NC}"
   fi
@@ -1086,7 +1378,7 @@ cmd_archive_repos_main() {
 
   # Filter by inactivity
   local inactive_json
-  inactive_json=$(echo "$repos_json" | jq --arg cutoff "$cutoff_date" '[.[] | select(.pushedAt < $cutoff)]')
+  inactive_json=$(echo "$repos_json" | jq --arg cutoff "$cutoff" '[.[] | select(.pushedAt < $cutoff)]')
 
   local total
   total=$(echo "$inactive_json" | jq 'length')
@@ -1111,12 +1403,9 @@ cmd_archive_repos_main() {
     exit 0
   fi
 
-  if ! $AUTO_YES; then
-    read -rp "Archive ${total} repos? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
+  if ! confirm "Archive ${total} repos?"; then
+    echo "Cancelled."
+    exit 0
   fi
 
   local archived=0 fail=0
@@ -1455,12 +1744,9 @@ cmd_bulk_topic_main() {
     exit 0
   fi
 
-  if ! $AUTO_YES; then
-    read -rp "${action^} topic '${topic_value}' on ${count} repos? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
+  if ! confirm "${action^} topic '${topic_value}' on ${count} repos?"; then
+    echo "Cancelled."
+    exit 0
   fi
 
   local success=0 fail=0
@@ -1838,12 +2124,9 @@ cmd_sync_labels_main() {
     exit 0
   fi
 
-  if ! $AUTO_YES; then
-    read -rp "Sync ${label_count} labels to ${#targets[@]} repos? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
+  if ! confirm "Sync ${label_count} labels to ${#targets[@]} repos?"; then
+    echo "Cancelled."
+    exit 0
   fi
 
   echo ""
@@ -2173,12 +2456,9 @@ cmd_rename_default_branch_main() {
     exit 0
   fi
 
-  if ! $AUTO_YES; then
-    read -rp "Rename default branch on ${total} repos? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
+  if ! confirm "Rename default branch on ${total} repos?"; then
+    echo "Cancelled."
+    exit 0
   fi
 
   local success=0 fail=0
@@ -2506,12 +2786,9 @@ cmd_license_check_main() {
     exit 0
   fi
 
-  if ! $AUTO_YES; then
-    read -rp "Add '${LICENSE_CHECK_TEMPLATE}' license to ${without_license} repos? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
+  if ! confirm "Add '${LICENSE_CHECK_TEMPLATE}' license to ${without_license} repos?"; then
+    echo "Cancelled."
+    exit 0
   fi
 
   local encoded_body
@@ -2736,13 +3013,10 @@ cmd_dependabot_enable_main() {
     exit 0
   fi
 
-  if ! $AUTO_YES; then
-    read -rp "Enable Dependabot on ${enable_count} repos? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      rm -f "$list_file"
-      exit 0
-    fi
+  if ! confirm "Enable Dependabot on ${enable_count} repos?"; then
+    echo "Cancelled."
+    rm -f "$list_file"
+    exit 0
   fi
 
   echo ""
@@ -2901,12 +3175,9 @@ cmd_mirror_main() {
     exit 0
   fi
 
-  if ! $AUTO_YES; then
-    read -rp "Mirror ${total} repos? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
+  if ! confirm "Mirror ${total} repos?"; then
+    echo "Cancelled."
+    exit 0
   fi
 
   # Create mirror directory
@@ -2924,7 +3195,7 @@ cmd_mirror_main() {
     # Clone bare
     $VERBOSE && echo -e "    ${DIM}Cloning bare...${NC}"
     rm -rf "$clone_path"
-    if ! git clone --bare "https://github.com/${nwo}.git" "$clone_path" 2>/dev/null; then
+    if ! git_mirror_clone "$nwo" "$clone_path" 2>/dev/null; then
       fail=$((fail + 1))
       echo -e "    ${RED}FAILED${NC} (clone)"
       continue
@@ -3150,14 +3421,11 @@ cmd_release_cleanup_main() {
   echo -e "${YELLOW}Found ${total_to_delete} releases to delete across ${repo_count} repos${NC}"
   echo ""
 
-  if ! $DRY_RUN && ! $AUTO_YES; then
-    read -rp "Delete ${total_to_delete} releases? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
-    echo ""
+  if ! confirm "Delete ${total_to_delete} releases?"; then
+    echo "Cancelled."
+    exit 0
   fi
+  echo ""
 
   # Second pass: process each repo
   while IFS= read -r nwo; do
@@ -3457,14 +3725,11 @@ cmd_branch_protection_main() {
     echo -e "${YELLOW}${enforce_count} repos need protection${NC}"
     echo ""
 
-    if ! $DRY_RUN && ! $AUTO_YES; then
-      read -rp "Apply branch protection to ${enforce_count} repos? [y/N] " confirm
-      if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "Cancelled."
-        exit 0
-      fi
-      echo ""
+    if ! confirm "Apply branch protection to ${enforce_count} repos?"; then
+      echo "Cancelled."
+      exit 0
     fi
+    echo ""
 
     while IFS='|' read -r nwo branch; do
       [ -z "$nwo" ] && continue
@@ -3575,7 +3840,7 @@ cmd_stale_issues_parse_args() {
 
 cmd_stale_issues_process_repo() {
   local nwo="$1"
-  local cutoff_date="$2"
+  local cutoff="$2"
 
   # Process issues
   if [ "$STALE_ISSUES_TYPE" = "all" ] || [ "$STALE_ISSUES_TYPE" = "issue" ]; then
@@ -3585,7 +3850,7 @@ cmd_stale_issues_process_repo() {
     local issues_json
     issues_json=$(gh issue list "${issue_flags[@]}" 2>/dev/null || echo "[]")
 
-    echo "$issues_json" | jq -c --arg cutoff "$cutoff_date" '.[] | select(.updatedAt < $cutoff)' | while IFS= read -r item; do
+    echo "$issues_json" | jq -c --arg cutoff "$cutoff" '.[] | select(.updatedAt < $cutoff)' | while IFS= read -r item; do
       local number title updated
       number=$(echo "$item" | jq -r '.number')
       title=$(echo "$item" | jq -r '.title')
@@ -3616,7 +3881,7 @@ cmd_stale_issues_process_repo() {
     local prs_json
     prs_json=$(gh pr list "${pr_flags[@]}" 2>/dev/null || echo "[]")
 
-    echo "$prs_json" | jq -c --arg cutoff "$cutoff_date" '.[] | select(.updatedAt < $cutoff)' | while IFS= read -r item; do
+    echo "$prs_json" | jq -c --arg cutoff "$cutoff" '.[] | select(.updatedAt < $cutoff)' | while IFS= read -r item; do
       local number title updated
       number=$(echo "$item" | jq -r '.number')
       title=$(echo "$item" | jq -r '.title')
@@ -3658,13 +3923,8 @@ cmd_stale_issues_main() {
   fi
   echo ""
 
-  # Calculate cutoff date
-  local cutoff_date
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    cutoff_date=$(date -v-"${STALE_ISSUES_DAYS}"d -u +"%Y-%m-%dT%H:%M:%SZ")
-  else
-    cutoff_date=$(date -u -d "${STALE_ISSUES_DAYS} days ago" +"%Y-%m-%dT%H:%M:%SZ")
-  fi
+  local cutoff
+  cutoff=$(cutoff_date "$STALE_ISSUES_DAYS" days)
 
   local repo_list
   if [ -n "$STALE_ISSUES_REPO" ]; then
@@ -3682,19 +3942,16 @@ cmd_stale_issues_main() {
   fi
   echo ""
 
-  if $STALE_ISSUES_CLOSE && ! $DRY_RUN && ! $AUTO_YES; then
-    read -rp "Close stale issues/PRs? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
-    echo ""
+  if $STALE_ISSUES_CLOSE && ! confirm "Close stale issues/PRs?"; then
+    echo "Cancelled."
+    exit 0
   fi
+  echo ""
 
   while IFS= read -r nwo; do
     [ -z "$nwo" ] && continue
     echo -e "  ${BOLD}${nwo}${NC}"
-    cmd_stale_issues_process_repo "$nwo" "$cutoff_date"
+    cmd_stale_issues_process_repo "$nwo" "$cutoff"
   done <<< "$repo_list"
 
   echo ""
@@ -3847,14 +4104,11 @@ cmd_bulk_settings_main() {
   echo -e "Found ${BOLD}${total}${NC} repos"
   echo ""
 
-  if ! $DRY_RUN && ! $AUTO_YES; then
-    read -rp "Apply settings to ${total} repos? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
-    echo ""
+  if ! confirm "Apply settings to ${total} repos?"; then
+    echo "Cancelled."
+    exit 0
   fi
+  echo ""
 
   # Build API args (use -F for JSON booleans)
   local -a api_args=()
@@ -4131,14 +4385,11 @@ cmd_cleanup_packages_main() {
   echo -e "Found ${BOLD}${pkg_count}${NC} packages"
   echo ""
 
-  if ! $DRY_RUN && ! $AUTO_YES; then
-    read -rp "Clean up old versions (keeping ${CLEANUP_PKG_KEEP} per package)? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
-    echo ""
+  if ! confirm "Clean up old versions (keeping ${CLEANUP_PKG_KEEP} per package)?"; then
+    echo "Cancelled."
+    exit 0
   fi
+  echo ""
 
   echo "$packages_json" | jq -r '.[].name' | while IFS= read -r pkg_name; do
     [ -z "$pkg_name" ] && continue
@@ -4452,14 +4703,11 @@ cmd_repo_template_main() {
   echo -e "Found ${BOLD}${total}${NC} target repos"
   echo ""
 
-  if ! $DRY_RUN && ! $AUTO_YES; then
-    read -rp "Apply template to ${total} repos? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
-    echo ""
+  if ! confirm "Apply template to ${total} repos?"; then
+    echo "Cancelled."
+    exit 0
   fi
+  echo ""
 
   while IFS= read -r nwo; do
     [ -z "$nwo" ] && continue
@@ -4610,7 +4858,7 @@ cmd_pr_cleanup_parse_args() {
 
 cmd_pr_cleanup_process_repo() {
   local nwo="$1"
-  local cutoff_date="$2"
+  local cutoff="$2"
 
   local prs_json
   prs_json=$(gh pr list --repo "$nwo" --state open --json number,title,updatedAt,isDraft,headRefName --limit 200 2>/dev/null || echo "[]")
@@ -4624,7 +4872,7 @@ cmd_pr_cleanup_process_repo() {
   fi
 
   local stale_prs
-  stale_prs=$(echo "$prs_json" | jq -c --arg cutoff "$cutoff_date" "[.[] | ${filter}]")
+  stale_prs=$(echo "$prs_json" | jq -c --arg cutoff "$cutoff" "[.[] | ${filter}]")
 
   local stale_count
   stale_count=$(echo "$stale_prs" | jq 'length')
@@ -4689,13 +4937,8 @@ cmd_pr_cleanup_main() {
   fi
   echo ""
 
-  # Calculate cutoff date
-  local cutoff_date
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    cutoff_date=$(date -v-"${PR_CLEANUP_DAYS}"d -u +"%Y-%m-%dT%H:%M:%SZ")
-  else
-    cutoff_date=$(date -u -d "${PR_CLEANUP_DAYS} days ago" +"%Y-%m-%dT%H:%M:%SZ")
-  fi
+  local cutoff
+  cutoff=$(cutoff_date "$PR_CLEANUP_DAYS" days)
 
   local repo_list
   if [ -n "$PR_CLEANUP_REPO" ]; then
@@ -4713,19 +4956,16 @@ cmd_pr_cleanup_main() {
   fi
   echo ""
 
-  if $PR_CLEANUP_CLOSE && ! $DRY_RUN && ! $AUTO_YES; then
-    read -rp "Close stale PRs? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-      echo "Cancelled."
-      exit 0
-    fi
-    echo ""
+  if $PR_CLEANUP_CLOSE && ! confirm "Close stale PRs?"; then
+    echo "Cancelled."
+    exit 0
   fi
+  echo ""
 
   while IFS= read -r nwo; do
     [ -z "$nwo" ] && continue
     echo -e "  ${BOLD}${nwo}${NC}"
-    cmd_pr_cleanup_process_repo "$nwo" "$cutoff_date"
+    cmd_pr_cleanup_process_repo "$nwo" "$cutoff"
   done <<< "$repo_list"
 
   echo ""
