@@ -11,7 +11,7 @@ set -euo pipefail
 #   Audit & visibility: repo-audit (audit), stats, workflow-status (ci),
 #     secret-audit, license-check, vulnerability-check, branch-protection,
 #     webhook-audit, collaborator-audit, activity-report, traffic, org-audit,
-#     follow-audit (follow)
+#     follow-audit (follow), inbox (recap)
 #   Bulk operations: clone-org, bulk-topic, sync-labels, export-stars,
 #     rename-default-branch, dependabot-enable, mirror, bulk-settings,
 #     repo-template, bulk-merge, backup
@@ -453,6 +453,7 @@ ${BOLD}COMMANDS${NC}
   follow-audit        Who follows you back, and who does not
   activity-report     Generate activity summary for a period
   traffic             Snapshot repo views and clones (14-day window)
+  inbox               What is waiting on you: replies, reviews, new issues
 
   ${BOLD}Bulk operations${NC}
   clone-org           Clone all repos from a GitHub org or user
@@ -8799,6 +8800,598 @@ cmd_backup_main() {
   exit 0
 }
 # =============================================================================
+# COMMAND: inbox
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+INBOX_TARGET=""
+INBOX_REPO=""
+INBOX_TYPE="all"
+INBOX_SINCE=""
+INBOX_SINCE_TS=""
+INBOX_NO_SAVE=false
+INBOX_ARCHIVED=false
+INBOX_INCLUDE_FORKS=false
+INBOX_INCLUDE_BOTS=false
+INBOX_INCLUDE_MINE=false
+INBOX_LABEL=""
+INBOX_MAX=15
+INBOX_LIMIT=1000
+INBOX_FORMAT="text"
+INBOX_OUTPUT=""
+INBOX_OPEN=0
+INBOX_ME=""
+INBOX_ORGS=()
+INBOX_EXCLUDE=()
+INBOX_ONLY=()
+INBOX_OWNERS=()
+INBOX_BOT_PRS=0     # bot items excluded server-side, counted by cmd_inbox_fetch
+INBOX_BOT_ISSUES=0
+
+INBOX_SECTIONS="awaiting review new untriaged updated"
+INBOX_KNOWN_BOTS='["dependabot","dependabot-preview","renovate","renovate-bot","github-actions","pre-commit-ci","codecov","allcontributors","imgbot","snyk-bot","greenkeeper","mergify","semantic-release-bot","stale"]'
+
+# Issues and PRs share every field but the PR block. comments(last:5) lets the
+# classifier skip trailing bot comments (codecov, CI bots) to find the last
+# human one; reviews(author:$me) answers "did I already look at this PR".
+INBOX_GQL='query($q: String!, $me: String!, $first: Int!, $cursor: String) {
+  search(query: $q, type: ISSUE, first: $first, after: $cursor) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      __typename
+      ... on Issue {
+        number title url createdAt updatedAt authorAssociation
+        repository { nameWithOwner isFork isArchived }
+        author { login __typename }
+        labels(first: 10) { nodes { name } }
+        assignees(first: 1) { totalCount }
+        comments(last: 5) { totalCount nodes { author { login __typename } authorAssociation createdAt } }
+      }
+      ... on PullRequest {
+        number title url createdAt updatedAt authorAssociation
+        repository { nameWithOwner isFork isArchived }
+        author { login __typename }
+        labels(first: 10) { nodes { name } }
+        assignees(first: 1) { totalCount }
+        comments(last: 5) { totalCount nodes { author { login __typename } authorAssociation createdAt } }
+        isDraft mergeable reviewDecision
+        reviews(author: $me, last: 1) { totalCount nodes { submittedAt } }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      }
+    }
+  }
+}'
+
+INBOX_COUNT_GQL='query($q: String!) { search(query: $q, type: ISSUE, first: 1) { issueCount } }'
+
+cmd_inbox_usage() {
+  cat <<EOF
+${BOLD}github-helpers inbox${NC} ${DIM}v${VERSION}${NC} — What is waiting on you, across every repo
+                                        ${DIM}(alias: github-helpers recap)${NC}
+
+${BOLD}USAGE${NC}
+  github-helpers inbox [options]
+
+${BOLD}SCOPE${NC}
+  --user NAME             Scan this user's repos instead of yours
+  --org NAME              Also scan an organization ${DIM}(repeatable)${NC}
+  --repo OWNER/NAME       Only this repository
+  --type TYPE             issue, pr or all (default: all)
+  --label NAME            Only items carrying this label
+  --archived              Include archived repositories
+  --include-forks         Include forks ${DIM}(excluded by default)${NC}
+  --include-bots          Show bot items instead of a one-line summary
+  --include-mine          Show items you opened yourself
+  --exclude-author LOGIN  Treat this login as a bot ${DIM}(repeatable)${NC}
+
+${BOLD}WINDOW${NC}
+  ${DIM}By default "new" means since your last run of the same scope (7 days on the${NC}
+  ${DIM}first run). The timestamp is saved only after a complete scan.${NC}
+  --since N|YYYY-MM-DD    Fixed window: N days, or since a date ${DIM}(not saved)${NC}
+  --no-save               Do not update the last-run timestamp
+
+${BOLD}SECTIONS${NC} ${DIM}(each item is listed once, in the first section it matches)${NC}
+  awaiting                Last human word is from someone outside the maintainers
+  review                  Open PR, not draft, no conflict, CI green or absent, not reviewed by you
+  new                     Opened inside the window
+  untriaged               Issue with no label and no assignee
+  updated                 Older item with activity inside the window
+  --only SECTION          Keep only this section ${DIM}(repeatable; disables state saving)${NC}
+  --max-per-section N     Lines per section in text mode (default: ${INBOX_MAX}, 0 = all)
+
+${BOLD}OUTPUT${NC}
+  --format FORMAT         text, json, csv or md (default: text; md is a paste-ready digest)
+  --output FILE           Write the report to FILE
+  --open N                Open the N most urgent items in the browser
+  --limit N               Max results per search (default: ${INBOX_LIMIT}, GitHub's own cap)
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show more detail
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers inbox
+  github-helpers recap --since 30 --org my-company
+  github-helpers inbox --only awaiting --only review --open 5
+  github-helpers inbox --format md --output digest.md --no-save
+  github-helpers inbox --format json | jq '.[] | select(.section == "review") | .url'
+
+${BOLD}NOTE${NC}
+  One paginated GraphQL search per owner and type, not one request per repo.
+  GitHub search stops at 1000 results; the command says so when it hits it.
+  State lives in \${XDG_STATE_HOME:-~/.local/state}/github-helpers/inbox.json.
+EOF
+  exit 0
+}
+
+cmd_inbox_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)            need_arg "--user" "${2:-}"; INBOX_TARGET="$2"; shift 2 ;;
+      --org)             need_arg "--org" "${2:-}"; INBOX_ORGS+=("$2"); shift 2 ;;
+      --repo)            need_arg "--repo" "${2:-}"; INBOX_REPO="$2"; shift 2 ;;
+      --type)            need_arg "--type" "${2:-}"; INBOX_TYPE="$2"; shift 2 ;;
+      --since)           need_arg "--since" "${2:-}"; INBOX_SINCE="$2"; shift 2 ;;
+      --label)           need_arg "--label" "${2:-}"; INBOX_LABEL="$2"; shift 2 ;;
+      --exclude-author)  need_arg "--exclude-author" "${2:-}"; INBOX_EXCLUDE+=("$2"); shift 2 ;;
+      --only)            need_arg "--only" "${2:-}"; INBOX_ONLY+=("$2"); shift 2 ;;
+      --max-per-section) need_arg "--max-per-section" "${2:-}"; INBOX_MAX="$2"; shift 2 ;;
+      --limit)           need_arg "--limit" "${2:-}"; INBOX_LIMIT="$2"; shift 2 ;;
+      --format)          need_arg "--format" "${2:-}"; INBOX_FORMAT="$2"; shift 2 ;;
+      --output)          need_arg "--output" "${2:-}"; INBOX_OUTPUT="$2"; shift 2 ;;
+      --open)            need_arg "--open" "${2:-}"; INBOX_OPEN="$2"; shift 2 ;;
+      --no-save)         INBOX_NO_SAVE=true; shift ;;
+      --archived)        INBOX_ARCHIVED=true; shift ;;
+      --include-forks)   INBOX_INCLUDE_FORKS=true; shift ;;
+      --include-bots)    INBOX_INCLUDE_BOTS=true; shift ;;
+      --include-mine)    INBOX_INCLUDE_MINE=true; shift ;;
+      -y|--yes)          AUTO_YES=true; shift ;;
+      -v|--verbose)      VERBOSE=true; shift ;;
+      -h|--help)         cmd_inbox_usage ;;
+      *) die "inbox: unknown option: $1" ;;
+    esac
+  done
+
+  case "$INBOX_TYPE" in issue|pr|all) ;; *) die "inbox: invalid --type '${INBOX_TYPE}' (use issue, pr or all)" ;; esac
+  case "$INBOX_FORMAT" in text|json|csv|md) ;; *) die "inbox: invalid --format '${INBOX_FORMAT}' (use text, json, csv or md)" ;; esac
+  [[ "$INBOX_MAX" =~ ^[0-9]+$ ]] || die "inbox: --max-per-section must be a whole number"
+  [[ "$INBOX_LIMIT" =~ ^[0-9]+$ ]] && [ "$INBOX_LIMIT" -gt 0 ] || die "inbox: --limit must be a positive whole number"
+  [[ "$INBOX_OPEN" =~ ^[0-9]+$ ]] || die "inbox: --open must be a whole number"
+  [ -n "$INBOX_REPO" ] && { [[ "$INBOX_REPO" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]] || die "inbox: --repo must be OWNER/NAME"; }
+  local s
+  for s in "${INBOX_ONLY[@]+"${INBOX_ONLY[@]}"}"; do
+    case " $INBOX_SECTIONS " in
+      *" $s "*) ;;
+      *) die "inbox: unknown --only '${s}' (valid: ${INBOX_SECTIONS// /, })" ;;
+    esac
+  done
+
+  if [ -n "$INBOX_SINCE" ]; then
+    if [[ "$INBOX_SINCE" =~ ^[0-9]+$ ]]; then
+      INBOX_SINCE_TS=$(cutoff_date "$INBOX_SINCE" days)
+    elif [[ "$INBOX_SINCE" =~ ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$ ]]; then
+      INBOX_SINCE_TS="${INBOX_SINCE}T00:00:00Z"
+    else
+      die "inbox: --since must be a number of days or YYYY-MM-DD"
+    fi
+  fi
+  return 0
+}
+
+# ── Last-run state ───────────────────────────────────────────────────────────
+cmd_inbox_state_file() {
+  printf '%s' "${XDG_STATE_HOME:-$HOME/.local/state}/github-helpers/inbox.json"
+}
+
+# cmd_inbox_state_key — one timestamp per scope, so `inbox` and
+# `inbox --org x` do not advance each other's window. Owners are sorted so the
+# order of --org flags does not matter.
+cmd_inbox_state_key() {
+  local owners
+  if [ -n "$INBOX_REPO" ]; then
+    owners="repo:${INBOX_REPO}"
+  else
+    owners=$(printf '%s\n' "${INBOX_OWNERS[@]+"${INBOX_OWNERS[@]}"}" | LC_ALL=C sort -u | paste -sd, -)
+  fi
+  printf '%s|%s' "$owners" "$INBOX_TYPE"
+  [ -n "$INBOX_LABEL" ] && printf '|label:%s' "$INBOX_LABEL"
+  return 0
+}
+
+# cmd_inbox_state_read <key> — the saved timestamp, or nothing. A missing or
+# corrupt file reads as "never ran".
+cmd_inbox_state_read() {
+  local f
+  f=$(cmd_inbox_state_file)
+  [ -f "$f" ] || return 0
+  jq -r --arg k "$1" '.[$k] // empty' "$f" 2>/dev/null || true
+}
+
+# cmd_inbox_state_write <key> <iso-ts> — atomic: .part then mv.
+cmd_inbox_state_write() {
+  local f cur
+  f=$(cmd_inbox_state_file)
+  mkdir -p "$(dirname "$f")" || return 1
+  cur=$(jq -c '.' "$f" 2>/dev/null) || cur=""
+  printf '%s' "$cur" | jq -e 'type == "object"' >/dev/null 2>&1 || cur='{}'
+  printf '%s' "$cur" | jq --arg k "$1" --arg v "$2" '.[$k] = $v' > "${f}.part" || return 1
+  mv "${f}.part" "$f"
+}
+
+# ── Fetch ────────────────────────────────────────────────────────────────────
+# cmd_inbox_fetch <owner qualifier> <is:issue|is:pr> <out-file>
+# Appends one JSON array of raw nodes per page to <out-file>. Returns 1 after
+# a skip_note when the search fails, so the caller moves on to the next owner.
+cmd_inbox_fetch() {
+  local qual="$1" kindq="$2" out="$3"
+  local q cursor="" resp rc fetched=0 total=-1 n page more reason with_bots=""
+  q="${qual} ${kindq} is:open sort:updated-desc"
+  $INBOX_ARCHIVED || q="${q} archived:false"
+  [ -n "$INBOX_LABEL" ] && q="${q} label:\"${INBOX_LABEL}\""
+  # Bots are hidden anyway, and in a busy org they are most of the open PRs
+  # (1116 -> 171 on a real one): exclude them server-side, and get their
+  # number from one cheap count of the unfiltered query.
+  if ! $INBOX_INCLUDE_BOTS; then
+    with_bots=$(gh_api_retry graphql -f query="$INBOX_COUNT_GQL" -f q="$q" \
+                  --jq '.data.search.issueCount' 2>/dev/null) || with_bots=""
+    q="${q} $(cmd_inbox_bot_exclusions)"
+  fi
+  $VERBOSE && echo -e "  ${DIM}search: ${q}${NC}" >&2
+
+  while :; do
+    page=$(( INBOX_LIMIT - fetched ))
+    [ "$page" -gt 50 ] && page=50
+    local -a args=(graphql -f query="$INBOX_GQL" -f q="$q" -f me="$INBOX_ME" -F first="$page")
+    [ -n "$cursor" ] && args+=(-f cursor="$cursor")
+    rc=0
+    resp=$(gh_api_retry "${args[@]}" 2>/dev/null) || rc=$?
+    if [ "$rc" -ne 0 ] || ! printf '%s' "$resp" | jq -e '.data.search' >/dev/null 2>&1; then
+      reason=$(printf '%s' "$resp" | jq -r '(.errors[0].message // .message // "search failed")' 2>/dev/null) || reason="search failed"
+      skip_note "${qual} ${kindq}" "${reason:-search failed}"
+      case "$reason" in *SAML*|*scope*|*"not accessible"*) scope_hint "read:org" ;; esac
+      return 1
+    fi
+    printf '%s' "$resp" | jq -c '.data.search.nodes // []' >> "$out"
+    n=$(printf '%s' "$resp" | jq '.data.search.nodes | length')
+    [ "$total" -lt 0 ] && total=$(printf '%s' "$resp" | jq '.data.search.issueCount')
+    fetched=$(( fetched + n ))
+    more=$(printf '%s' "$resp" | jq -r '.data.search.pageInfo.hasNextPage')
+    cursor=$(printf '%s' "$resp" | jq -r '.data.search.pageInfo.endCursor // empty')
+    [ "$more" = "true" ] && [ -n "$cursor" ] && [ "$n" -gt 0 ] && [ "$fetched" -lt "$INBOX_LIMIT" ] || break
+  done
+
+  # No silent truncation: say when either --limit or GitHub's cap cut the list.
+  if [ "$total" -gt "$fetched" ]; then
+    if [ "$fetched" -ge 1000 ]; then
+      warn "inbox: ${qual} ${kindq} has ${total} open items; GitHub search stops at 1000 (least recently updated ones not shown)"
+    else
+      warn "inbox: ${qual} ${kindq} limited to ${fetched} of ${total} items — raise it with --limit"
+    fi
+  fi
+  if [[ "$with_bots" =~ ^[0-9]+$ ]] && [ "$with_bots" -gt "$total" ]; then
+    if [ "$kindq" = "is:pr" ]; then
+      INBOX_BOT_PRS=$(( INBOX_BOT_PRS + with_bots - total ))
+    else
+      INBOX_BOT_ISSUES=$(( INBOX_BOT_ISSUES + with_bots - total ))
+    fi
+  fi
+  return 0
+}
+
+# cmd_inbox_bot_exclusions — search negations for the known bots and every
+# --exclude-author. "foo[bot]" is an app and is spelt app/foo in search.
+cmd_inbox_bot_exclusions() {
+  local out="" b
+  while IFS= read -r b; do
+    [ -n "$b" ] && out="${out} -author:app/${b}"
+  done < <(printf '%s' "$INBOX_KNOWN_BOTS" | jq -r '.[]')
+  for b in "${INBOX_EXCLUDE[@]+"${INBOX_EXCLUDE[@]}"}"; do
+    case "$b" in
+      *"[bot]") out="${out} -author:app/${b%\[bot\]}" ;;
+      *)        out="${out} -author:${b}" ;;
+    esac
+  done
+  printf '%s' "${out# }"
+}
+
+# cmd_inbox_check_owner <qualifier> — GitHub search returns 0 results, not an
+# error, for an owner that does not exist or that you cannot see. Check first
+# so a typo in --org reads as a skip instead of an empty inbox.
+cmd_inbox_check_owner() {
+  case "$1" in
+    user:*|org:*) gh_api_try "$1" "users/${1#*:}" >/dev/null ;;
+    repo:*)       gh_api_try "$1" "repos/${1#repo:}" >/dev/null ;;
+  esac
+}
+
+# ── Classification (pure) ────────────────────────────────────────────────────
+# cmd_inbox_classify <me> <since-iso>
+# stdin: JSON array of raw search nodes. stdout: JSON array of flat items
+# {repo, number, kind, section, title, author, age_days, created, updated, url, tags}.
+# `section` is the first of $INBOX_SECTIONS the item matches, or null.
+cmd_inbox_classify() {
+  local exclude
+  exclude=$(printf '%s\n' "${INBOX_EXCLUDE[@]+"${INBOX_EXCLUDE[@]}"}" | jq -R 'select(length > 0)' | jq -sc '.')
+  jq -c --arg me "$1" --arg since "$2" --argjson known "$INBOX_KNOWN_BOTS" \
+        --argjson exclude "$exclude" --arg order "$INBOX_SECTIONS" '
+    def maint: . == "OWNER" or . == "MEMBER" or . == "COLLABORATOR";
+    def botlist: ($known + $exclude) | map(ascii_downcase);
+    def is_bot:
+      (. // {}) as $a | ($a.login // "" | ascii_downcase) as $l
+      | ($a.__typename == "Bot") or ($l | endswith("[bot]"))
+        or ((botlist | map(select(. == $l)) | length) > 0);
+    ($order | split(" ")) as $sections
+    | [ .[] | select(. != null and .repository != null and .number != null)
+        | . as $n
+        | ($n.__typename == "PullRequest") as $pr
+        | ($n.author.login // "ghost") as $login
+        | ($n.author | is_bot) as $bot
+        | ($login == $me) as $mine
+        | ([ ($n.comments.nodes // [])[] | select(.author | is_bot | not) ] | last) as $lc
+        | ((($n.reviews.nodes // []) | last | .submittedAt) // "") as $myrev
+        | (if $lc == null then
+             (($n.authorAssociation | maint | not) and $login != $me and $myrev == "")
+           else
+             (($lc.author.login // "") != $me) and ($lc.authorAssociation | maint | not)
+             and ($lc.createdAt > $myrev)
+           end) as $awaiting
+        | ((($n.commits.nodes // [])[0].commit.statusCheckRollup.state) // null) as $ci
+        | ($pr and ($n.isDraft | not) and $n.mergeable != "CONFLICTING"
+             and ($ci == null or $ci == "SUCCESS") and (($n.reviews.totalCount // 0) == 0)) as $review
+        | (($pr | not) and ((($n.labels.nodes // []) | length) == 0)
+             and (($n.assignees.totalCount // 0) == 0)) as $untriaged
+        | ($n.createdAt >= $since) as $new
+        | (($new | not) and $n.updatedAt >= $since) as $updated
+        | [ (if $bot then "bot" else empty end),
+            (if $mine then "mine" else empty end),
+            (if $awaiting then "awaiting" else empty end),
+            (if $review then "review" else empty end),
+            (if $new then "new" else empty end),
+            (if $untriaged then "untriaged" else empty end),
+            (if $updated then "updated" else empty end),
+            (if $pr and $n.isDraft then "draft" else empty end),
+            (if $n.mergeable == "CONFLICTING" then "conflict" else empty end),
+            (if $ci == "FAILURE" or $ci == "ERROR" then "ci-failing"
+             elif $ci == "PENDING" or $ci == "EXPECTED" then "ci-pending" else empty end),
+            (if $n.reviewDecision == "APPROVED" then "approved"
+             elif $n.reviewDecision == "CHANGES_REQUESTED" then "changes-requested" else empty end),
+            (if $n.authorAssociation == "FIRST_TIME_CONTRIBUTOR" or $n.authorAssociation == "FIRST_TIMER"
+             then "first-timer" else empty end)
+          ] as $tags
+        | { repo: $n.repository.nameWithOwner,
+            number: $n.number,
+            kind: (if $pr then "pr" else "issue" end),
+            section: ([ $sections[] as $s | select($tags | any(. == $s)) | $s ] | first),
+            title: (($n.title // "") | gsub("[\t\r\n]+"; " ")),
+            author: $login,
+            age_days: (((now - ($n.createdAt | fromdateiso8601)) / 86400) | floor),
+            created: $n.createdAt,
+            updated: $n.updatedAt,
+            url: $n.url,
+            tags: $tags } ]'
+}
+
+# cmd_inbox_select — stdin: classified items. stdout: what the recap shows,
+# deduplicated and in priority order (section, then oldest waiting first; new
+# and updated items newest first).
+cmd_inbox_select() {
+  local only
+  only=$(printf '%s\n' "${INBOX_ONLY[@]+"${INBOX_ONLY[@]}"}" | jq -R 'select(length > 0)' | jq -sc '.')
+  jq -c --argjson bots "$INBOX_INCLUDE_BOTS" --argjson mine "$INBOX_INCLUDE_MINE" \
+        --argjson only "$only" --arg order "$INBOX_SECTIONS" '
+    ($order | split(" ")) as $sections
+    | unique_by(.url)
+    | map(select(.section != null)
+          | select($bots or (.tags | any(. == "bot") | not))
+          | select($mine or (.tags | any(. == "mine") | not))
+          | .section as $s
+          | select(($only | length) == 0 or ($only | any(. == $s))))
+    | sort_by(.section as $s | ($sections | index($s)),
+              (if .section == "new" or .section == "updated"
+               then -(.updated | fromdateiso8601) else (.created | fromdateiso8601) end))'
+}
+
+# ── Rendering ────────────────────────────────────────────────────────────────
+# cmd_inbox_render_text <items> <all-classified> — the recap on stdout.
+cmd_inbox_render_text() {
+  local items="$1" all="$2" total
+  total=$(printf '%s' "$items" | jq 'length')
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}Nothing waiting on you.${NC}"
+  fi
+
+  local sec label color count shown ref ref_pad title title_pad author_pad age_pad tags width
+  width=$(printf '%s' "$items" | jq '[.[] | "\(.repo)#\(.number)" | length] | (max // 10) | if . > 40 then 40 else . end')
+  for sec in $INBOX_SECTIONS; do
+    count=$(printf '%s' "$items" | jq --arg s "$sec" '[.[] | select(.section == $s)] | length')
+    [ "$count" -eq 0 ] && continue
+    case "$sec" in
+      awaiting)  label="⏳ Awaiting your reply";  color="$YELLOW" ;;
+      review)    label="👀 PRs ready for review"; color="$CYAN" ;;
+      new)       label="🆕 New";                  color="$GREEN" ;;
+      untriaged) label="🏷  Untriaged";            color="$BOLD" ;;
+      updated)   label="✎  Updated";              color="$DIM" ;;
+    esac
+    echo -e "${BOLD}${color}${label}${NC} ${DIM}(${count})${NC}"
+    shown=0
+    while IFS=$'\t' read -r ref title author age tags; do
+      # Pad first, colour after: a colour code inside %-Ns breaks the column.
+      [ "${#title}" -gt 60 ] && title="${title:0:59}…"
+      printf -v ref_pad    "%-${width}s" "$ref"
+      printf -v title_pad  '%-60s' "$title"
+      printf -v author_pad '%-18s' "@${author}"
+      printf -v age_pad    '%5s'   "${age}d"
+      echo -e "  ${BOLD}${ref_pad}${NC}  ${title_pad}  ${DIM}${author_pad}${NC} ${age_pad}${tags:+  ${DIM}[${tags}]${NC}}"
+      shown=$((shown + 1))
+    done < <(printf '%s' "$items" | jq -r --arg s "$sec" --argjson max "$INBOX_MAX" '
+      [.[] | select(.section == $s)] | (if $max > 0 then .[0:$max] else . end)[]
+      | [ "\(.repo)#\(.number)", .title, .author, (.age_days | tostring),
+          ([.tags[] | select(. != $s)] | join(", ")) ] | @tsv')
+    [ "$count" -gt "$shown" ] && echo -e "  ${DIM}… and $((count - shown)) more (--max-per-section 0 to list them all)${NC}"
+    echo ""
+  done
+
+  hr
+  local totals
+  totals=$(printf '%s' "$items" | jq -r --arg order "$INBOX_SECTIONS" '
+    . as $i | [ ($order | split(" "))[] as $s | "\($s) \([ $i[] | select(.section == $s) ] | length)" ] | join(" · ")')
+  echo -e "  ${BOLD}${total}${NC} item(s): ${totals}"
+
+  if ! $INBOX_INCLUDE_BOTS; then
+    local bot_prs bot_issues
+    # Excluded server-side, plus any bot the search let through.
+    bot_prs=$(printf '%s' "$all" | jq --argjson s "$INBOX_BOT_PRS" \
+      '$s + ([unique_by(.url)[] | select((.tags | any(. == "bot")) and .kind == "pr")] | length)')
+    bot_issues=$(printf '%s' "$all" | jq --argjson s "$INBOX_BOT_ISSUES" \
+      '$s + ([unique_by(.url)[] | select((.tags | any(. == "bot")) and .kind == "issue")] | length)')
+    if [ "$bot_prs" -gt 0 ] || [ "$bot_issues" -gt 0 ]; then
+      echo -e "  ${DIM}Hidden: ${bot_prs} bot PR(s), ${bot_issues} bot issue(s) → merge the green ones with ${NC}${BOLD}github-helpers bulk-merge${NC}${DIM} (or --include-bots)${NC}"
+    fi
+  fi
+
+  if [ "$total" -gt 0 ]; then
+    local busiest
+    busiest=$(printf '%s' "$items" | jq -r '
+      group_by(.repo) | map({r: .[0].repo, n: length}) | sort_by(-.n, .r) | .[0:5]
+      | map("\(.r) (\(.n))") | join(", ")')
+    echo -e "  ${DIM}Busiest: ${busiest}${NC}"
+  fi
+}
+
+# cmd_inbox_open <items> <n> — open the N most urgent items in the browser.
+cmd_inbox_open() {
+  local items="$1" n="$2" real repo num kind opened=0
+  real=$(printf '%s' "$items" | jq --argjson n "$n" '.[0:$n] | length')
+  [ "$real" -eq 0 ] && return 0
+  if [ "$real" -gt 5 ] && ! confirm "Open ${real} items in your browser?"; then
+    echo "Cancelled." >&2
+    return 0
+  fi
+  while IFS=$'\t' read -r repo num kind; do
+    if gh "$kind" view "$num" --repo "$repo" --web >/dev/null 2>&1; then
+      opened=$((opened + 1))
+    else
+      warn "inbox: could not open ${repo}#${num}"
+    fi
+  done < <(printf '%s' "$items" | jq -r --argjson n "$n" '.[0:$n][] | [.repo, (.number | tostring), .kind] | @tsv')
+  echo -e "${GREEN}Opened${NC} ${BOLD}${opened}${NC} item(s) in the browser" >&2
+}
+
+cmd_inbox_main() {
+  cmd_inbox_parse_args "$@"
+  preflight_check
+  skip_init
+
+  local run_start
+  run_start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  INBOX_ME=$(get_username)
+
+  INBOX_OWNERS=("user:${INBOX_TARGET:-$INBOX_ME}")
+  local o
+  for o in "${INBOX_ORGS[@]+"${INBOX_ORGS[@]}"}"; do INBOX_OWNERS+=("org:${o}"); done
+
+  local key since_src
+  key=$(cmd_inbox_state_key)
+  if [ -n "$INBOX_SINCE_TS" ]; then
+    since_src="--since ${INBOX_SINCE}"
+  else
+    INBOX_SINCE_TS=$(cmd_inbox_state_read "$key")
+    if [ -n "$INBOX_SINCE_TS" ]; then
+      since_src="last run"
+    else
+      INBOX_SINCE_TS=$(cutoff_date 7 days)
+      since_src="first run, 7 days"
+    fi
+  fi
+
+  {
+    header "Inbox"
+    if [ -n "$INBOX_REPO" ]; then
+      echo -e "  Repo:   ${BOLD}${INBOX_REPO}${NC}"
+    else
+      echo -e "  Owners: ${BOLD}$(printf '%s ' "${INBOX_OWNERS[@]}" | sed 's/[a-z]*://g; s/ $//')${NC}"
+    fi
+    echo -e "  Type:   ${BOLD}${INBOX_TYPE}${NC}"
+    echo -e "  Since:  ${BOLD}${INBOX_SINCE_TS/T/ }${NC} ${DIM}(${since_src})${NC}"
+    [ -n "$INBOX_LABEL" ] && echo -e "  Label:  ${BOLD}${INBOX_LABEL}${NC}"
+    echo ""
+  } >&2
+
+  local -a quals=() kinds=()
+  if [ -n "$INBOX_REPO" ]; then
+    quals=("repo:${INBOX_REPO}")
+  else
+    quals=("${INBOX_OWNERS[@]}")
+  fi
+  case "$INBOX_TYPE" in
+    issue) kinds=("is:issue") ;;
+    pr)    kinds=("is:pr") ;;
+    all)   kinds=("is:issue" "is:pr") ;;
+  esac
+
+  # One search per owner and kind: splitting issues from PRs doubles the room
+  # under GitHub's 1000-result cap.
+  local raw_file qual kind
+  raw_file=$(tmp_new)
+  for qual in "${quals[@]}"; do
+    if [ "$qual" != "user:${INBOX_ME}" ] && ! cmd_inbox_check_owner "$qual"; then
+      warn "inbox: cannot see ${qual#*:} — skipped"
+      continue
+    fi
+    for kind in "${kinds[@]}"; do
+      echo -e "  ${DIM}Searching ${qual} ${kind}...${NC}" >&2
+      cmd_inbox_fetch "$qual" "$kind" "$raw_file" || true
+    done
+  done
+  echo "" >&2
+
+  local all items
+  all=$(jq -s --argjson forks "$INBOX_INCLUDE_FORKS" --argjson archived "$INBOX_ARCHIVED" '
+      add // [] | map(select(. != null and .repository != null)
+        | select($forks or (.repository.isFork | not))
+        | select($archived or (.repository.isArchived | not)))' "$raw_file" \
+    | cmd_inbox_classify "$INBOX_ME" "$INBOX_SINCE_TS")
+  items=$(printf '%s' "$all" | cmd_inbox_select)
+
+  if [ "$INBOX_FORMAT" = "text" ]; then
+    local report
+    report=$(cmd_inbox_render_text "$items" "$all")
+    if [ -n "$INBOX_OUTPUT" ]; then
+      # Plain text in a file: strip the colour codes.
+      write_output "$INBOX_OUTPUT" "$(printf '%s\n' "$report" | sed $'s/\033\\[[0-9;]*m//g')"
+    else
+      printf '%s\n' "$report"
+    fi
+  else
+    local rows
+    rows=$(printf '%s' "$items" | jq -c 'map({section, repo, number, kind, title, author, age_days,
+                                              updated, url, tags: (.tags | join(", "))})')
+    if [ "$(printf '%s' "$rows" | jq 'length')" -eq 0 ] && [ "$INBOX_FORMAT" != "json" ]; then
+      echo -e "${GREEN}Nothing waiting on you.${NC}" >&2
+    else
+      write_output "$INBOX_OUTPUT" "$(render_rows "$INBOX_FORMAT" "$rows")"
+    fi
+  fi
+
+  [ "$INBOX_OPEN" -gt 0 ] && cmd_inbox_open "$items" "$INBOX_OPEN"
+
+  print_skips
+  # Save the START of the run: anything opened while we were scanning is
+  # still "new" next time. A partial scan never advances the window.
+  if [ -n "$INBOX_SINCE" ] || $INBOX_NO_SAVE; then
+    :
+  elif [ "${#INBOX_ONLY[@]}" -gt 0 ]; then
+    $VERBOSE && echo -e "  ${DIM}--only in use: last-run timestamp not updated${NC}" >&2
+  elif [ "$SKIP_COUNT" -gt 0 ]; then
+    warn "inbox: incomplete scan — last-run timestamp not updated"
+  elif cmd_inbox_state_write "$key" "$run_start"; then
+    $VERBOSE && echo -e "  ${DIM}next run: changes since ${run_start}${NC}" >&2
+  else
+    warn "inbox: could not save state to $(cmd_inbox_state_file)"
+  fi
+  return 0
+}
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -8861,6 +9454,7 @@ main() {
     repo-template)         cmd_repo_template_main "$@" ;;
     pr-cleanup)            cmd_pr_cleanup_main "$@" ;;
     activity-report)       cmd_activity_report_main "$@" ;;
+    inbox|recap)           cmd_inbox_main "$@" ;;
     version|-V|--version)  echo "github-helpers v${VERSION}" ;;
     help|-h|--help)        usage ;;
     *)
