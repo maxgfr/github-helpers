@@ -525,6 +525,167 @@ assert_eq "repo names travel as GraphQL variables" "-f o0=u -f n0=a -f h0=p:main
 assert_match "batch meta records the parent per alias" '"f1":\{"nwo":"u/b","parent":""' "$CF_BATCH_META"
 
 echo ""
+
+# ── 14. inbox: classifier, --since, state ────────────────────────────────────
+echo -e "${BOLD}14. inbox classifier, --since and state${NC}"
+setup_env
+inbox_reset() {
+  INBOX_TARGET="" INBOX_REPO="" INBOX_TYPE="all" INBOX_SINCE="" INBOX_SINCE_TS=""
+  INBOX_NO_SAVE=false INBOX_ARCHIVED=false INBOX_INCLUDE_FORKS=false
+  INBOX_INCLUDE_BOTS=false INBOX_INCLUDE_MINE=false INBOX_LABEL=""
+  INBOX_MAX=15 INBOX_LIMIT=1000 INBOX_FORMAT="text" INBOX_OUTPUT="" INBOX_OPEN=0
+  INBOX_ORGS=() INBOX_EXCLUDE=() INBOX_ONLY=()
+}
+SINCE="2026-09-01T00:00:00Z"
+OLDC="2026-06-01T00:00:00Z"   # created before the window
+NEWC="2026-09-10T00:00:00Z"   # created inside it
+# node <typename> <login> <author typename> <association> <created> <updated> [extra json]
+node() {
+  jq -nc --arg t "$1" --arg l "$2" --arg at "$3" --arg as "$4" --arg c "$5" --arg u "$6" --argjson x "${7:-{\}}" '
+    { __typename: $t, number: 1, title: "t", url: "https://x/\($l)/\($c)",
+      createdAt: $c, updatedAt: $u, authorAssociation: $as,
+      repository: {nameWithOwner: "me/r", isFork: false, isArchived: false},
+      author: {login: $l, __typename: $at},
+      labels: {nodes: []}, assignees: {totalCount: 0},
+      comments: {totalCount: 0, nodes: []} }
+    + (if $t == "PullRequest" then
+        {isDraft: false, mergeable: "MERGEABLE", reviewDecision: null,
+         reviews: {totalCount: 0, nodes: []},
+         commits: {nodes: [{commit: {statusCheckRollup: {state: "SUCCESS"}}}]}}
+       else {} end)
+    + $x'
+}
+tags() { printf '[%s]' "$1" | cmd_inbox_classify me "$SINCE" | jq -r '.[0].tags | join(",")'; }
+section() { printf '[%s]' "$1" | cmd_inbox_classify me "$SINCE" | jq -r '.[0].section // "none"'; }
+inbox_reset
+
+assert_match "bot detected by __typename" '(^|,)bot(,|$)' \
+  "$(tags "$(node PullRequest renovate-x Bot NONE "$OLDC" "$OLDC")")"
+assert_match "bot detected by [bot] suffix" '(^|,)bot(,|$)' \
+  "$(tags "$(node Issue foo[bot] User NONE "$OLDC" "$OLDC")")"
+assert_match "bot detected by the known list" '(^|,)bot(,|$)' \
+  "$(tags "$(node Issue dependabot User NONE "$OLDC" "$OLDC")")"
+INBOX_EXCLUDE=(SomeBotty)
+assert_match "bot detected by --exclude-author, case-insensitively" '(^|,)bot(,|$)' \
+  "$(tags "$(node Issue somebotty User NONE "$OLDC" "$OLDC")")"
+INBOX_EXCLUDE=()
+bot_free=$(tags "$(node Issue alice User NONE "$OLDC" "$OLDC")" | tr ',' '\n' | grep -cx bot || true)
+assert_eq "a human author carries no bot tag" "0" "$bot_free"
+assert_match "my own item is tagged mine" '(^|,)mine(,|$)' \
+  "$(tags "$(node Issue me User OWNER "$OLDC" "$OLDC")")"
+
+assert_eq "external issue with no reply is awaiting" "awaiting" \
+  "$(section "$(node Issue alice User NONE "$OLDC" "$OLDC")")"
+assert_eq "collaborator reply clears awaiting" "none" \
+  "$(section "$(node Issue alice User NONE "$OLDC" "$OLDC" \
+    '{"labels":{"nodes":[{"name":"bug"}]},"comments":{"totalCount":1,"nodes":[{"author":{"login":"bob","__typename":"User"},"authorAssociation":"COLLABORATOR","createdAt":"2026-06-02T00:00:00Z"}]}}')")"
+assert_eq "my own reply clears awaiting" "none" \
+  "$(section "$(node Issue alice User NONE "$OLDC" "$OLDC" \
+    '{"labels":{"nodes":[{"name":"bug"}]},"comments":{"totalCount":1,"nodes":[{"author":{"login":"me","__typename":"User"},"authorAssociation":"NONE","createdAt":"2026-06-02T00:00:00Z"}]}}')")"
+assert_eq "external follow-up after my reply is awaiting" "awaiting" \
+  "$(section "$(node Issue alice User NONE "$OLDC" "$OLDC" \
+    '{"labels":{"nodes":[{"name":"bug"}]},"comments":{"totalCount":2,"nodes":[{"author":{"login":"me","__typename":"User"},"authorAssociation":"OWNER","createdAt":"2026-06-02T00:00:00Z"},{"author":{"login":"alice","__typename":"User"},"authorAssociation":"NONE","createdAt":"2026-06-03T00:00:00Z"}]}}')")"
+assert_eq "a trailing bot comment does not hide the human one" "awaiting" \
+  "$(section "$(node Issue alice User NONE "$OLDC" "$OLDC" \
+    '{"labels":{"nodes":[{"name":"bug"}]},"comments":{"totalCount":2,"nodes":[{"author":{"login":"alice","__typename":"User"},"authorAssociation":"NONE","createdAt":"2026-06-02T00:00:00Z"},{"author":{"login":"codecov","__typename":"Bot"},"authorAssociation":"NONE","createdAt":"2026-06-03T00:00:00Z"}]}}')")"
+assert_eq "member-opened issue is not awaiting" "none" \
+  "$(section "$(node Issue bob User MEMBER "$OLDC" "$OLDC" '{"labels":{"nodes":[{"name":"bug"}]}}')")"
+
+# PRs opened by a collaborator so that "awaiting" does not mask "review".
+assert_eq "green, mergeable, unreviewed PR is review-ready" "review" \
+  "$(section "$(node PullRequest bob User COLLABORATOR "$OLDC" "$OLDC")")"
+assert_eq "a PR without CI is review-ready" "review" \
+  "$(section "$(node PullRequest bob User COLLABORATOR "$OLDC" "$OLDC" '{"commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}}')")"
+assert_eq "a draft PR is not review-ready" "none" \
+  "$(section "$(node PullRequest bob User COLLABORATOR "$OLDC" "$OLDC" '{"isDraft":true}')")"
+assert_eq "a conflicting PR is not review-ready" "none" \
+  "$(section "$(node PullRequest bob User COLLABORATOR "$OLDC" "$OLDC" '{"mergeable":"CONFLICTING"}')")"
+assert_eq "a red PR is not review-ready" "none" \
+  "$(section "$(node PullRequest bob User COLLABORATOR "$OLDC" "$OLDC" '{"commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}]}}')")"
+assert_match "a red PR is tagged ci-failing" '(^|,)ci-failing(,|$)' \
+  "$(tags "$(node PullRequest bob User COLLABORATOR "$OLDC" "$OLDC" '{"commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}]}}')")"
+assert_eq "a PR I already reviewed is not review-ready" "none" \
+  "$(section "$(node PullRequest bob User COLLABORATOR "$OLDC" "$OLDC" '{"reviews":{"totalCount":1,"nodes":[{"submittedAt":"2026-06-05T00:00:00Z"}]}}')")"
+assert_eq "my review answers an external PR with no comments" "none" \
+  "$(section "$(node PullRequest alice User NONE "$OLDC" "$OLDC" '{"reviews":{"totalCount":1,"nodes":[{"submittedAt":"2026-06-05T00:00:00Z"}]}}')")"
+
+assert_eq "unlabelled, unassigned collaborator issue is untriaged" "untriaged" \
+  "$(section "$(node Issue bob User COLLABORATOR "$OLDC" "$OLDC")")"
+assert_eq "an assigned issue is triaged" "none" \
+  "$(section "$(node Issue bob User COLLABORATOR "$OLDC" "$OLDC" '{"assignees":{"totalCount":1}}')")"
+
+assert_eq "created inside the window is new" "new" \
+  "$(section "$(node Issue bob User COLLABORATOR "$NEWC" "$NEWC" '{"labels":{"nodes":[{"name":"bug"}]}}')")"
+assert_eq "updated inside the window is updated" "updated" \
+  "$(section "$(node Issue bob User COLLABORATOR "$OLDC" "$NEWC" '{"labels":{"nodes":[{"name":"bug"}]}}')")"
+new_and_upd=$(tags "$(node Issue bob User COLLABORATOR "$NEWC" "$NEWC")" | tr ',' '\n' | grep -cx updated || true)
+assert_eq "new items are not also tagged updated" "0" "$new_and_upd"
+
+# Selection: bots and my own items are hidden unless asked for.
+MIX="[$(node Issue alice User NONE "$OLDC" "$OLDC"),$(node PullRequest dependabot Bot NONE "$OLDC" "$OLDC"),$(node Issue me User OWNER "$NEWC" "$NEWC")]"
+sel() { printf '%s' "$MIX" | cmd_inbox_classify me "$SINCE" | cmd_inbox_select | jq -r 'map(.author) | join(",")'; }
+assert_eq "select hides bots and my own items" "alice" "$(sel)"
+INBOX_INCLUDE_BOTS=true INBOX_INCLUDE_MINE=true
+assert_eq "--include-bots/--include-mine bring them back" "3" "$(printf '%s' "$MIX" | cmd_inbox_classify me "$SINCE" | cmd_inbox_select | jq length)"
+INBOX_INCLUDE_BOTS=false INBOX_INCLUDE_MINE=false
+INBOX_ONLY=(review)
+assert_eq "--only drops the other sections" "0" "$(printf '%s' "$MIX" | cmd_inbox_classify me "$SINCE" | cmd_inbox_select | jq length)"
+INBOX_ONLY=()
+
+# Server-side bot exclusion: apps are spelt app/NAME in search.
+INBOX_EXCLUDE=("ci-helper[bot]" "some-user")
+excl=$(cmd_inbox_bot_exclusions)
+assert_match "known bots are excluded as apps" '(^| )-author:app/dependabot( |$)' "$excl"
+assert_match "an --exclude-author [bot] login becomes app/NAME" '(^| )-author:app/ci-helper( |$)' "$excl"
+assert_match "a plain --exclude-author login is excluded as-is" '(^| )-author:some-user$' "$excl"
+INBOX_EXCLUDE=()
+
+# --since parsing
+inbox_reset
+cmd_inbox_parse_args --since 2026-01-02
+assert_eq "--since DATE becomes midnight UTC" "2026-01-02T00:00:00Z" "$INBOX_SINCE_TS"
+inbox_reset
+cmd_inbox_parse_args --since 7
+assert_match "--since N goes through cutoff_date" '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$' "$INBOX_SINCE_TS"
+inbox_reset
+(cmd_inbox_parse_args --since abc) &>/dev/null && rc=0 || rc=1
+assert_exit_code "--since rejects garbage" 1 $rc
+(cmd_inbox_parse_args --since 2026-13-45x) &>/dev/null && rc=0 || rc=1
+assert_exit_code "--since rejects a malformed date" 1 $rc
+(cmd_inbox_parse_args --type foo) &>/dev/null && rc=0 || rc=1
+assert_exit_code "--type rejects an unknown kind" 1 $rc
+(cmd_inbox_parse_args --only nope) &>/dev/null && rc=0 || rc=1
+assert_exit_code "--only rejects an unknown section" 1 $rc
+(cmd_inbox_parse_args --repo nope) &>/dev/null && rc=0 || rc=1
+assert_exit_code "--repo requires OWNER/NAME" 1 $rc
+(cmd_inbox_parse_args --open x) &>/dev/null && rc=0 || rc=1
+assert_exit_code "--open requires a whole number" 1 $rc
+
+# State key is independent of --org order; state round-trips.
+inbox_reset
+INBOX_OWNERS=("user:me" "org:b" "org:a")
+k1=$(cmd_inbox_state_key)
+INBOX_OWNERS=("org:a" "user:me" "org:b")
+k2=$(cmd_inbox_state_key)
+assert_eq "state key is stable across --org order" "$k1" "$k2"
+INBOX_TYPE="pr"
+[ "$(cmd_inbox_state_key)" != "$k1" ] && rc=0 || rc=1
+assert_exit_code "state key changes with --type" 0 $rc
+INBOX_TYPE="all"
+
+state_dir=$(mktemp -d)
+XDG_STATE_HOME="$state_dir"
+assert_eq "state read on a fresh install is empty" "" "$(cmd_inbox_state_read "$k1")"
+cmd_inbox_state_write "$k1" "2026-09-01T10:00:00Z"
+cmd_inbox_state_write "other" "2026-01-01T00:00:00Z"
+assert_eq "state round-trips" "2026-09-01T10:00:00Z" "$(cmd_inbox_state_read "$k1")"
+assert_eq "scopes do not overwrite each other" "2026-01-01T00:00:00Z" "$(cmd_inbox_state_read other)"
+printf 'not json' > "${state_dir}/github-helpers/inbox.json"
+assert_eq "a corrupt state file reads as empty" "" "$(cmd_inbox_state_read "$k1")"
+rm -rf "$state_dir"
+unset XDG_STATE_HOME
+
+echo ""
 # ── 10. Script syntax check ─────────────────────────────────────────────────
 echo -e "${BOLD}10. Script integrity${NC}"
 
