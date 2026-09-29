@@ -82,7 +82,7 @@ These are binding on new commands and enforced by `test.sh` where possible.
 
 ## Testing
 
-`test.sh` holds the unit tests (159 of them, all offline). It sources `script.sh` with `main "$@"` and the preflight checks neutralised by `sed`, then calls functions in-process. CI runs it plus a `--help` smoke test per command.
+`test.sh` holds the unit tests (162 of them, all offline). It sources `script.sh` with `main "$@"` and the preflight checks neutralised by `sed`, then calls functions in-process. CI runs it plus a `--help` smoke test per command.
 
 Suite 10 is a set of grep-based invariants over the whole script: `bash -n`, `need_arg` on every `shift 2`, no lowercase locals in traps, no raw `read -rp`, a single `gh repo delete` call site, ISO date arithmetic only in `cutoff_date`, a usage function per command, and a pinned EXIT-trap count.
 

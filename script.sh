@@ -8814,6 +8814,7 @@ INBOX_ARCHIVED=false
 INBOX_INCLUDE_FORKS=false
 INBOX_INCLUDE_BOTS=false
 INBOX_INCLUDE_MINE=false
+INBOX_ALL=false
 INBOX_LABEL=""
 INBOX_MAX=15
 INBOX_LIMIT=1000
@@ -8883,6 +8884,7 @@ ${BOLD}SCOPE${NC}
   --include-forks         Include forks ${DIM}(excluded by default)${NC}
   --include-bots          Show bot items instead of a one-line summary
   --include-mine          Show items you opened yourself
+  --all                   Also list open items that match no section, as "other"
   --exclude-author LOGIN  Treat this login as a bot ${DIM}(repeatable)${NC}
 
 ${BOLD}WINDOW${NC}
@@ -8945,6 +8947,7 @@ cmd_inbox_parse_args() {
       --include-forks)   INBOX_INCLUDE_FORKS=true; shift ;;
       --include-bots)    INBOX_INCLUDE_BOTS=true; shift ;;
       --include-mine)    INBOX_INCLUDE_MINE=true; shift ;;
+      --all)             INBOX_ALL=true; shift ;;
       -y|--yes)          AUTO_YES=true; shift ;;
       -v|--verbose)      VERBOSE=true; shift ;;
       -h|--help)         cmd_inbox_usage ;;
@@ -9172,22 +9175,24 @@ cmd_inbox_classify() {
 }
 
 # cmd_inbox_select — stdin: classified items. stdout: what the recap shows,
-# deduplicated and in priority order (section, then oldest waiting first; new
-# and updated items newest first).
+# deduplicated and in priority order (section, then oldest waiting first; new,
+# updated and other items newest first). With --all, an item that matches no
+# section is kept as "other", listed last.
 cmd_inbox_select() {
   local only
   only=$(printf '%s\n' "${INBOX_ONLY[@]+"${INBOX_ONLY[@]}"}" | jq -R 'select(length > 0)' | jq -sc '.')
   jq -c --argjson bots "$INBOX_INCLUDE_BOTS" --argjson mine "$INBOX_INCLUDE_MINE" \
-        --argjson only "$only" --arg order "$INBOX_SECTIONS" '
+        --argjson all "$INBOX_ALL" --argjson only "$only" --arg order "$INBOX_SECTIONS other" '
     ($order | split(" ")) as $sections
     | unique_by(.url)
-    | map(select(.section != null)
+    | map(if $all and .section == null then .section = "other" else . end
+          | select(.section != null)
           | select($bots or (.tags | any(. == "bot") | not))
           | select($mine or (.tags | any(. == "mine") | not))
           | .section as $s
           | select(($only | length) == 0 or ($only | any(. == $s))))
     | sort_by(.section as $s | ($sections | index($s)),
-              (if .section == "new" or .section == "updated"
+              (if .section == "new" or .section == "updated" or .section == "other"
                then -(.updated | fromdateiso8601) else (.created | fromdateiso8601) end))'
 }
 
@@ -9202,7 +9207,7 @@ cmd_inbox_render_text() {
 
   local sec label color count shown ref ref_pad title title_pad author_pad age_pad tags width
   width=$(printf '%s' "$items" | jq '[.[] | "\(.repo)#\(.number)" | length] | (max // 10) | if . > 40 then 40 else . end')
-  for sec in $INBOX_SECTIONS; do
+  for sec in $INBOX_SECTIONS other; do
     count=$(printf '%s' "$items" | jq --arg s "$sec" '[.[] | select(.section == $s)] | length')
     [ "$count" -eq 0 ] && continue
     case "$sec" in
@@ -9211,6 +9216,7 @@ cmd_inbox_render_text() {
       new)       label="🆕 New";                  color="$GREEN" ;;
       untriaged) label="🏷  Untriaged";            color="$BOLD" ;;
       updated)   label="✎  Updated";              color="$DIM" ;;
+      other)     label="📋 Everything else open"; color="$DIM" ;;
     esac
     echo -e "${BOLD}${color}${label}${NC} ${DIM}(${count})${NC}"
     shown=0
@@ -9233,7 +9239,9 @@ cmd_inbox_render_text() {
 
   hr
   local totals
-  totals=$(printf '%s' "$items" | jq -r --arg order "$INBOX_SECTIONS" '
+  local order="$INBOX_SECTIONS"
+  $INBOX_ALL && order="${order} other"
+  totals=$(printf '%s' "$items" | jq -r --arg order "$order" '
     . as $i | [ ($order | split(" "))[] as $s | "\($s) \([ $i[] | select(.section == $s) ] | length)" ] | join(" · ")')
   echo -e "  ${BOLD}${total}${NC} item(s): ${totals}"
 

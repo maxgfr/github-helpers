@@ -702,6 +702,7 @@ Each item is listed once, in the first section it matches:
 | `--include-forks` | Include forks (excluded by default) |
 | `--include-bots` | List bot items instead of a one-line summary |
 | `--include-mine` | List items you opened yourself |
+| `--all` | Also list every other open item from other people, last, as "other" |
 | `--exclude-author LOGIN` | Treat this login as a bot (repeatable) |
 | `--only SECTION` | Keep only this section (repeatable) |
 | `--max-per-section N` | Lines per section in text mode (default 15, `0` = all) |

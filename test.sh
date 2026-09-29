@@ -534,7 +534,7 @@ inbox_reset() {
   INBOX_NO_SAVE=false INBOX_ARCHIVED=false INBOX_INCLUDE_FORKS=false
   INBOX_INCLUDE_BOTS=false INBOX_INCLUDE_MINE=false INBOX_LABEL=""
   INBOX_MAX=15 INBOX_LIMIT=1000 INBOX_FORMAT="text" INBOX_OUTPUT="" INBOX_OPEN=0
-  INBOX_ORGS=() INBOX_EXCLUDE=() INBOX_ONLY=()
+  INBOX_ORGS=() INBOX_EXCLUDE=() INBOX_ONLY=() INBOX_ALL=false
 }
 SINCE="2026-09-01T00:00:00Z"
 OLDC="2026-06-01T00:00:00Z"   # created before the window
@@ -631,6 +631,16 @@ INBOX_INCLUDE_BOTS=false INBOX_INCLUDE_MINE=false
 INBOX_ONLY=(review)
 assert_eq "--only drops the other sections" "0" "$(printf '%s' "$MIX" | cmd_inbox_classify me "$SINCE" | cmd_inbox_select | jq length)"
 INBOX_ONLY=()
+
+# --all: items matching no section are listed last, as "other".
+QUIET="[$(node Issue bob User COLLABORATOR "$OLDC" "$OLDC" '{"labels":{"nodes":[{"name":"bug"}]}}'),$(node Issue alice User NONE "$OLDC" "$OLDC")]"
+assert_eq "a quiet, triaged item is hidden by default" "1" \
+  "$(printf '%s' "$QUIET" | cmd_inbox_classify me "$SINCE" | cmd_inbox_select | jq length)"
+INBOX_ALL=true
+assert_eq "--all lists it last, in an other section" "awaiting,other" \
+  "$(printf '%s' "$QUIET" | cmd_inbox_classify me "$SINCE" | cmd_inbox_select | jq -r 'map(.section) | join(",")')"
+assert_eq "--all still hides bots and my own items" "alice" "$(sel)"
+INBOX_ALL=false
 
 # Server-side bot exclusion: apps are spelt app/NAME in search.
 INBOX_EXCLUDE=("ci-helper[bot]" "some-user")
