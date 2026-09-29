@@ -141,6 +141,12 @@ jobs:
       - name: Test backup help
         run: ./script.sh backup --help
 
+      - name: Test inbox help
+        run: ./script.sh inbox --help
+
+      - name: Test recap alias (inbox) help
+        run: ./script.sh recap --help
+
       - name: Test forks alias (cleanup-forks) help
         run: ./script.sh forks --help
 
@@ -236,6 +242,15 @@ jobs:
           if ./script.sh backup --no-git --no-metadata 2>/dev/null; then
             echo "Should have failed" && exit 1
           fi
+
+      - name: Test inbox rejects invalid arguments
+        run: |
+          for args in "--type foo" "--since abc" "--open x" "--repo nope"; do
+            # shellcheck disable=SC2086
+            if ./script.sh inbox $args 2>/dev/null; then
+              echo "inbox $args should have failed" && exit 1
+            fi
+          done
 
       - name: Run unit tests
         run: |
