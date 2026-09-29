@@ -82,7 +82,7 @@ These are binding on new commands and enforced by `test.sh` where possible.
 
 ## Testing
 
-`test.sh` holds the unit tests (114 of them, all offline). It sources `script.sh` with `main "$@"` and the preflight checks neutralised by `sed`, then calls functions in-process. CI runs it plus a `--help` smoke test per command.
+`test.sh` holds the unit tests (159 of them, all offline). It sources `script.sh` with `main "$@"` and the preflight checks neutralised by `sed`, then calls functions in-process. CI runs it plus a `--help` smoke test per command.
 
 Suite 10 is a set of grep-based invariants over the whole script: `bash -n`, `need_arg` on every `shift 2`, no lowercase locals in traps, no raw `read -rp`, a single `gh repo delete` call site, ISO date arithmetic only in `cutoff_date`, a usage function per command, and a pinned EXIT-trap count.
 
@@ -94,10 +94,10 @@ bash -n script.sh
 ./script.sh <command> --dry-run [required-flags]
 ```
 
-## Commands (39 total)
+## Commands (40 total)
 
 **Cleanup & maintenance**: `unstar`, `cleanup-forks` (alias `forks`), `sync-forks`, `cleanup-branches`, `archive-repos`, `release-cleanup`, `pr-cleanup`, `cleanup-packages`, `stale-issues`, `cache-cleanup`, `artifact-cleanup`, `run-cleanup`, `gist` (alias `gists`), `notifications` (alias `notifs`), `invite-cleanup`
-**Audit & visibility**: `repo-audit` (alias `audit`), `stats`, `workflow-status` (alias `ci`), `secret-audit`, `license-check`, `vulnerability-check`, `branch-protection`, `webhook-audit`, `collaborator-audit`, `activity-report`, `traffic`, `org-audit`, `follow-audit` (alias `follow`)
+**Audit & visibility**: `repo-audit` (alias `audit`), `stats`, `workflow-status` (alias `ci`), `secret-audit`, `license-check`, `vulnerability-check`, `branch-protection`, `webhook-audit`, `collaborator-audit`, `activity-report`, `traffic`, `org-audit`, `follow-audit` (alias `follow`), `inbox` (alias `recap`)
 **Bulk operations**: `clone-org`, `bulk-topic`, `sync-labels`, `export-stars`, `rename-default-branch`, `dependabot-enable`, `mirror`, `bulk-settings`, `repo-template`, `bulk-merge`, `backup`
 
 ## Dependencies

@@ -56,6 +56,7 @@ chmod +x /usr/local/bin/github-helpers
 | [`traffic`](#traffic--snapshot-repo-views-and-clones) | Snapshot views and clones (14-day window) |
 | [`org-audit`](#org-audit--org-level-security-and-membership-posture) | Org security and membership posture |
 | [`follow-audit`](#follow-audit--who-follows-you-back-and-who-does-not) | Who follows you back, and who does not |
+| [`inbox`](#inbox--what-is-waiting-on-you-across-every-repo) | What is waiting on you: replies, reviews, new issues |
 | [`clone-org`](#clone-org--clone-all-repos-from-a-github-org-or-user) | Clone/pull all repos from an org or user |
 | [`bulk-topic`](#bulk-topic--add-or-remove-topics-in-batch) | Add/remove topics in batch |
 | [`sync-labels`](#sync-labels--sync-issue-labels-from-a-template-repo) | Sync issue labels across repos |
@@ -664,6 +665,59 @@ only in private repos will look inactive; it is a hint, not proof.
 `--exclude` fails loudly if the file is missing — a silently-empty whitelist is the
 disaster case here. Unfollowing goes through the dry-run → edit → `--from` loop so a human
 reads every login first, and needs the `user:follow` scope.
+
+#### `inbox` — What is waiting on you, across every repo
+
+Alias: `github-helpers recap`. Read-only. A daily view of the issues and PRs other people
+opened on your repositories, without going through the notification inbox.
+
+```bash
+github-helpers inbox                                  # since your last run (7 days the first time)
+github-helpers recap --since 30 --org my-company      # fixed window, your repos + an org
+github-helpers inbox --only awaiting --only review --open 5
+github-helpers inbox --format md --output digest.md --no-save
+github-helpers inbox --format json | jq '.[] | select(.section == "review") | .url'
+```
+
+Each item is listed once, in the first section it matches:
+
+| Section | Meaning |
+|---|---|
+| ⏳ `awaiting` | The last human comment is from someone who is not OWNER/MEMBER/COLLABORATOR (or nobody answered an outside issue yet) |
+| 👀 `review` | Open PR, not a draft, no conflict, CI green or absent, and you have not reviewed it |
+| 🆕 `new` | Opened inside the window |
+| 🏷 `untriaged` | Issue with no label and no assignee |
+| ✎ `updated` | Older item with activity inside the window |
+
+| Flag | Description |
+|---|---|
+| `--user NAME` | Scan this user's repos instead of yours |
+| `--org NAME` | Also scan an organization (repeatable) |
+| `--repo OWNER/NAME` | Only this repository |
+| `--type issue\|pr\|all` | Default `all` |
+| `--since N\|YYYY-MM-DD` | Fixed window instead of "since last run" (not saved) |
+| `--no-save` | Do not update the last-run timestamp |
+| `--label NAME` | Only items with this label |
+| `--archived` | Include archived repositories |
+| `--include-forks` | Include forks (excluded by default) |
+| `--include-bots` | List bot items instead of a one-line summary |
+| `--include-mine` | List items you opened yourself |
+| `--exclude-author LOGIN` | Treat this login as a bot (repeatable) |
+| `--only SECTION` | Keep only this section (repeatable) |
+| `--max-per-section N` | Lines per section in text mode (default 15, `0` = all) |
+| `--limit N` | Max results per search (default 1000) |
+| `--format text\|json\|csv\|md`, `--output FILE` | Export; `md` is a paste-ready digest |
+| `--open N` | Open the N most urgent items in the browser (asks above 5) |
+
+It runs one paginated GraphQL search per owner and type rather than one request per
+repository. Known bots (Dependabot, Renovate, github-actions…) are excluded server-side and
+reported as a count, with a pointer to `bulk-merge`. GitHub search stops at 1000 results;
+the command warns when a search hits it or `--limit`.
+
+The last-run timestamp is stored per scope (owners + type + label) in
+`${XDG_STATE_HOME:-~/.local/state}/github-helpers/inbox.json`. It records the **start** of
+the run, so nothing opened during the scan is missed, and it is only written after a
+complete scan: a skipped owner, `--since`, `--only` or `--no-save` leave it untouched.
 
 ### Bulk operations
 
