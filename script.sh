@@ -430,7 +430,7 @@ ${BOLD}COMMANDS${NC}
   unstar              Clean up your GitHub stars (filter & bulk-unstar)
   cleanup-forks       Audit forks; delete only those with zero activity
   sync-forks          Update your forks from their upstream
-  cleanup-branches    Delete merged or stale remote branches
+  cleanup-branches    Delete merged, squash-merged or stale branches
   archive-repos       Archive inactive repos in batch
   release-cleanup     Delete old releases
   pr-cleanup          Find and close abandoned pull requests
@@ -2835,165 +2835,242 @@ cmd_branches_main() {
 # COMMAND: cleanup-branches
 # =============================================================================
 
+# ── Defaults ─────────────────────────────────────────────────────────────────
+CLEANUP_BRANCHES_TARGET=""
+CLEANUP_BRANCHES_REPO=""
+CLEANUP_BRANCHES_STALE_DAYS=""
+CLEANUP_BRANCHES_EXCLUDE=""
+CLEANUP_BRANCHES_STRICT=false
+CLEANUP_BRANCHES_FROM=""
+CLEANUP_BRANCHES_OUT="cleanup-branches.txt"
+CLEANUP_BRANCHES_LIMIT=1000
+
 cmd_cleanup_branches_usage() {
   cat <<EOF
-${BOLD}github-helpers cleanup-branches${NC} ${DIM}v${VERSION}${NC} — Delete merged/stale remote branches
+${BOLD}github-helpers cleanup-branches${NC} ${DIM}v${VERSION}${NC} — Delete merged, squash-merged or stale branches
 
 ${BOLD}USAGE${NC}
-  github-helpers cleanup-branches --repo OWNER/REPO [options]
-  github-helpers cleanup-branches --org NAME [options]
-  github-helpers cleanup-branches --user NAME [options]
+  github-helpers cleanup-branches [options]
 
-${BOLD}TARGET${NC} (one required)
+${BOLD}TARGET${NC} ${DIM}(default: your non-archived source repos)${NC}
   --repo OWNER/REPO       Single repository
   --org NAME              All repos in organization
   --user NAME             All repos for user
+  --limit N               Max repos to scan (default: 1000)
 
-${BOLD}OPTIONS${NC}
-  --merged                Delete only merged branches (default)
-  --stale-days N          Delete branches with no commits in N days
-  --exclude PATTERN       Exclude branches matching pattern (grep regex)
-  --dry-run               List branches without deleting
+${BOLD}WHAT IS DELETED${NC} ${DIM}(see github-helpers branches for the verdicts)${NC}
+  ${DIM}default${NC}                 MERGED, PR_MERGED and PR_CLOSED
+  --merged                Same as the default ${DIM}(kept for compatibility)${NC}
+  --strict                MERGED only: no commit ahead of the default branch
+  --stale-days N          Also delete STALE branches: no commit in N days
+  --exclude REGEX         Never touch branches matching REGEX
+  ${DIM}Never deleted: the default branch, protected branches, and any branch that${NC}
+  ${DIM}is the head or base of an open pull request.${NC}
+
+${BOLD}REVIEW LOOP${NC}
+  --dry-run               Preview and write the list to --out, delete nothing
+  --out FILE              List file (default: ${CLEANUP_BRANCHES_OUT})
+  --from FILE             Delete the branches listed in FILE, after re-checking
+                          each one: a branch that moved or changed verdict is skipped
   -y, --yes               Skip confirmation prompt
   -v, --verbose           Show detailed output
   -h, --help              Show this help
 
 ${BOLD}EXAMPLES${NC}
-  github-helpers cleanup-branches --repo maxgfr/my-repo --dry-run
-  github-helpers cleanup-branches --org my-company --merged --exclude "release|hotfix" --dry-run
-  github-helpers cleanup-branches --user maxgfr --stale-days 90 -y
+  github-helpers cleanup-branches --dry-run
+  github-helpers cleanup-branches --from cleanup-branches.txt
+  github-helpers cleanup-branches --repo maxgfr/my-repo --strict
+  github-helpers cleanup-branches --org my-company --exclude "^(release|hotfix)/" --dry-run
+  github-helpers cleanup-branches --stale-days 180 -y
+
+${BOLD}NOTE${NC}
+  A deleted branch can be restored from the SHA in the list file or the output:
+  gh api repos/OWNER/REPO/git/refs -f ref=refs/heads/BRANCH -f sha=SHA
 EOF
   exit 0
 }
 
-cmd_cleanup_branches_for_repo() {
-  local nwo="$1" mode="$2" stale_days="$3" exclude="$4" dry_run="$5"
-
-  # Get default branch
-  local default_branch
-  default_branch=$(gh api "repos/${nwo}" --jq '.default_branch' 2>/dev/null) || return 1
-
-  # List remote branches
-  local branches_json
-  branches_json=$(gh api "repos/${nwo}/branches" --paginate --jq '.[] | select(.name != "'"$default_branch"'") | .name' 2>/dev/null) || return 1
-
-  local -a to_delete=()
-
-  while IFS= read -r branch; do
-    [ -z "$branch" ] && continue
-
-    # Exclude pattern
-    if [ -n "$exclude" ] && echo "$branch" | grep -qE "$exclude"; then
-      $VERBOSE && echo -e "    ${DIM}SKIP${NC} $branch ${DIM}(excluded)${NC}"
-      continue
-    fi
-
-    local should_delete=false
-
-    if [ "$mode" = "merged" ]; then
-      # Check if branch is merged into default
-      local comparison
-      comparison=$(gh api "repos/${nwo}/compare/${default_branch}...${branch}" --jq '.ahead_by' 2>/dev/null || echo "-1")
-      if [ "$comparison" = "0" ]; then
-        should_delete=true
-      fi
-    fi
-
-    if [ "$mode" = "stale" ] && [ -n "$stale_days" ]; then
-      local last_commit_date
-      last_commit_date=$(gh api "repos/${nwo}/branches/${branch}" --jq '.commit.commit.committer.date' 2>/dev/null || echo "")
-      if [ -n "$last_commit_date" ]; then
-        local cutoff_ts last_ts
-        cutoff_ts=$(date -v-"${stale_days}"d +%s 2>/dev/null || date -d "${stale_days} days ago" +%s 2>/dev/null)
-        last_ts=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$last_commit_date" +%s 2>/dev/null || date -d "$last_commit_date" +%s 2>/dev/null)
-        if [ -n "$cutoff_ts" ] && [ -n "$last_ts" ] && [ "$last_ts" -lt "$cutoff_ts" ]; then
-          should_delete=true
-        fi
-      fi
-    fi
-
-    if $should_delete; then
-      to_delete+=("$branch")
-      echo -e "    ${YELLOW}DELETE${NC} $branch"
-    elif $VERBOSE; then
-      echo -e "    ${DIM}KEEP${NC}   $branch"
-    fi
-  done <<< "$branches_json"
-
-  if [ ${#to_delete[@]} -eq 0 ]; then
-    $VERBOSE && echo -e "    ${GREEN}No branches to delete${NC}"
-    return 0
-  fi
-
-  if $dry_run; then
-    return 0
-  fi
-
-  for branch in "${to_delete[@]}"; do
-    if gh api --method DELETE "repos/${nwo}/git/refs/heads/${branch}" 2>/dev/null; then
-      $VERBOSE && echo -e "    ${GREEN}DELETED${NC} $branch"
-    else
-      echo -e "    ${RED}FAILED${NC}  $branch"
-    fi
-  done
-}
-
-cmd_cleanup_branches_main() {
-  local target="" target_type="" mode="merged" stale_days="" exclude="" dry_run=false
-
+cmd_cleanup_branches_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)        need_arg "--repo" "${2:-}"; target="$2"; target_type="repo"; shift 2 ;;
-      --org)         need_arg "--org" "${2:-}"; target="$2"; target_type="org"; shift 2 ;;
-      --user)        need_arg "--user" "${2:-}"; target="$2"; target_type="user"; shift 2 ;;
-      --merged)      mode="merged"; shift ;;
-      --stale-days)  need_arg "--stale-days" "${2:-}"; mode="stale"; stale_days="$2"; shift 2 ;;
-      --exclude)     need_arg "--exclude" "${2:-}"; exclude="$2"; shift 2 ;;
-      --dry-run)     dry_run=true; shift ;;
+      --repo)        need_arg "--repo" "${2:-}"; CLEANUP_BRANCHES_REPO="$2"; shift 2 ;;
+      --org)         need_arg "--org" "${2:-}"; CLEANUP_BRANCHES_TARGET="$2"; shift 2 ;;
+      --user)        need_arg "--user" "${2:-}"; CLEANUP_BRANCHES_TARGET="$2"; shift 2 ;;
+      --merged)      shift ;;
+      --strict)      CLEANUP_BRANCHES_STRICT=true; shift ;;
+      --stale-days)  need_arg "--stale-days" "${2:-}"; CLEANUP_BRANCHES_STALE_DAYS="$2"; shift 2 ;;
+      --exclude)     need_arg "--exclude" "${2:-}"; CLEANUP_BRANCHES_EXCLUDE="$2"; shift 2 ;;
+      --from)        need_arg "--from" "${2:-}"; CLEANUP_BRANCHES_FROM="$2"; shift 2 ;;
+      --out)         need_arg "--out" "${2:-}"; CLEANUP_BRANCHES_OUT="$2"; shift 2 ;;
+      --limit)       need_arg "--limit" "${2:-}"; CLEANUP_BRANCHES_LIMIT="$2"; shift 2 ;;
+      --dry-run)     DRY_RUN=true; shift ;;
       -y|--yes)      AUTO_YES=true; shift ;;
       -v|--verbose)  VERBOSE=true; shift ;;
       -h|--help)     cmd_cleanup_branches_usage ;;
       *) die "cleanup-branches: unknown option: $1" ;;
     esac
   done
+  cmd_branches_validate cleanup-branches "$CLEANUP_BRANCHES_REPO" "$CLEANUP_BRANCHES_STALE_DAYS" \
+    "$CLEANUP_BRANCHES_EXCLUDE" "$CLEANUP_BRANCHES_LIMIT"
+  if [ -n "$CLEANUP_BRANCHES_FROM" ] && [ ! -f "$CLEANUP_BRANCHES_FROM" ]; then
+    die "cleanup-branches: file not found: ${CLEANUP_BRANCHES_FROM}"
+  fi
+  return 0
+}
 
-  [ -z "$target" ] && die "cleanup-branches: --repo, --org or --user is required"
+# cmd_cleanup_branches_to_tsv — stdin: rows. stdout: the list file format,
+# "repo<TAB>branch<TAB>sha<TAB>verdict<TAB>reason", one branch per line.
+cmd_cleanup_branches_to_tsv() {
+  jq -r '.[] | [.repo, .branch, .sha, .verdict, .reason] | @tsv'
+}
 
+# cmd_cleanup_branches_reverify <list-file> <set> — stdin: freshly classified
+# rows. stdout: {keep: [rows], skip: [[target, reason]]}. A listed branch is
+# kept only if it still points at the listed commit AND is still in <set>.
+# Lines starting with # are comments; a branch name may itself contain one.
+cmd_cleanup_branches_reverify() {
+  jq -c --rawfile list "$1" --arg set "$2" '
+    ($set | split(" ")) as $s
+    | . as $rows
+    | [ $list | gsub("\r"; "") | split("\n")[]
+        | select(length > 0 and (startswith("#") | not))
+        | split("\t") | select(length >= 3)
+        | {repo: .[0], branch: .[1], sha: .[2]} ] | unique_by([.repo, .branch])
+    | reduce .[] as $w ({keep: [], skip: []};
+        ([ $rows[] | select(.repo == $w.repo and .branch == $w.branch) ] | first) as $c
+        | "\($w.repo):\($w.branch)" as $t
+        | if $c == null then .skip += [[$t, "branch gone or excluded since the dry run"]]
+          elif $c.sha != $w.sha then .skip += [[$t, "changed since the dry run"]]
+          elif ($c.verdict as $v | $s | any(. == $v) | not) then
+            .skip += [[$t, "now \($c.verdict): \($c.reason)"]]
+          else .keep += [$c] end)'
+}
+
+cmd_cleanup_branches_main() {
+  cmd_cleanup_branches_parse_args "$@"
   preflight_check
+  skip_init
+  BRANCHES_CMD="cleanup-branches"
 
-  echo -e "${BOLD}${CYAN}Cleanup Branches${NC} ${DIM}v${VERSION}${NC}"
-  echo -e "${DIM}─────────────────────────────────────────────${NC}"
-  echo -e "  Target: ${BOLD}${target}${NC}"
-  echo -e "  Mode:   ${BOLD}${mode}${NC}"
-  if $dry_run; then
-    echo -e "  Run:    ${YELLOW}DRY RUN${NC}"
+  local owner="" cutoff="" set
+  if [ -z "$CLEANUP_BRANCHES_REPO" ] && [ -z "$CLEANUP_BRANCHES_FROM" ]; then
+    if [ -n "$CLEANUP_BRANCHES_TARGET" ]; then owner="$CLEANUP_BRANCHES_TARGET"; else owner=$(get_username); fi
   fi
+  if [ -n "$CLEANUP_BRANCHES_STALE_DAYS" ]; then
+    cutoff=$(cutoff_date "$CLEANUP_BRANCHES_STALE_DAYS" days)
+  fi
+  set=$(cmd_branches_deletable_set "$CLEANUP_BRANCHES_STRICT" "$CLEANUP_BRANCHES_STALE_DAYS")
+
+  header "Cleanup Branches"
+  if [ -n "$CLEANUP_BRANCHES_FROM" ]; then
+    echo -e "  From:    ${BOLD}${CLEANUP_BRANCHES_FROM}${NC} ${DIM}(every branch re-checked)${NC}"
+  elif [ -n "$CLEANUP_BRANCHES_REPO" ]; then
+    echo -e "  Repo:    ${BOLD}${CLEANUP_BRANCHES_REPO}${NC}"
+  else
+    echo -e "  Owner:   ${BOLD}${owner}${NC} ${DIM}(non-archived source repos)${NC}"
+  fi
+  echo -e "  Delete:  ${BOLD}${set// /, }${NC}"
+  [ -n "$cutoff" ] && echo -e "  Stale:   before ${BOLD}${cutoff%%T*}${NC}"
+  [ -n "$CLEANUP_BRANCHES_EXCLUDE" ] && echo -e "  Exclude: ${BOLD}${CLEANUP_BRANCHES_EXCLUDE}${NC}"
+  $DRY_RUN && echo -e "  Mode:    ${YELLOW}DRY RUN${NC}"
   echo ""
 
-  if [ "$target_type" = "repo" ]; then
-    echo -e "  ${BOLD}${target}${NC}"
-    cmd_cleanup_branches_for_repo "$target" "$mode" "$stale_days" "$exclude" "$dry_run"
+  # ── Scan ───────────────────────────────────────────────────────────────────
+  local repos classified rows r
+  repos=$(tmp_new); classified=$(tmp_new)
+  if [ -n "$CLEANUP_BRANCHES_FROM" ]; then
+    # Only the repositories named in the list, and each one scanned afresh.
+    while IFS= read -r r; do
+      [ -n "$r" ] && cmd_branches_lookup_repo "$r" "$repos"
+    done < <(awk -F'\t' '!/^#/ && NF >= 3 {print $1}' "$CLEANUP_BRANCHES_FROM" | tr -d '\r' | sort -u)
   else
-    local repos_json
-    repos_json=$(gh repo list "$target" --json nameWithOwner --source --no-archived --limit 9999 2>/dev/null) || die "Failed to list repos"
+    cmd_branches_resolve_repos "$owner" "$CLEANUP_BRANCHES_REPO" "$CLEANUP_BRANCHES_LIMIT" "$repos"
+  fi
+  if [ "$(count_lines "$repos")" -eq 0 ]; then
+    echo -e "${GREEN}No repositories to scan.${NC}"
+    print_skips
+    exit 0
+  fi
+  cmd_branches_scan "$repos" "$cutoff" "$classified"
+  rows=$(cmd_branches_filter_exclude "$CLEANUP_BRANCHES_EXCLUDE" < "$classified")
 
-    local total
-    total=$(echo "$repos_json" | jq 'length')
-    echo -e "Scanning ${BOLD}${total}${NC} repos..."
+  # ── Candidates ─────────────────────────────────────────────────────────────
+  local cand target reason
+  if [ -n "$CLEANUP_BRANCHES_FROM" ]; then
+    local checked
+    checked=$(printf '%s' "$rows" | cmd_cleanup_branches_reverify "$CLEANUP_BRANCHES_FROM" "$set")
+    while IFS=$'\t' read -r target reason; do
+      [ -n "$target" ] && skip_note "$target" "$reason"
+    done < <(printf '%s' "$checked" | jq -r '.skip[] | @tsv')
+    cand=$(printf '%s' "$checked" | jq -c '.keep' | cmd_branches_sort)
+  else
+    cand=$(printf '%s' "$rows" | cmd_branches_select "$set" | cmd_branches_sort)
+  fi
+
+  local n_cand n_repos n_kept
+  n_cand=$(printf '%s' "$cand" | jq 'length')
+  n_repos=$(printf '%s' "$cand" | jq '[.[].repo] | unique | length')
+  n_kept=$(( $(printf '%s' "$rows" | jq 'length') - n_cand ))
+  echo ""
+  if [ "$n_cand" -eq 0 ]; then
+    echo -e "${GREEN}Nothing to clean up — no branch is deletable.${NC}"
+    [ "$n_kept" -gt 0 ] && echo -e "  ${DIM}${n_kept} branch(es) kept — see github-helpers branches${NC}"
+    print_skips
+    exit 0
+  fi
+
+  cmd_branches_render_text "$cand" "$set"
+  [ "$n_kept" -gt 0 ] && [ -z "$CLEANUP_BRANCHES_FROM" ] \
+    && echo -e "  ${DIM}${n_kept} other branch(es) kept — see github-helpers branches${NC}"
+
+  if $DRY_RUN; then
+    {
+      echo "# github-helpers cleanup-branches — delete the lines of the branches to keep, then run:"
+      echo "#   github-helpers cleanup-branches --from ${CLEANUP_BRANCHES_OUT}"
+      echo "# Each branch is re-checked first; one that moved since this list is skipped."
+      printf '# repo\tbranch\tsha\tverdict\treason\n'
+      printf '%s' "$cand" | cmd_cleanup_branches_to_tsv
+    } > "$CLEANUP_BRANCHES_OUT"
     echo ""
-
-    echo "$repos_json" | jq -r '.[].nameWithOwner' | while IFS= read -r nwo; do
-      echo -e "  ${BOLD}${nwo}${NC}"
-      cmd_cleanup_branches_for_repo "$nwo" "$mode" "$stale_days" "$exclude" "$dry_run"
-    done
+    echo -e "${YELLOW}DRY RUN — no branches were deleted.${NC}"
+    echo -e "List saved to: ${BOLD}${CLEANUP_BRANCHES_OUT}${NC}"
+    echo -e "Review it, then run:"
+    echo -e "  ${BOLD}github-helpers cleanup-branches --from ${CLEANUP_BRANCHES_OUT}${NC}"
+    print_skips
+    exit 0
   fi
 
   echo ""
-  if $dry_run; then
-    echo -e "${YELLOW}DRY RUN — no branches were deleted.${NC}"
-  else
-    echo -e "${GREEN}Done!${NC}"
+  if ! confirm "Delete ${n_cand} branch(es) across ${n_repos} repo(s)?"; then
+    echo "Cancelled."
+    print_skips
+    exit 0
   fi
+
+  # ── Deletion ───────────────────────────────────────────────────────────────
+  local list repo branch sha verdict path deleted=0 failed=0
+  list=$(tmp_new)
+  printf '%s' "$cand" | cmd_cleanup_branches_to_tsv > "$list"
+  while IFS=$'\t' read -r repo branch sha verdict reason; do
+    [ -z "$repo" ] && continue
+    path=$(cmd_branches_ref_path "$branch")
+    # A 403/422 (ruleset, missing permission) is a skip, not an abort.
+    if gh_api_try "${repo}:${branch}" --method DELETE "repos/${repo}/git/refs/heads/${path}" >/dev/null </dev/null; then
+      deleted=$((deleted + 1))
+      echo -e "  ${GREEN}DELETED${NC}  ${repo}  ${branch}  ${DIM}${sha}${NC}"
+    else
+      failed=$((failed + 1))
+      echo -e "  ${RED}FAILED${NC}   ${repo}  ${branch}"
+    fi
+  done < "$list"
+
+  echo ""
+  echo -e "${GREEN}Done!${NC} Deleted: ${BOLD}${deleted}${NC}, Failed: ${BOLD}${failed}${NC}"
+  if [ "$deleted" -gt 0 ]; then
+    echo -e "  ${DIM}Deleted by mistake? Restore it from the SHA above:${NC}"
+    echo -e "  ${DIM}gh api repos/OWNER/REPO/git/refs -f ref=refs/heads/BRANCH -f sha=SHA${NC}"
+  fi
+  print_skips
 }
 
 # =============================================================================
