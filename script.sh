@@ -11,7 +11,7 @@ set -euo pipefail
 #   Audit & visibility: repo-audit (audit), stats, workflow-status (ci),
 #     secret-audit, license-check, vulnerability-check, branch-protection,
 #     webhook-audit, collaborator-audit, activity-report, traffic, org-audit,
-#     follow-audit (follow), inbox (recap)
+#     follow-audit (follow), inbox (recap), branches (branch-status)
 #   Bulk operations: clone-org, bulk-topic, sync-labels, export-stars,
 #     rename-default-branch, dependabot-enable, mirror, bulk-settings,
 #     repo-template, bulk-merge, backup
@@ -458,6 +458,7 @@ ${BOLD}COMMANDS${NC}
   activity-report     Generate activity summary for a period
   traffic             Snapshot repo views and clones (14-day window)
   inbox               What is waiting on you: replies, reviews, new issues
+  branches            Open branches, ahead/behind the default branch
 
   ${BOLD}Bulk operations${NC}
   clone-org           Clone all repos from a GitHub org or user
@@ -2354,6 +2355,480 @@ cmd_bulk_topic_main() {
 
   echo ""
   echo -e "${GREEN}Done!${NC} Success: ${BOLD}${success}${NC}, Failed: ${BOLD}${fail}${NC}"
+}
+
+# =============================================================================
+# COMMAND: branches
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+BRANCHES_TARGET=""
+BRANCHES_TARGET_FLAG=""
+BRANCHES_REPO=""
+BRANCHES_STALE_DAYS=""
+BRANCHES_EXCLUDE=""
+BRANCHES_LIMIT=1000
+BRANCHES_FORMAT="text"
+BRANCHES_OUTPUT=""
+BRANCHES_BATCH=10
+BRANCHES_CMD="branches"   # prefix for messages; cleanup-branches shares the scan
+
+cmd_branches_usage() {
+  cat <<EOF
+${BOLD}github-helpers branches${NC} ${DIM}v${VERSION}${NC} — Open branches and their distance to the default branch
+                                        ${DIM}(alias: github-helpers branch-status)${NC}
+
+${BOLD}USAGE${NC}
+  github-helpers branches [options]
+
+${BOLD}SCOPE${NC} ${DIM}(default: your non-archived source repos)${NC}
+  --user NAME             Scan this user's repos instead of yours
+  --org NAME              Scan an organization's repos
+  --repo OWNER/NAME       Only this repository
+  --exclude REGEX         Hide branches whose name matches REGEX
+  --limit N               Max repos to scan (default: 1000)
+
+${BOLD}VERDICTS${NC} ${DIM}(first match wins)${NC}
+  PROTECTED               Covered by a branch protection rule
+  OPEN_PR                 Head or base of an open pull request
+  UNKNOWN                 Could not be compared or verified
+  MERGED                  No commit ahead of the default branch
+  PR_MERGED               Last PR merged, branch unchanged since ${DIM}(squash/rebase merge)${NC}
+  PR_CLOSED               Last PR closed unmerged, branch unchanged since
+  STALE                   No commit in --stale-days N days
+  ACTIVE                  Everything else
+  --stale-days N          Label branches untouched for N days as STALE
+
+${BOLD}OUTPUT${NC}
+  --format FORMAT         text, json, csv or md (default: text)
+  --output FILE           Write the report to FILE
+  -v, --verbose           Show skipped repositories
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers branches
+  github-helpers branches --org my-company --stale-days 90
+  github-helpers branch-status --repo maxgfr/github-helpers
+  github-helpers branches --format json | jq '.[] | select(.behind > 50)'
+
+${BOLD}NOTE${NC}
+  One GraphQL request per ${BRANCHES_BATCH} repositories. ↑ counts commits ahead of the
+  default branch, ↓ commits behind. MERGED, PR_MERGED and PR_CLOSED (plus STALE
+  with --stale-days) are what ${BOLD}github-helpers cleanup-branches${NC} deletes.
+EOF
+  exit 0
+}
+
+cmd_branches_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)       need_arg "--user" "${2:-}"; BRANCHES_TARGET="$2"; BRANCHES_TARGET_FLAG="--user"; shift 2 ;;
+      --org)        need_arg "--org" "${2:-}"; BRANCHES_TARGET="$2"; BRANCHES_TARGET_FLAG="--org"; shift 2 ;;
+      --repo)       need_arg "--repo" "${2:-}"; BRANCHES_REPO="$2"; shift 2 ;;
+      --stale-days) need_arg "--stale-days" "${2:-}"; BRANCHES_STALE_DAYS="$2"; shift 2 ;;
+      --exclude)    need_arg "--exclude" "${2:-}"; BRANCHES_EXCLUDE="$2"; shift 2 ;;
+      --limit)      need_arg "--limit" "${2:-}"; BRANCHES_LIMIT="$2"; shift 2 ;;
+      --format)     need_arg "--format" "${2:-}"; BRANCHES_FORMAT="$2"; shift 2 ;;
+      --output)     need_arg "--output" "${2:-}"; BRANCHES_OUTPUT="$2"; shift 2 ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)    cmd_branches_usage ;;
+      *) die "branches: unknown option: $1" ;;
+    esac
+  done
+  case "$BRANCHES_FORMAT" in text|json|csv|md) ;; *) die "branches: invalid --format '${BRANCHES_FORMAT}' (use text, json, csv or md)" ;; esac
+  cmd_branches_validate branches "$BRANCHES_REPO" "$BRANCHES_STALE_DAYS" "$BRANCHES_EXCLUDE" "$BRANCHES_LIMIT"
+}
+
+# cmd_branches_validate <cmd> <repo> <stale-days> <exclude> <limit> — the scope
+# flags branches and cleanup-branches have in common.
+cmd_branches_validate() {
+  if [ -n "$2" ] && ! [[ "$2" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]]; then
+    die "$1: --repo must be OWNER/NAME"
+  fi
+  if [ -n "$3" ] && { ! [[ "$3" =~ ^[0-9]+$ ]] || [ "$3" -eq 0 ]; }; then
+    die "$1: --stale-days must be a positive whole number"
+  fi
+  if [ -n "$4" ] && ! jq -n --arg re "$4" '"" | test($re)' >/dev/null 2>&1; then
+    die "$1: --exclude is not a valid regular expression: $4"
+  fi
+  if ! [[ "$5" =~ ^[0-9]+$ ]] || [ "$5" -eq 0 ]; then
+    die "$1: --limit must be a positive whole number"
+  fi
+  return 0
+}
+
+# ── Repositories ─────────────────────────────────────────────────────────────
+# cmd_branches_list_repos <owner> <limit> <out> — appends "nwo<TAB>default".
+# Calls gh directly because list_repos fixes --json to nameWithOwner. Empty
+# repositories have no default branch to compare against and are left out.
+cmd_branches_list_repos() {
+  local owner="$1" limit="$2" out="$3" json
+  json=$(gh repo list "$owner" --json nameWithOwner,defaultBranchRef \
+           --source --no-archived --limit "$limit" 2>/dev/null) \
+    || die "${BRANCHES_CMD}: failed to list repos for ${owner}"
+  if [ "$(printf '%s' "$json" | jq 'length')" -ge "$limit" ]; then
+    warn "${BRANCHES_CMD}: limited to ${limit} repos — raise it with --limit"
+  fi
+  printf '%s' "$json" | jq -r '.[] | select(.defaultBranchRef.name != null)
+    | [.nameWithOwner, .defaultBranchRef.name] | @tsv' >> "$out"
+}
+
+# cmd_branches_lookup_repo <nwo> <out> — one repository (--repo, --from).
+cmd_branches_lookup_repo() {
+  local def
+  def=$(gh_api_try "$1" "repos/$1" --jq '.default_branch // empty' </dev/null) || return 0
+  if [ -z "$def" ]; then
+    skip_note "$1" "empty repository"
+    return 0
+  fi
+  printf '%s\t%s\n' "$1" "$def" >> "$2"
+}
+
+# ── Batched GraphQL probe ────────────────────────────────────────────────────
+# Same pattern as cmd_cleanup_forks_build_batch_query: one aliased document
+# for N repos, names passed as GraphQL variables, results returned through
+# globals because a command substitution would drop them.
+BR_QUERY=""
+BR_GQL_ARGS=()
+BR_BATCH_META=""
+cmd_branches_build_batch_query() {
+  local i=0 decls="" body="" meta="" entry nwo def
+  BR_GQL_ARGS=()
+  for entry in "$@"; do
+    IFS=$'\t' read -r nwo def <<< "$entry"
+    decls="${decls}\$o${i}: String!, \$n${i}: String!, \$h${i}: String!, "
+    BR_GQL_ARGS+=("-f" "o${i}=${nwo%%/*}" "-f" "n${i}=${nwo#*/}" "-f" "h${i}=${def}")
+    body="${body}
+  r${i}: repository(owner: \$o${i}, name: \$n${i}) {
+    nameWithOwner
+    pullRequests(states: OPEN, first: 100) {
+      totalCount
+      nodes { number url headRefName baseRefName headRepository { nameWithOwner } }
+    }
+    refs(refPrefix: \"refs/heads/\", first: 100) {
+      totalCount
+      nodes {
+        name
+        branchProtectionRule { pattern }
+        target { ... on Commit { oid committedDate author { user { login } } } }
+        compare(headRef: \$h${i}) { aheadBy behindBy }
+        associatedPullRequests(first: 1, orderBy: {field: UPDATED_AT, direction: DESC}) {
+          nodes { number url state headRefOid }
+        }
+      }
+    }
+  }"
+    meta="${meta}$(jq -nc --arg k "r${i}" --arg nwo "$nwo" --arg def "$def" \
+      '{key:$k, value:{nwo:$nwo, default:$def}}')"$'\n'
+    i=$((i + 1))
+  done
+  decls="${decls%, }"
+  BR_BATCH_META=$(printf '%s' "$meta" | jq -sc 'from_entries')
+  BR_QUERY=$(printf 'query(%s) {%s\n}\n' "$decls" "$body")
+}
+
+# cmd_branches_probe_batch <out> <"nwo<TAB>default">... — appends one JSON
+# repository object per line to <out>, with its default branch as .default.
+# A repository that did not fully resolve is skip_note'd and left out, so none
+# of its branches is ever classified, let alone deleted. An error under
+# compare() only nulls that comparison, which the classifier reads as UNKNOWN.
+cmd_branches_probe_batch() {
+  local out="$1"; shift
+  local result="" entry tag a b
+  cmd_branches_build_batch_query "$@"
+  result=$(gh_api_retry graphql -f query="$BR_QUERY" "${BR_GQL_ARGS[@]}" 2>/dev/null </dev/null) || true
+
+  if ! printf '%s' "$result" | jq -e '.data | type == "object"' >/dev/null 2>&1; then
+    # Total failure. One slow repository can time the whole batch out, so
+    # retry them one by one before giving up on any.
+    if [ "$#" -gt 1 ]; then
+      for entry in "$@"; do cmd_branches_probe_batch "$out" "$entry"; done
+    else
+      skip_note "${1%%$'\t'*}" "API error: $(printf '%s' "$result" \
+        | jq -r '(.errors[0].message // "request failed") | .[0:100]' 2>/dev/null || echo "request failed")"
+    fi
+    return 0
+  fi
+
+  while IFS=$'\t' read -r tag a b; do
+    case "$tag" in
+      REPO) printf '%s\n' "$a" >> "$out" ;;
+      SKIP) skip_note "$a" "$b" ;;
+      WARN) warn "$a" ;;
+    esac
+  done < <(printf '%s' "$result" | jq -r --argjson meta "$BR_BATCH_META" '
+    def clean: gsub("[\t\r\n]+"; " ");
+    (.errors // []) as $errs | .data as $d
+    | $meta | to_entries[] | .key as $k | .value as $m
+    | ([ $errs[] | select(.path != null and .path[0] == $k
+                          and (.path | any(. == "compare") | not)) ] | first) as $err
+    | if $d[$k] == null or $err != null then
+        "SKIP\t\($m.nwo)\t\(($err.message // "not found or no access") | clean | .[0:100])"
+      else
+        ($d[$k] + {default: $m.default}) as $r
+        | "REPO\t\($r | tojson)",
+          (if ($r.refs.totalCount // 0) > 100
+           then "WARN\t\($m.nwo): \($r.refs.totalCount) branches, only the first 100 are listed" else empty end),
+          (if ($r.pullRequests.totalCount // 0) > 100
+           then "WARN\t\($m.nwo): over 100 open PRs, none of its branches will be deleted" else empty end)
+      end')
+}
+
+# ── Classification (pure) ────────────────────────────────────────────────────
+# cmd_branches_classify <stale-cutoff-iso-or-empty>
+# stdin: JSON array of repository objects as cmd_branches_probe_batch writes
+# them. stdout: JSON array, one flat object per branch other than the default:
+# {repo, default_branch, branch, ahead, behind, sha, last_commit, age_days,
+#  author, pr, pr_state, pr_url, verdict, reason}.
+# Fail safe: the first three verdicts are checked first and can never be
+# deleted; a deletable verdict is only reached once every input is resolved.
+cmd_branches_classify() {
+  jq -c --arg cutoff "${1:-}" '
+    # NOTE: compare() is evaluated FROM the branch, so the names are inverted:
+    #   compare.behindBy == commits the branch has that the default lacks  <- "ahead"
+    #   compare.aheadBy  == commits the default has that the branch lacks  <- "behind"
+    # Same verified inversion as in cmd_cleanup_forks_probe_batch.
+    [ .[] | select(. != null) | . as $r
+      | ($r.pullRequests == null
+         or ($r.pullRequests.totalCount // 0) > (($r.pullRequests.nodes // []) | length)) as $prs_partial
+      | [ ($r.pullRequests.nodes // [])[] | select(. != null) ] as $open
+      | ($r.refs.nodes // [])[] | select(. != null and .name != $r.default) | . as $b
+      | ($b.target.oid // null) as $sha
+      | ($b.target.committedDate // null) as $date
+      | ($b.compare.behindBy // null) as $ahead
+      | ($b.compare.aheadBy // null) as $behind
+      | ([ $open[] | select(.headRefName == $b.name
+             and (.headRepository.nameWithOwner // "") == $r.nameWithOwner) ] | first) as $head_of
+      | ([ $open[] | select(.baseRefName == $b.name) ] | first) as $base_of
+      | ((($b.associatedPullRequests.nodes // []) | first) // null) as $last
+      | ($last != null and $sha != null and $last.headRefOid == $sha) as $unmoved
+      | (if $b.branchProtectionRule != null then
+           ["PROTECTED", "protection rule \($b.branchProtectionRule.pattern)"]
+         elif $head_of != null then ["OPEN_PR", "head of open PR #\($head_of.number)"]
+         elif $base_of != null then ["OPEN_PR", "base of open PR #\($base_of.number)"]
+         elif $prs_partial then ["UNKNOWN", "open PRs not fully listed"]
+         elif $sha == null or $date == null then ["UNKNOWN", "branch commit unreadable"]
+         elif $ahead == null or $behind == null then ["UNKNOWN", "no comparison with \($r.default)"]
+         elif $ahead == 0 then ["MERGED", "no commit ahead of \($r.default)"]
+         elif $unmoved and $last.state == "MERGED" then
+           ["PR_MERGED", "PR #\($last.number) merged, branch unchanged since"]
+         elif $unmoved and $last.state == "CLOSED" then
+           ["PR_CLOSED", "PR #\($last.number) closed unmerged, branch unchanged since"]
+         elif $cutoff != "" and $date < $cutoff then ["STALE", "no commit since \($date[0:10])"]
+         elif $last != null and $last.state == "MERGED" then
+           ["ACTIVE", "commits pushed after PR #\($last.number) was merged"]
+         else ["ACTIVE", "\($ahead) commit(s) ahead"]
+         end) as $v
+      | ($head_of // $base_of) as $open_pr
+      | ($open_pr // $last) as $pr
+      | { repo: $r.nameWithOwner,
+          default_branch: $r.default,
+          branch: $b.name,
+          ahead: $ahead,
+          behind: $behind,
+          sha: $sha,
+          last_commit: $date,
+          age_days: (if $date == null then null
+                     else (try (((now - ($date | fromdateiso8601)) / 86400) | floor) catch null) end),
+          author: ($b.target.author.user.login // null),
+          pr: ($pr.number // null),
+          pr_state: (if $open_pr != null then "open"
+                     elif $last != null then ($last.state | ascii_downcase) else null end),
+          pr_url: ($pr.url // null),
+          verdict: $v[0],
+          reason: $v[1] } ]'
+}
+
+# cmd_branches_deletable_set <strict:true|false> <stale-days-or-empty>
+# The verdicts cleanup-branches deletes, space-separated.
+cmd_branches_deletable_set() {
+  local set="MERGED PR_MERGED PR_CLOSED"
+  [ "$1" = "true" ] && set="MERGED"
+  [ -n "${2:-}" ] && set="${set} STALE"
+  printf '%s' "$set"
+}
+
+# cmd_branches_select <set> — stdin: classified rows. stdout: those whose
+# verdict is in <set>.
+cmd_branches_select() {
+  jq -c --arg set "$1" '($set | split(" ")) as $s | map(select(.verdict as $v | $s | any(. == $v)))'
+}
+
+# cmd_branches_filter_exclude <regex-or-empty> — stdin/stdout: rows.
+cmd_branches_filter_exclude() {
+  jq -c --arg re "$1" 'if $re == "" then . else map(select(.branch | test($re) | not)) end'
+}
+
+# cmd_branches_sort — grouped by repo, most recent commit first.
+cmd_branches_sort() {
+  jq -c 'group_by(.repo) | map(sort_by(.last_commit // "") | reverse) | add // []'
+}
+
+# cmd_branches_ref_path <branch> — URL-encode each path segment, keep the
+# slashes: DELETE repos/R/git/refs/heads/feat/a%23b.
+cmd_branches_ref_path() {
+  jq -rn --arg b "$1" '$b | split("/") | map(@uri) | join("/")'
+}
+
+# ── Scan ─────────────────────────────────────────────────────────────────────
+# cmd_branches_resolve_repos <owner> <repo-or-empty> <limit> <out>
+cmd_branches_resolve_repos() {
+  if [ -n "$2" ]; then
+    cmd_branches_lookup_repo "$2" "$4"
+  else
+    cmd_branches_list_repos "$1" "$3" "$4"
+  fi
+}
+
+# cmd_branches_scan <repos-tsv> <cutoff> <out> — probes every repository and
+# writes the classified rows (one JSON array) to <out>.
+cmd_branches_scan() {
+  local repos="$1" cutoff="$2" out="$3" raw n done_n=0 entry
+  local -a batch=()
+  raw=$(tmp_new)
+  n=$(count_lines "$repos")
+  echo -e "  ${DIM}Scanning ${n} repo(s), ${BRANCHES_BATCH} per request...${NC}" >&2
+  while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    batch+=("$entry")
+    if [ "${#batch[@]}" -ge "$BRANCHES_BATCH" ]; then
+      cmd_branches_probe_batch "$raw" "${batch[@]}"
+      done_n=$((done_n + ${#batch[@]}))
+      $VERBOSE && echo -e "  ${DIM}${done_n}/${n}${NC}" >&2
+      batch=()
+    fi
+  done < "$repos"
+  if [ "${#batch[@]}" -gt 0 ]; then
+    cmd_branches_probe_batch "$raw" "${batch[@]}"
+  fi
+  jq -s '.' "$raw" | cmd_branches_classify "$cutoff" > "$out"
+}
+
+# ── Rendering ────────────────────────────────────────────────────────────────
+# cmd_branches_render_text <rows> <deletable-set> [hint] — grouped by repo.
+cmd_branches_render_text() {
+  local rows="$1" set="$2" hint="${3:-}" total width
+  total=$(printf '%s' "$rows" | jq 'length')
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No branches besides the default ones.${NC}"
+    return 0
+  fi
+
+  width=$(printf '%s' "$rows" | jq '[.[].branch | length] | max | if . > 40 then 40 elif . < 12 then 12 else . end')
+  local cur="" repo default branch ahead behind age pr verdict b_pad a_pad h_pad age_pad pr_pad color
+  while IFS=$'\t' read -r repo default branch ahead behind age pr verdict; do
+    if [ "$repo" != "$cur" ]; then
+      [ -n "$cur" ] && echo ""
+      echo -e "${BOLD}${repo}${NC}  ${DIM}(${default})${NC}"
+      cur="$repo"
+    fi
+    # Pad first, colour after: a colour code inside %-Ns breaks the column.
+    # Only ASCII goes through a padded conversion (printf counts bytes).
+    if [ "${#branch}" -gt "$width" ]; then
+      printf -v b_pad "%-$((width - 1))s…" "${branch:0:$((width - 1))}"
+    else
+      printf -v b_pad "%-${width}s" "$branch"
+    fi
+    printf -v a_pad   '%-4s' "$ahead"
+    printf -v h_pad   '%-5s' "$behind"
+    printf -v age_pad '%5s'  "${age}d"
+    printf -v pr_pad  '%-12s' "$pr"
+    [ "$pr" = "-" ] && pr_pad="—${pr_pad:1}"
+    case "$verdict" in
+      ACTIVE)    color="$GREEN" ;;
+      OPEN_PR)   color="$CYAN" ;;
+      PROTECTED) color="$DIM" ;;
+      UNKNOWN)   color="$RED" ;;
+      *)         color="$YELLOW" ;;
+    esac
+    printf '  %s  %s↑%s ↓%s%s %s  %s  %s%s%s\n' "$b_pad" "$DIM" "$a_pad" "$h_pad" "$NC" \
+      "$age_pad" "$pr_pad" "$color" "$verdict" "$NC"
+  done < <(printf '%s' "$rows" | jq -r '.[] | [
+      .repo, .default_branch, .branch,
+      (.ahead // "?" | tostring), (.behind // "?" | tostring), (.age_days // "?" | tostring),
+      (if .pr != null then "#\(.pr) \(.pr_state)" else "-" end), .verdict ] | @tsv')
+
+  echo ""
+  hr
+  local summary cleanable
+  summary=$(printf '%s' "$rows" | jq -r --arg set "$set" '
+    def count(f): map(select(f)) | length;
+    . as $rows | ($set | split(" ")) as $s
+    | ([ "\($rows | count(.verdict == "ACTIVE")) active",
+         "\($rows | count(.verdict == "OPEN_PR")) open PR",
+         "\($rows | count(.verdict as $v | $s | any(. == $v))) cleanable",
+         "\($rows | count(.verdict == "PROTECTED")) protected",
+         "\($rows | count(.verdict == "UNKNOWN")) unknown" ]
+       | map(select(startswith("0 ") | not)) | join(" · ")) as $parts
+    | "\($rows | length) branch(es) in \([$rows[].repo] | unique | length) repo(s): \($parts)"')
+  echo -e "  ${summary}"
+  cleanable=$(printf '%s' "$rows" | cmd_branches_select "$set" | jq 'length')
+  if [ "$cleanable" -gt 0 ] && [ -n "$hint" ]; then
+    echo -e "  ${DIM}→${NC} ${BOLD}${hint}${NC}"
+  fi
+  return 0
+}
+
+cmd_branches_main() {
+  cmd_branches_parse_args "$@"
+  preflight_check
+  skip_init
+  BRANCHES_CMD="branches"
+
+  local owner cutoff="" set
+  if [ -n "$BRANCHES_TARGET" ]; then owner="$BRANCHES_TARGET"; else owner=$(get_username); fi
+  if [ -n "$BRANCHES_STALE_DAYS" ]; then cutoff=$(cutoff_date "$BRANCHES_STALE_DAYS" days); fi
+  set=$(cmd_branches_deletable_set false "$BRANCHES_STALE_DAYS")
+
+  {
+    header "Branches"
+    if [ -n "$BRANCHES_REPO" ]; then
+      echo -e "  Repo:    ${BOLD}${BRANCHES_REPO}${NC}"
+    else
+      echo -e "  Owner:   ${BOLD}${owner}${NC} ${DIM}(non-archived source repos)${NC}"
+    fi
+    [ -n "$cutoff" ] && echo -e "  Stale:   ${BOLD}${BRANCHES_STALE_DAYS}${NC} days (before ${cutoff%%T*})"
+    [ -n "$BRANCHES_EXCLUDE" ] && echo -e "  Exclude: ${BOLD}${BRANCHES_EXCLUDE}${NC}"
+    echo ""
+  } >&2
+
+  local repos classified rows
+  repos=$(tmp_new); classified=$(tmp_new)
+  cmd_branches_resolve_repos "$owner" "$BRANCHES_REPO" "$BRANCHES_LIMIT" "$repos"
+  if [ "$(count_lines "$repos")" -eq 0 ]; then
+    echo -e "${GREEN}No repositories to scan.${NC}" >&2
+    print_skips
+    return 0
+  fi
+  cmd_branches_scan "$repos" "$cutoff" "$classified"
+  echo "" >&2
+  rows=$(cmd_branches_filter_exclude "$BRANCHES_EXCLUDE" < "$classified" | cmd_branches_sort)
+
+  if [ "$BRANCHES_FORMAT" = "text" ]; then
+    local hint="github-helpers cleanup-branches" report
+    if [ -n "$BRANCHES_REPO" ]; then
+      hint="${hint} --repo ${BRANCHES_REPO}"
+    elif [ -n "$BRANCHES_TARGET" ]; then
+      hint="${hint} ${BRANCHES_TARGET_FLAG} ${BRANCHES_TARGET}"
+    fi
+    [ -n "$BRANCHES_STALE_DAYS" ] && hint="${hint} --stale-days ${BRANCHES_STALE_DAYS}"
+    [ -n "$BRANCHES_EXCLUDE" ] && hint="${hint} --exclude $(printf '%q' "$BRANCHES_EXCLUDE")"
+    hint="${hint} --dry-run"
+    report=$(cmd_branches_render_text "$rows" "$set" "$hint")
+    if [ -n "$BRANCHES_OUTPUT" ]; then
+      # Plain text in a file: strip the colour codes.
+      write_output "$BRANCHES_OUTPUT" "$(printf '%s\n' "$report" | sed $'s/\033\\[[0-9;]*m//g')"
+    else
+      printf '%s\n' "$report"
+    fi
+  elif [ "$(printf '%s' "$rows" | jq 'length')" -eq 0 ] && [ "$BRANCHES_FORMAT" != "json" ]; then
+    echo -e "${GREEN}No branches besides the default ones.${NC}" >&2
+  else
+    write_output "$BRANCHES_OUTPUT" "$(render_rows "$BRANCHES_FORMAT" "$rows")"
+  fi
+
+  print_skips
+  return 0
 }
 
 # =============================================================================
@@ -9467,6 +9942,7 @@ main() {
     pr-cleanup)            cmd_pr_cleanup_main "$@" ;;
     activity-report)       cmd_activity_report_main "$@" ;;
     inbox|recap)           cmd_inbox_main "$@" ;;
+    branches|branch-status) cmd_branches_main "$@" ;;
     version|-V|--version)  echo "github-helpers v${VERSION}" ;;
     help|-h|--help)        usage ;;
     *)
