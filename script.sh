@@ -208,6 +208,9 @@ scope_hint() {
 }
 
 print_skips() {
+  # skip_note often runs inside $(…), where the increment dies with the
+  # subshell. The log file survives, so it is the source of truth.
+  [ -n "$SKIP_LOG" ] && SKIP_COUNT=$(count_lines "$SKIP_LOG")
   [ "${SKIP_COUNT:-0}" -eq 0 ] && return 0
   echo -e "  ${YELLOW}Skipped: ${BOLD}${SKIP_COUNT}${NC}" >&2
   cut -f2 "$SKIP_LOG" | sort | uniq -c | sort -rn | while read -r n reason; do
@@ -281,6 +284,7 @@ gh_api_try() {
     *"HTTP 403"*|*Forbidden*)   reason="forbidden - missing scope or permission (403)" ;;
     *"HTTP 404"*|*"Not Found"*) reason="not found or no access (404)" ;;
     *"HTTP 410"*)               reason="feature disabled (410)" ;;
+    *"HTTP 422"*)               reason="rejected (422) - ruleset or validation" ;;
     *"HTTP 5"*)                 reason="GitHub server error" ;;
     *)                          reason="request failed" ;;
   esac
