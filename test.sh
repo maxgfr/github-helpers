@@ -696,6 +696,187 @@ rm -rf "$state_dir"
 unset XDG_STATE_HOME
 
 echo ""
+
+# ── 15. branches: classifier, selection, --from round trip ──────────────────
+echo -e "${BOLD}15. branches classifier and cleanup-branches review loop${NC}"
+setup_env
+BOLDD="2026-01-01T00:00:00Z"   # older than the stale cutoff below
+BNEW="2026-09-20T00:00:00Z"
+BCUT="2026-06-01T00:00:00Z"
+# bref <name> <sha> <date> <compare.aheadBy> <compare.behindBy> [extra json]
+# compare() runs FROM the branch: behindBy is the branch's own commits.
+bref() {
+  jq -nc --arg n "$1" --arg s "$2" --arg d "$3" --argjson a "$4" --argjson b "$5" --argjson x "${6:-{\}}" '
+    { name: $n, branchProtectionRule: null,
+      target: {oid: $s, committedDate: $d, author: {user: {login: "me"}}},
+      compare: {aheadBy: $a, behindBy: $b},
+      associatedPullRequests: {nodes: []} } + $x'
+}
+# brepo <refs-json-array> [open-prs-json-array]
+brepo() {
+  jq -nc --argjson refs "$1" --argjson prs "${2:-[]}" '
+    { nameWithOwner: "me/r", default: "main",
+      pullRequests: {totalCount: ($prs | length), nodes: $prs},
+      refs: {totalCount: ($refs | length), nodes: $refs} }'
+}
+MAIN=$(bref main m0 "$BNEW" 0 0)
+# bclass <refs-json-array> [prs] [cutoff] -> "verdict" of the first non-default branch
+bclass() { printf '[%s]' "$(brepo "$1" "${2:-[]}")" | cmd_branches_classify "${3:-}" | jq -r '.[0].verdict'; }
+bfield() { printf '[%s]' "$(brepo "$1" "${2:-[]}")" | cmd_branches_classify "${4:-}" | jq -r ".[0].$3"; }
+MERGED_PR='{"associatedPullRequests":{"nodes":[{"number":7,"url":"u7","state":"MERGED","headRefOid":"s1"}]}}'
+CLOSED_PR='{"associatedPullRequests":{"nodes":[{"number":8,"url":"u8","state":"CLOSED","headRefOid":"s1"}]}}'
+
+one=$(printf '[%s]' "$(brepo "[$MAIN,$(bref feat s1 "$BNEW" 12 3)]")" | cmd_branches_classify "")
+assert_eq "the default branch is not listed" "1" "$(printf '%s' "$one" | jq length)"
+assert_eq "ahead is compare.behindBy (inverted)" "3" "$(printf '%s' "$one" | jq '.[0].ahead')"
+assert_eq "behind is compare.aheadBy (inverted)" "12" "$(printf '%s' "$one" | jq '.[0].behind')"
+assert_eq "rows carry the default branch" "main" "$(printf '%s' "$one" | jq -r '.[0].default_branch')"
+assert_eq "a branch with its own commits is ACTIVE" "ACTIVE" "$(printf '%s' "$one" | jq -r '.[0].verdict')"
+
+assert_eq "0 ahead is MERGED" "MERGED" "$(bclass "[$(bref old s1 "$BOLDD" 40 0)]")"
+assert_eq "a protection rule wins over everything" "PROTECTED" \
+  "$(bclass "[$(bref rel s1 "$BOLDD" 40 0 '{"branchProtectionRule":{"pattern":"rel*"}}')]")"
+assert_eq "head of an open PR is OPEN_PR" "OPEN_PR" \
+  "$(bclass "[$(bref feat s1 "$BOLDD" 4 0)]" '[{"number":3,"url":"u3","headRefName":"feat","baseRefName":"main","headRepository":{"nameWithOwner":"me/r"}}]')"
+assert_eq "base of an open PR is OPEN_PR, even at 0 ahead" "OPEN_PR" \
+  "$(bclass "[$(bref stack s1 "$BOLDD" 4 0)]" '[{"number":4,"url":"u4","headRefName":"other","baseRefName":"stack","headRepository":{"nameWithOwner":"me/r"}}]')"
+assert_eq "OPEN_PR reports the open PR" "#4 open" \
+  "$(printf '[%s]' "$(brepo "[$(bref stack s1 "$BOLDD" 4 0)]" '[{"number":4,"url":"u4","headRefName":"other","baseRefName":"stack","headRepository":{"nameWithOwner":"me/r"}}]')" \
+     | cmd_branches_classify "" | jq -r '"#\(.[0].pr) \(.[0].pr_state)"')"
+assert_eq "a fork PR with the same head name does not protect" "MERGED" \
+  "$(bclass "[$(bref feat s1 "$BOLDD" 4 0)]" '[{"number":5,"url":"u5","headRefName":"feat","baseRefName":"main","headRepository":{"nameWithOwner":"someone/r"}}]')"
+assert_eq "a null comparison is UNKNOWN" "UNKNOWN" \
+  "$(bclass "[$(bref odd s1 "$BOLDD" 0 0 '{"compare":null}')]")"
+assert_eq "a missing commit is UNKNOWN" "UNKNOWN" \
+  "$(bclass "[$(bref odd s1 "$BOLDD" 0 0 '{"target":null}')]")"
+assert_eq "more open PRs than listed makes every branch UNKNOWN" "UNKNOWN" \
+  "$(printf '[%s]' "$(brepo "[$(bref old s1 "$BOLDD" 40 0)]" | jq -c '.pullRequests.totalCount = 101')" | cmd_branches_classify "" | jq -r '.[0].verdict')"
+assert_eq "unreadable open PRs make every branch UNKNOWN" "UNKNOWN" \
+  "$(printf '[%s]' "$(brepo "[$(bref old s1 "$BOLDD" 40 0)]" | jq -c '.pullRequests = null')" | cmd_branches_classify "" | jq -r '.[0].verdict')"
+assert_eq "merged PR, branch unchanged: PR_MERGED (squash)" "PR_MERGED" \
+  "$(bclass "[$(bref sq s1 "$BNEW" 8 5 "$MERGED_PR")]")"
+assert_eq "merged PR, commits pushed since: ACTIVE" "ACTIVE" \
+  "$(bclass "[$(bref sq s2 "$BNEW" 8 5 "$MERGED_PR")]")"
+assert_eq "closed PR, branch unchanged: PR_CLOSED" "PR_CLOSED" \
+  "$(bclass "[$(bref cl s1 "$BNEW" 8 5 "$CLOSED_PR")]")"
+assert_eq "closed PR, commits pushed since: ACTIVE" "ACTIVE" \
+  "$(bclass "[$(bref cl s9 "$BNEW" 8 5 "$CLOSED_PR")]")"
+assert_eq "an old branch is ACTIVE without a cutoff" "ACTIVE" "$(bclass "[$(bref st s1 "$BOLDD" 8 5)]")"
+assert_eq "an old branch is STALE with a cutoff" "STALE" "$(bclass "[$(bref st s1 "$BOLDD" 8 5)]" '[]' "$BCUT")"
+assert_eq "a recent branch is not STALE" "ACTIVE" "$(bclass "[$(bref st s1 "$BNEW" 8 5)]" '[]' "$BCUT")"
+assert_eq "an open PR beats STALE" "OPEN_PR" \
+  "$(bclass "[$(bref st s1 "$BOLDD" 8 5)]" '[{"number":3,"url":"u3","headRefName":"st","baseRefName":"main","headRepository":{"nameWithOwner":"me/r"}}]' "$BCUT")"
+assert_eq "MERGED beats STALE" "MERGED" "$(bclass "[$(bref st s1 "$BOLDD" 8 0)]" '[]' "$BCUT")"
+assert_eq "PR_MERGED rows carry the PR" "7 merged" \
+  "$(printf '[%s]' "$(brepo "[$(bref sq s1 "$BNEW" 8 5 "$MERGED_PR")]")" | cmd_branches_classify "" | jq -r '"\(.[0].pr) \(.[0].pr_state)"')"
+
+# THE invariant: nothing unresolved or in use can be classified as deletable.
+bad=0
+for extra in '{"compare":null}' '{"target":null}' '{"branchProtectionRule":{"pattern":"*"}}'; do
+  for ap in '{}' "$MERGED_PR" "$CLOSED_PR"; do
+    x=$(jq -nc --argjson a "$extra" --argjson b "$ap" '$b + $a')
+    v=$(bclass "[$(bref b s1 "$BOLDD" 3 0 "$x")]" '[]' "$BCUT")
+    case "$v" in MERGED|PR_MERGED|PR_CLOSED|STALE) bad=$((bad + 1)) ;; esac
+  done
+done
+assert_eq "unresolved or protected branches are never deletable (9 cases)" "0" "$bad"
+
+# Selection
+assert_eq "default deletable set" "MERGED PR_MERGED PR_CLOSED" "$(cmd_branches_deletable_set false '')"
+assert_eq "--strict keeps MERGED only" "MERGED" "$(cmd_branches_deletable_set true '')"
+assert_eq "--stale-days adds STALE" "MERGED PR_MERGED PR_CLOSED STALE" "$(cmd_branches_deletable_set false 90)"
+assert_eq "--strict --stale-days" "MERGED STALE" "$(cmd_branches_deletable_set true 90)"
+SEL='[{"branch":"a","verdict":"MERGED"},{"branch":"b","verdict":"ACTIVE"},{"branch":"c","verdict":"PR_CLOSED"},{"branch":"release/1","verdict":"MERGED"}]'
+assert_eq "select keeps the set's verdicts" "a,c,release/1" \
+  "$(printf '%s' "$SEL" | cmd_branches_select "MERGED PR_CLOSED" | jq -r 'map(.branch) | join(",")')"
+assert_eq "--exclude drops matching branches" "a,b,c" \
+  "$(printf '%s' "$SEL" | cmd_branches_filter_exclude '^release/' | jq -r 'map(.branch) | join(",")')"
+assert_eq "an empty --exclude keeps everything" "4" "$(printf '%s' "$SEL" | cmd_branches_filter_exclude '' | jq length)"
+assert_eq "sort groups by repo, newest commit first" "x/a:new,x/a:old,x/b:mid" \
+  "$(printf '%s' '[{"repo":"x/b","branch":"mid","last_commit":"2026-02-01"},{"repo":"x/a","branch":"old","last_commit":"2026-01-01"},{"repo":"x/a","branch":"new","last_commit":"2026-03-01"}]' \
+     | cmd_branches_sort | jq -r 'map("\(.repo):\(.branch)") | join(",")')"
+
+# Ref path encoding
+assert_eq "ref path keeps slashes" "feat/foo" "$(cmd_branches_ref_path feat/foo)"
+assert_eq "ref path encodes # and spaces" "feat/a%23b/c%20d" "$(cmd_branches_ref_path 'feat/a#b/c d')"
+
+# Batch query: one alias per repo, names as variables, default branch as $h
+cmd_branches_build_batch_query $'me/a\tmain' $'org/b\tdevelop'
+assert_eq "branches batch has one alias per repo" "2" "$(printf '%s' "$BR_QUERY" | grep -c 'repository(owner:')"
+assert_eq "branches batch passes names as variables" \
+  "-f o0=me -f n0=a -f h0=main -f o1=org -f n1=b -f h1=develop" "${BR_GQL_ARGS[*]}"
+assert_match "branches batch meta keeps the default branch" '"r1":\{"nwo":"org/b","default":"develop"\}' "$BR_BATCH_META"
+
+# --from round trip: list -> re-verify
+ROWS=$(jq -nc '[
+  {repo:"me/r", branch:"feat/a#1", sha:"s1", verdict:"MERGED", reason:"no commit ahead of main"},
+  {repo:"me/r", branch:"moved", sha:"s2-new", verdict:"MERGED", reason:"no commit ahead of main"},
+  {repo:"me/r", branch:"reopened", sha:"s3", verdict:"OPEN_PR", reason:"head of open PR #9"}]')
+list_file=$(mktemp)
+{
+  echo "# comment line"
+  printf '%s' "$ROWS" | jq -c '[.[0], (.[1] | .sha = "s2-old"), (.[2] | .verdict = "MERGED")]' | cmd_cleanup_branches_to_tsv
+  printf 'me/r\tgone\ts4\tMERGED\tx\r\n'
+} > "$list_file"
+assert_eq "list file is one TSV line per branch" "me/r	feat/a#1	s1	MERGED	no commit ahead of main" "$(sed -n 2p "$list_file")"
+checked=$(printf '%s' "$ROWS" | cmd_cleanup_branches_reverify "$list_file" "MERGED PR_MERGED PR_CLOSED")
+assert_eq "an unchanged branch is kept (# in its name is not a comment)" "feat/a#1" "$(printf '%s' "$checked" | jq -r '.keep | map(.branch) | join(",")')"
+assert_eq "a branch whose SHA moved is skipped" "changed since the dry run" \
+  "$(printf '%s' "$checked" | jq -r '.skip[] | select(.[0] == "me/r:moved") | .[1]')"
+assert_match "a branch that got an open PR is skipped" '^now OPEN_PR' \
+  "$(printf '%s' "$checked" | jq -r '.skip[] | select(.[0] == "me/r:reopened") | .[1]')"
+assert_match "a branch that disappeared is skipped (CRLF tolerated)" 'gone' \
+  "$(printf '%s' "$checked" | jq -r '.skip[] | select(.[0] == "me/r:gone") | .[1]')"
+assert_eq "re-verify skips exactly the three changed branches" "3" "$(printf '%s' "$checked" | jq '.skip | length')"
+rm -f "$list_file"
+
+# Parsers
+br_reset() {
+  BRANCHES_TARGET="" BRANCHES_TARGET_FLAG="" BRANCHES_REPO="" BRANCHES_STALE_DAYS=""
+  BRANCHES_EXCLUDE="" BRANCHES_LIMIT=1000 BRANCHES_FORMAT="text" BRANCHES_OUTPUT=""
+  CLEANUP_BRANCHES_TARGET="" CLEANUP_BRANCHES_REPO="" CLEANUP_BRANCHES_STALE_DAYS=""
+  CLEANUP_BRANCHES_EXCLUDE="" CLEANUP_BRANCHES_STRICT=false CLEANUP_BRANCHES_FROM=""
+  CLEANUP_BRANCHES_OUT="cleanup-branches.txt" CLEANUP_BRANCHES_LIMIT=1000
+}
+br_reset
+cmd_branches_parse_args --org acme --stale-days 30 --format json
+assert_eq "branches --org sets the target" "acme --org" "${BRANCHES_TARGET} ${BRANCHES_TARGET_FLAG}"
+assert_eq "branches --stale-days parsed" "30" "$BRANCHES_STALE_DAYS"
+br_reset
+(cmd_branches_parse_args --stale-days abc) &>/dev/null && rc=0 || rc=1
+assert_exit_code "branches --stale-days rejects garbage" 1 $rc
+(cmd_branches_parse_args --stale-days 0) &>/dev/null && rc=0 || rc=1
+assert_exit_code "branches --stale-days rejects 0" 1 $rc
+(cmd_branches_parse_args --format nope) &>/dev/null && rc=0 || rc=1
+assert_exit_code "branches --format rejects an unknown format" 1 $rc
+(cmd_branches_parse_args --repo nope) &>/dev/null && rc=0 || rc=1
+assert_exit_code "branches --repo requires OWNER/NAME" 1 $rc
+(cmd_branches_parse_args --exclude '([') &>/dev/null && rc=0 || rc=1
+assert_exit_code "branches --exclude rejects an invalid regex" 1 $rc
+(cmd_branches_parse_args --limit 0) &>/dev/null && rc=0 || rc=1
+assert_exit_code "branches --limit rejects 0" 1 $rc
+br_reset
+cmd_cleanup_branches_parse_args --strict --stale-days 90 --merged --out x.txt
+assert_eq "cleanup-branches --strict/--stale-days/--out parsed" "true 90 x.txt" \
+  "${CLEANUP_BRANCHES_STRICT} ${CLEANUP_BRANCHES_STALE_DAYS} ${CLEANUP_BRANCHES_OUT}"
+br_reset
+(cmd_cleanup_branches_parse_args --stale-days abc) &>/dev/null && rc=0 || rc=1
+assert_exit_code "cleanup-branches --stale-days rejects garbage" 1 $rc
+(cmd_cleanup_branches_parse_args --from "/tmp/nonexistent-branches-$$") &>/dev/null && rc=0 || rc=1
+assert_exit_code "cleanup-branches --from rejects a missing file" 1 $rc
+(cmd_cleanup_branches_parse_args --repo nope) &>/dev/null && rc=0 || rc=1
+assert_exit_code "cleanup-branches --repo requires OWNER/NAME" 1 $rc
+br_reset
+setup_env
+
+# print_skips counts from the log: skip_note inside $(…) loses its increment.
+skip_init
+_=$(skip_note "a/b" "lost in a subshell")
+print_skips 2>/dev/null
+assert_eq "print_skips resyncs the count from the log" "1" "$SKIP_COUNT"
+SKIP_LOG="" SKIP_COUNT=0
+
+echo ""
 # ── 10. Script syntax check ─────────────────────────────────────────────────
 echo -e "${BOLD}10. Script integrity${NC}"
 

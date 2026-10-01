@@ -147,6 +147,12 @@ jobs:
       - name: Test recap alias (inbox) help
         run: ./script.sh recap --help
 
+      - name: Test branches help
+        run: ./script.sh branches --help
+
+      - name: Test branch-status alias (branches) help
+        run: ./script.sh branch-status --help
+
       - name: Test forks alias (cleanup-forks) help
         run: ./script.sh forks --help
 
@@ -249,6 +255,24 @@ jobs:
             # shellcheck disable=SC2086
             if ./script.sh inbox $args 2>/dev/null; then
               echo "inbox $args should have failed" && exit 1
+            fi
+          done
+
+      - name: Test branches rejects invalid arguments
+        run: |
+          for args in "--format nope" "--stale-days abc" "--repo nope" "--limit 0"; do
+            # shellcheck disable=SC2086
+            if ./script.sh branches $args 2>/dev/null; then
+              echo "branches $args should have failed" && exit 1
+            fi
+          done
+
+      - name: Test cleanup-branches rejects invalid arguments
+        run: |
+          for args in "--stale-days abc" "--from /nonexistent" "--repo nope"; do
+            # shellcheck disable=SC2086
+            if ./script.sh cleanup-branches $args 2>/dev/null; then
+              echo "cleanup-branches $args should have failed" && exit 1
             fi
           done
 

@@ -31,7 +31,7 @@ chmod +x /usr/local/bin/github-helpers
 | [`unstar`](#unstar--clean-up-your-github-stars) | Filter & bulk-unstar repos |
 | [`cleanup-forks`](#cleanup-forks--audit-forks-delete-only-the-inactive-ones) | Audit forks; delete only inactive ones |
 | [`sync-forks`](#sync-forks--update-your-forks-from-their-upstream) | Update your forks from their upstream |
-| [`cleanup-branches`](#cleanup-branches--delete-merged-or-stale-branches) | Delete merged/stale remote branches |
+| [`cleanup-branches`](#cleanup-branches--delete-merged-squash-merged-or-stale-branches) | Delete merged, squash-merged or stale branches |
 | [`archive-repos`](#archive-repos--archive-inactive-repos) | Batch archive inactive repos |
 | [`release-cleanup`](#release-cleanup--delete-old-releases) | Delete old releases, keep N latest |
 | [`pr-cleanup`](#pr-cleanup--find-and-close-abandoned-prs) | Close abandoned pull requests |
@@ -57,6 +57,7 @@ chmod +x /usr/local/bin/github-helpers
 | [`org-audit`](#org-audit--org-level-security-and-membership-posture) | Org security and membership posture |
 | [`follow-audit`](#follow-audit--who-follows-you-back-and-who-does-not) | Who follows you back, and who does not |
 | [`inbox`](#inbox--what-is-waiting-on-you-across-every-repo) | What is waiting on you: replies, reviews, new issues |
+| [`branches`](#branches--track-open-branches-across-your-repos) | Open branches, commits ahead/behind the default branch |
 | [`clone-org`](#clone-org--clone-all-repos-from-a-github-org-or-user) | Clone/pull all repos from an org or user |
 | [`bulk-topic`](#bulk-topic--add-or-remove-topics-in-batch) | Add/remove topics in batch |
 | [`sync-labels`](#sync-labels--sync-issue-labels-from-a-template-repo) | Sync issue labels across repos |
@@ -163,28 +164,57 @@ Reports `SYNCED` / `UP-TO-DATE` / `CONFLICT` / `SKIPPED` per fork. No confirmati
 `merge-upstream` only fast-forwards or merges **from** the upstream, so it never discards
 your work. Archived forks and orphans are skipped.
 
-#### `cleanup-branches` — Delete merged or stale branches
+#### `cleanup-branches` — Delete merged, squash-merged or stale branches
 
-Clean up remote branches across one or many repos.
+Built on the same scan as [`branches`](#branches--track-open-branches-across-your-repos), with
+the review-then-execute loop of `unstar` and `cleanup-forks`.
 
 ```bash
-# Merged branches on a single repo
-github-helpers cleanup-branches --repo maxgfr/my-repo --dry-run
+# preview every repo you own, review the list, then execute
+github-helpers cleanup-branches --dry-run
+vim cleanup-branches.txt          # delete the lines of the branches to keep
+github-helpers cleanup-branches --from cleanup-branches.txt
 
-# Stale branches (no commit in 90 days) across an org
-github-helpers cleanup-branches --org my-company --stale-days 90 --dry-run
+# one repo, only branches with no commit ahead of the default branch
+github-helpers cleanup-branches --repo maxgfr/my-repo --strict
 
-# Exclude release branches
-github-helpers cleanup-branches --user maxgfr --exclude "release|hotfix" --dry-run
+# also stale branches, never release/hotfix ones, across an org
+github-helpers cleanup-branches --org my-company --stale-days 90 --exclude "^(release|hotfix)/" --dry-run
 ```
+
+| Deleted | Condition |
+|---|---|
+| `MERGED` | No commit ahead of the default branch |
+| `PR_MERGED` | Its last PR was merged and the branch has not moved since (squash or rebase merge) |
+| `PR_CLOSED` | Its last PR was closed unmerged and the branch has not moved since |
+| `STALE` | Only with `--stale-days N`: no commit in N days |
+
+Never deleted: the default branch, protected branches, the head **or base** of an open pull
+request, and any branch that could not be fully verified (`UNKNOWN`). No branch of a repo
+with more than 100 open PRs is deleted.
 
 | Flag | Description |
 |---|---|
 | `--repo OWNER/REPO` | Single repository |
-| `--org NAME` / `--user NAME` | All repos in org or user |
-| `--merged` | Delete only merged branches (default) |
-| `--stale-days N` | Delete branches with no commits in N days |
-| `--exclude PATTERN` | Exclude branches matching regex |
+| `--org NAME` / `--user NAME` | All non-archived source repos of an owner (default: you) |
+| `--merged` | The default; kept for compatibility |
+| `--strict` | Delete `MERGED` branches only (the previous behaviour) |
+| `--stale-days N` | Also delete `STALE` branches |
+| `--exclude REGEX` | Never touch branches matching REGEX |
+| `--dry-run` / `--out FILE` | Preview and write the list (default: `cleanup-branches.txt`) |
+| `--from FILE` | Delete the listed branches after re-checking each one |
+| `--limit N` | Max repos to scan (default: 1000) |
+| `-y` | Skip the confirmation prompt |
+
+`--from` rescans the listed repos: a branch whose SHA moved since the dry run, or whose
+verdict changed (an open PR appeared, for instance), is skipped and reported. The list keeps
+each branch's SHA, so a branch deleted by mistake can be restored with
+`gh api repos/OWNER/REPO/git/refs -f ref=refs/heads/BRANCH -f sha=SHA`.
+
+> **Behaviour changes.** A confirmation is now asked before deleting: scripts must pass
+> `-y`. Squash-merged branches and branches of closed PRs are deleted by default (`--strict`
+> restores the old rule). `--stale-days` adds to the default instead of replacing it, and no
+> longer touches branches with an open PR. The target is optional and defaults to your repos.
 
 #### `archive-repos` — Archive inactive repos
 
@@ -719,6 +749,52 @@ The last-run timestamp is stored per scope (owners + type + label) in
 `${XDG_STATE_HOME:-~/.local/state}/github-helpers/inbox.json`. It records the **start** of
 the run, so nothing opened during the scan is missed, and it is only written after a
 complete scan: a skipped owner, `--since`, `--only` or `--no-save` leave it untouched.
+
+#### `branches` — Track open branches across your repos
+
+Alias: `github-helpers branch-status`. Read-only. Every branch other than the default one, on
+every non-archived source repo, with how many commits it is ahead of and behind the default
+branch, its last PR, and what `cleanup-branches` would do with it.
+
+```bash
+github-helpers branches
+github-helpers branches --org my-company --stale-days 90
+github-helpers branch-status --repo maxgfr/github-helpers
+github-helpers branches --format json | jq '.[] | select(.behind > 50)'
+```
+
+```
+maxgfr/github-helpers  (main)
+  feat/foo      ↑3    ↓12       4d  #42 open      ACTIVE
+  wip/squashed  ↑5    ↓8       20d  #38 merged    PR_MERGED
+  fix/old       ↑0    ↓40      90d  —             MERGED
+─────────────────────────────────────────────
+  14 branch(es) in 5 repo(s): 6 active · 2 open PR · 5 cleanable · 1 protected
+  → github-helpers cleanup-branches --dry-run
+```
+
+| Verdict (first match wins) | Meaning |
+|---|---|
+| `PROTECTED` | Covered by a branch protection rule |
+| `OPEN_PR` | Head or base of an open pull request |
+| `UNKNOWN` | Could not be compared or verified |
+| `MERGED` | No commit ahead of the default branch |
+| `PR_MERGED` | Last PR merged, branch unchanged since (squash or rebase merge) |
+| `PR_CLOSED` | Last PR closed unmerged, branch unchanged since |
+| `STALE` | Only with `--stale-days N`: no commit in N days |
+| `ACTIVE` | Everything else, including commits pushed after a merged PR |
+
+| Flag | Description |
+|---|---|
+| `--user NAME` / `--org NAME` | Owner to scan (default: you) |
+| `--repo OWNER/NAME` | Only this repository |
+| `--stale-days N` | Label branches untouched for N days as `STALE` |
+| `--exclude REGEX` | Hide branches matching REGEX |
+| `--limit N` | Max repos to scan (default: 1000) |
+| `--format text\|json\|csv\|md`, `--output FILE` | Export |
+
+One GraphQL request covers 10 repositories: branches, comparisons and PRs together. Only the
+first 100 branches of a repo are listed, and the command says so when that happens.
 
 ### Bulk operations
 
