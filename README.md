@@ -36,6 +36,7 @@ chmod +x /usr/local/bin/github-helpers
 | [`release-cleanup`](#release-cleanup--delete-old-releases) | Delete old releases, keep N latest |
 | [`pr-cleanup`](#pr-cleanup--find-and-close-abandoned-prs) | Close abandoned pull requests |
 | [`cleanup-packages`](#cleanup-packages--delete-old-package-versions) | Delete old GitHub Package versions |
+| [`packages`](#packages--list-packages-flag-the-orphaned-and-renamed-delete-whole-ones) | List packages, flag the orphaned and renamed, delete whole ones |
 | [`stale-issues`](#stale-issues--find-and-close-stale-issues) | Find/close stale issues and PRs |
 | [`cache-cleanup`](#cache-cleanup--purge-github-actions-caches) | Purge Actions caches (10 GB/repo quota) |
 | [`artifact-cleanup`](#artifact-cleanup--delete-github-actions-artifacts) | Delete Actions artifacts |
@@ -284,6 +285,43 @@ github-helpers cleanup-packages --type container --package myapp --keep 1
 | `--type TYPE` | Package type: npm, maven, rubygems, docker, nuget, container (required) |
 | `--package NAME` | Specific package name (default: all) |
 | `--keep N` | Versions to keep per package (default: 5) |
+
+#### `packages` — List packages, flag the orphaned and renamed, delete whole ones
+
+Every package of a user or an organization, every type, with its visibility, the
+repository it is linked to, its versions and its last update — and a status:
+`orphaned` when it is linked to no repository, `mismatch` when no part of its name
+holds its repository's name. A `mismatch` is typically what a repository rename
+leaves behind: `ghcr.io/me/old-name`, still linked to `me/new-name`, which the
+workflows now push as `ghcr.io/me/new-name`. Variants such as `new-name-lite` or
+`new-name/server` are `ok`. Alias: `pkgs`.
+
+```bash
+github-helpers packages
+github-helpers packages --type container --format md
+github-helpers packages --org my-company --orphaned
+github-helpers packages --mismatch --delete --dry-run   # writes packages-delete.txt
+github-helpers packages --from packages-delete.txt      # deletes what is left in it
+```
+
+| Flag | Description |
+|---|---|
+| `--user NAME` / `--org NAME` | Target (default: authenticated user, private packages included) |
+| `--type TYPE` | container, npm, maven, rubygems, docker or nuget (default: all of them) |
+| `--orphaned` | Linked to no repository |
+| `--mismatch` | No part of the name holds its repository's name |
+| `--untouched N` | Not updated in N days |
+| `--match PATTERN` | Case-insensitive regex on the name |
+| `--visibility VIS` | public, private or internal |
+| `--delete` | Delete the matched packages, every version (needs at least one filter) |
+| `--dry-run` / `--out FILE` / `--from FILE` | Review loop: write the annotated list, edit it, delete what is left |
+| `--format FORMAT` | text, json, csv or md |
+
+Deleting a package removes every version for good, and its name cannot be reused for
+30 days; GitHub refuses to delete a public package with more than 5,000 downloads (it
+is reported as failed, with that reason). Needs the `read:packages` scope, and
+`delete:packages` to delete: `gh auth refresh -h github.com -s read:packages,delete:packages`.
+To trim old versions and keep the package, use `cleanup-packages`.
 
 #### `stale-issues` — Find and close stale issues
 
