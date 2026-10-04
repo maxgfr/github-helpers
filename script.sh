@@ -6,7 +6,7 @@ set -euo pipefail
 # Subcommands:
 #   Cleanup & maintenance: unstar, cleanup-forks (forks), sync-forks,
 #     cleanup-branches, archive-repos, release-cleanup, pr-cleanup,
-#     cleanup-packages, stale-issues, cache-cleanup, artifact-cleanup,
+#     cleanup-packages, packages (pkgs), stale-issues, cache-cleanup, artifact-cleanup,
 #     run-cleanup, gist (gists), notifications (notifs), invite-cleanup
 #   Audit & visibility: repo-audit (audit), stats, workflow-status (ci),
 #     secret-audit, license-check, vulnerability-check, branch-protection,
@@ -435,6 +435,7 @@ ${BOLD}COMMANDS${NC}
   release-cleanup     Delete old releases
   pr-cleanup          Find and close abandoned pull requests
   cleanup-packages    Delete old GitHub Package versions
+  packages            List packages, flag orphaned or renamed ones, delete whole ones
   stale-issues        Find and close stale issues/PRs
   cache-cleanup       Purge GitHub Actions caches (10 GB/repo quota)
   artifact-cleanup    Delete GitHub Actions artifacts
@@ -5583,6 +5584,383 @@ cmd_cleanup_packages_main() {
 }
 
 # =============================================================================
+# COMMAND: packages
+# =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+PACKAGES_TARGET=""
+PACKAGES_TARGET_TYPE=""
+PACKAGES_TYPES=""
+PACKAGES_ORPHANED=false
+PACKAGES_MISMATCH=false
+PACKAGES_UNTOUCHED=""
+PACKAGES_MATCH=""
+PACKAGES_VISIBILITY=""
+PACKAGES_DELETE=false
+PACKAGES_FORMAT="text"
+PACKAGES_OUT="packages-delete.txt"
+PACKAGES_SAVE_LIST=false
+PACKAGES_FROM=""
+PACKAGES_ALL_TYPES="container npm maven rubygems docker nuget"
+
+cmd_packages_usage() {
+  cat <<EOF
+${BOLD}github-helpers packages${NC} ${DIM}v${VERSION}${NC} — List your packages, flag the orphaned and the renamed, delete whole ones
+
+${BOLD}USAGE${NC}
+  github-helpers packages [filters]
+  github-helpers packages [filters] --delete --dry-run
+  github-helpers packages --from ${PACKAGES_OUT}
+
+${BOLD}TARGET${NC}
+  --user NAME             Target user (default: authenticated user)
+  --org NAME              Target organization
+  --type TYPE             container, npm, maven, rubygems, docker or nuget (default: all)
+
+${BOLD}FILTERS${NC} (combined with AND)
+  --orphaned              Linked to no repository (never linked, or the repository is gone)
+  --mismatch              Linked to a repository whose name is not in the package's name —
+                          typically what a repository rename leaves behind under the old name
+  --untouched N           Not updated in N days
+  --match PATTERN         Regex on the package name
+  --visibility VIS        public, private or internal
+
+${BOLD}ACTION${NC}
+  --delete                Delete the matched packages, every version ${DIM}(needs at least one filter)${NC}
+
+${BOLD}I/O${NC}
+  --dry-run               Preview only — writes an annotated list, deletes nothing
+  --out FILE              List file (default: ${PACKAGES_OUT}), or report file with --format
+  --save-list             Save the list even outside --dry-run
+  --from FILE             Delete the TYPE/NAME packages listed in FILE (comments after # are ignored)
+  --format FORMAT         text, json, csv or md (default: text)
+
+${BOLD}FLAGS${NC}
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show skipped types and requests
+  -h, --help              Show this help
+
+${BOLD}WORKFLOW${NC}
+  1. Preview:  github-helpers packages --mismatch --delete --dry-run
+  2. Edit:     vim ${PACKAGES_OUT}
+  3. Execute:  github-helpers packages --from ${PACKAGES_OUT}
+
+${BOLD}EXAMPLES${NC}
+  github-helpers packages
+  github-helpers packages --type container --format md
+  github-helpers packages --org my-company --orphaned
+  github-helpers packages --match '^old-name$' --delete --dry-run
+
+${BOLD}NOTE${NC}
+  Deleting a package deletes every version of it, for good, and its name
+  cannot be reused for 30 days. GitHub refuses to delete a public package
+  with more than 5,000 downloads; such a package is reported as failed.
+  Needs the read:packages scope, and delete:packages to delete.
+  To trim old versions and keep the package, use cleanup-packages.
+EOF
+  exit 0
+}
+
+cmd_packages_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user)       need_arg "--user" "${2:-}"; PACKAGES_TARGET="$2"; PACKAGES_TARGET_TYPE="user"; shift 2 ;;
+      --org)        need_arg "--org" "${2:-}"; PACKAGES_TARGET="$2"; PACKAGES_TARGET_TYPE="org"; shift 2 ;;
+      --type)       need_arg "--type" "${2:-}"; PACKAGES_TYPES="$2"; shift 2 ;;
+      --untouched)  need_arg "--untouched" "${2:-}"; PACKAGES_UNTOUCHED="$2"; shift 2 ;;
+      --match)      need_arg "--match" "${2:-}"; PACKAGES_MATCH="$2"; shift 2 ;;
+      --visibility) need_arg "--visibility" "${2:-}"; PACKAGES_VISIBILITY="$2"; shift 2 ;;
+      --out)        need_arg "--out" "${2:-}"; PACKAGES_OUT="$2"; PACKAGES_SAVE_LIST=true; shift 2 ;;
+      --from)       need_arg "--from" "${2:-}"; PACKAGES_FROM="$2"; shift 2 ;;
+      --format)     need_arg "--format" "${2:-}"; PACKAGES_FORMAT="$2"; shift 2 ;;
+      --orphaned)   PACKAGES_ORPHANED=true; shift ;;
+      --mismatch)   PACKAGES_MISMATCH=true; shift ;;
+      --delete)     PACKAGES_DELETE=true; shift ;;
+      --save-list)  PACKAGES_SAVE_LIST=true; shift ;;
+      --dry-run)    DRY_RUN=true; shift ;;
+      -y|--yes)     AUTO_YES=true; shift ;;
+      -v|--verbose) VERBOSE=true; shift ;;
+      -h|--help)    cmd_packages_usage ;;
+      *) die "packages: unknown option: $1" ;;
+    esac
+  done
+
+  case "$PACKAGES_FORMAT" in
+    text|json|csv|md) ;;
+    *) die "packages: invalid --format '${PACKAGES_FORMAT}' (use text, json, csv or md)" ;;
+  esac
+  if [ -n "$PACKAGES_TYPES" ]; then
+    case " ${PACKAGES_ALL_TYPES} " in
+      *" ${PACKAGES_TYPES} "*) ;;
+      *) die "packages: invalid --type '${PACKAGES_TYPES}' (use ${PACKAGES_ALL_TYPES// /, })" ;;
+    esac
+  fi
+  case "$PACKAGES_VISIBILITY" in
+    ""|public|private|internal) ;;
+    *) die "packages: invalid --visibility '${PACKAGES_VISIBILITY}' (use public, private or internal)" ;;
+  esac
+  [ -n "$PACKAGES_UNTOUCHED" ] && { [[ "$PACKAGES_UNTOUCHED" =~ ^[1-9][0-9]*$ ]] || die "packages: --untouched must be a whole number of days"; }
+
+  if [ -n "$PACKAGES_FROM" ]; then
+    [ -f "$PACKAGES_FROM" ] || die "packages: file not found: ${PACKAGES_FROM}"
+    PACKAGES_DELETE=true
+    return 0
+  fi
+
+  if [ -n "$PACKAGES_MATCH" ]; then
+    jq -n --arg p "$PACKAGES_MATCH" '"" | test($p; "i")' >/dev/null 2>&1 \
+      || die "packages: --match is not a valid regex: ${PACKAGES_MATCH}"
+  fi
+  if [ "$PACKAGES_FORMAT" != "text" ] && { $PACKAGES_DELETE || $DRY_RUN; }; then
+    die "packages: --format is for reporting — drop --delete/--dry-run"
+  fi
+
+  local nfilters=0
+  $PACKAGES_ORPHANED && nfilters=$((nfilters + 1))
+  $PACKAGES_MISMATCH && nfilters=$((nfilters + 1))
+  [ -n "$PACKAGES_UNTOUCHED" ] && nfilters=$((nfilters + 1))
+  [ -n "$PACKAGES_MATCH" ] && nfilters=$((nfilters + 1))
+  [ -n "$PACKAGES_VISIBILITY" ] && nfilters=$((nfilters + 1))
+  if $PACKAGES_DELETE && [ "$nfilters" -eq 0 ]; then
+    die "packages: --delete requires at least one filter (refusing to delete every package)"
+  fi
+  return 0
+}
+
+# cmd_packages_classify — stdin: the packages API's objects (one array, any
+# types); stdout: flat rows with a status. Pure, so it is unit-tested.
+#   orphaned  no repository linked (never linked, or the repository is gone)
+#   mismatch  linked, but no part of its name holds the repository's name:
+#             "old-name" linked to "new-name" — what a rename leaves behind —
+#             where "new-name-lite" and "new-name/server" are variants, and fine
+#   ok        anything else
+cmd_packages_classify() {
+  jq -c 'map(
+    (.repository.name // "" | ascii_downcase) as $repo
+    | (.name | ascii_downcase | ltrimstr("@") | split("/")) as $parts
+    | { type: .package_type, name, visibility,
+        repository: (.repository.full_name // ""),
+        versions: (.version_count // 0),
+        updated: ((.updated_at // "")[0:10]), updated_at: (.updated_at // ""),
+        status: (if $repo == "" then "orphaned"
+                 elif ($parts | any(contains($repo))) | not then "mismatch"
+                 else "ok" end),
+        url: (.html_url // "") })
+    | sort_by(.type, .name)'
+}
+
+# cmd_packages_select <orphaned> <mismatch> <untouched-cutoff> <regex> <visibility>
+# stdin: classified rows; stdout: the rows every given filter keeps (AND).
+cmd_packages_select() {
+  jq -c --argjson orph "$1" --argjson mis "$2" --arg cut "$3" --arg pat "$4" --arg vis "$5" '
+    map(select($orph == false or .status == "orphaned"))
+    | map(select($mis == false or .status == "mismatch"))
+    | map(select($cut == "" or (.updated_at != "" and .updated_at < $cut)))
+    | map(select($pat == "" or (.name | test($pat; "i"))))
+    | map(select($vis == "" or .visibility == $vis))'
+}
+
+# cmd_packages_list_lines — stdin: rows; stdout: the annotated list --from reads.
+cmd_packages_list_lines() {
+  jq -r '.[] | "\(.type)/\(.name)  # \(.status) · \(.visibility) · \(if .repository == "" then "no repository" else .repository end) · \(.versions) version(s) · updated \(.updated)"'
+}
+
+# cmd_packages_parse_list <file> — "TYPE<TAB>NAME" per package: comments and
+# blank lines dropped, CRLF tolerated, the type checked. A container name may
+# itself hold a slash, so only the first one separates type from name.
+cmd_packages_parse_list() {
+  sed 's/#.*//; s/\r$//' "$1" | awk -v types=" ${PACKAGES_ALL_TYPES} " '
+    NF {
+      entry = $1; slash = index(entry, "/")
+      if (slash < 2) next
+      type = substr(entry, 1, slash - 1); name = substr(entry, slash + 1)
+      if (name == "" || index(types, " " type " ") == 0) next
+      print type "\t" name
+    }'
+}
+
+# The API path of a target's packages: /user for your own (it also lists the
+# private ones), /users/NAME or /orgs/NAME otherwise.
+cmd_packages_base() {
+  if [ "$PACKAGES_TARGET_TYPE" = "org" ]; then
+    printf 'orgs/%s' "$PACKAGES_TARGET"
+  elif [ -z "$PACKAGES_TARGET" ] || [ "$PACKAGES_TARGET" = "$(get_username)" ]; then
+    printf 'user'
+  else
+    printf 'users/%s' "$PACKAGES_TARGET"
+  fi
+}
+
+cmd_packages_delete_from() {
+  local list_file="$1" base="$2" entries total deleted=0 fail=0 type name encoded body rc
+  entries=$(tmp_new)
+  cmd_packages_parse_list "$list_file" > "$entries"
+  total=$(count_lines "$entries")
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No packages to delete.${NC}"
+    exit 0
+  fi
+  echo -e "${YELLOW}${total} package(s) to delete${NC}"
+  while IFS=$'\t' read -r type name; do
+    echo -e "  ${type}/${name}"
+  done < "$entries"
+  echo ""
+  if ! require_scope "delete:packages"; then
+    warn "this token has no delete:packages scope: every deletion will be refused"
+    scope_hint "read:packages,delete:packages"
+  fi
+  if ! confirm "Delete ${total} package(s), every version of each? This is permanent."; then
+    echo "Cancelled."
+    exit 0
+  fi
+  while IFS=$'\t' read -r type name; do
+    encoded=$(jq -rn --arg n "$name" '$n | @uri')
+    rc=0
+    body=$(gh_api_retry -X DELETE "${base}/packages/${type}/${encoded}" 2>&1) || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      deleted=$((deleted + 1))
+      echo -e "  ${GREEN}DELETED${NC}  ${type}/${name}"
+    else
+      fail=$((fail + 1))
+      case "$body" in
+        *5000*|*"5,000"*) echo -e "  ${RED}FAILED${NC}   ${type}/${name} ${DIM}(public with over 5,000 downloads: only GitHub support can delete it)${NC}" ;;
+        *"HTTP 403"*)     echo -e "  ${RED}FAILED${NC}   ${type}/${name} ${DIM}(forbidden: delete:packages scope, or admin rights on the package)${NC}"; scope_hint "read:packages,delete:packages" ;;
+        *"HTTP 404"*)     echo -e "  ${RED}FAILED${NC}   ${type}/${name} ${DIM}(not found: already gone, or not this target's)${NC}" ;;
+        *)                echo -e "  ${RED}FAILED${NC}   ${type}/${name}" ;;
+      esac
+    fi
+  done < "$entries"
+  echo ""
+  echo -e "${GREEN}Done!${NC} Deleted: ${BOLD}${deleted}${NC}, Failed: ${BOLD}${fail}${NC}"
+  [ "$fail" -eq 0 ]
+}
+
+cmd_packages_main() {
+  cmd_packages_parse_args "$@"
+  preflight_check
+  skip_init
+
+  local out=1
+  [ "$PACKAGES_FORMAT" != "text" ] && out=2
+  local base
+  base=$(cmd_packages_base)
+
+  { header "Packages"; } >&$out
+
+  if [ -n "$PACKAGES_FROM" ]; then
+    echo -e "  From: ${BOLD}${PACKAGES_FROM}${NC}"
+    echo ""
+    cmd_packages_delete_from "$PACKAGES_FROM" "$base"
+    exit $?
+  fi
+
+  local cutoff=""
+  [ -n "$PACKAGES_UNTOUCHED" ] && cutoff=$(cutoff_date "$PACKAGES_UNTOUCHED" days)
+  local types="${PACKAGES_TYPES:-$PACKAGES_ALL_TYPES}"
+
+  {
+    echo -e "  Target:   ${BOLD}${PACKAGES_TARGET:-$(get_username)}${NC}"
+    echo -e "  Types:    ${BOLD}${types}${NC}"
+    $PACKAGES_ORPHANED && echo -e "  Filter:   ${BOLD}orphaned${NC}"
+    $PACKAGES_MISMATCH && echo -e "  Filter:   ${BOLD}name not its repository's${NC}"
+    [ -n "$cutoff" ] && echo -e "  Updated:  ${BOLD}before ${cutoff%%T*}${NC}"
+    [ -n "$PACKAGES_MATCH" ] && echo -e "  Match:    ${BOLD}${PACKAGES_MATCH}${NC}"
+    [ -n "$PACKAGES_VISIBILITY" ] && echo -e "  Filter:   ${BOLD}${PACKAGES_VISIBILITY} only${NC}"
+    $DRY_RUN && echo -e "  Mode:     ${YELLOW}DRY RUN${NC}"
+    echo ""
+    echo -e "${DIM}Fetching packages...${NC}"
+  } >&$out
+
+  # One listing per type: the API has no "every type" listing. A type the
+  # token cannot read is a skip, not the end of the sweep.
+  local raw type part
+  raw=$(tmp_new)
+  printf '[]' > "$raw"
+  for type in $types; do
+    part=$(gh_paginate "${type} packages" "${base}/packages?package_type=${type}&per_page=100") || continue
+    jq -s '.[0] + .[1]' "$raw" <(printf '%s' "$part") > "${raw}.next" && mv "${raw}.next" "$raw"
+  done
+  # gh_paginate runs in $(…), where the skip count dies: the log is what remains.
+  if grep -q '403' "$SKIP_LOG" 2>/dev/null; then
+    scope_hint "read:packages"
+  fi
+
+  local rows total
+  rows=$(cmd_packages_classify < "$raw" \
+    | cmd_packages_select "$PACKAGES_ORPHANED" "$PACKAGES_MISMATCH" "$cutoff" "$PACKAGES_MATCH" "$PACKAGES_VISIBILITY")
+  total=$(printf '%s' "$rows" | jq 'length')
+
+  # The listing gives no version count for containers: asked per package kept,
+  # one page of 100 at most ("100+" past that).
+  if [ "$total" -gt 0 ]; then
+    local counts n vt vn
+    counts=$(tmp_new)
+    while IFS=$'\t' read -r vt vn; do
+      n=$(gh_api_try "${vt}/${vn} versions" "${base}/packages/${vt}/$(jq -rn --arg n "$vn" '$n | @uri')/versions?per_page=100" --jq 'length') || n=""
+      [ "$n" = "100" ] && n="100+"
+      printf '%s\t%s\t%s\n' "$vt" "$vn" "${n:-?}" >> "$counts"
+    done < <(printf '%s' "$rows" | jq -r '.[] | [.type, .name] | @tsv')
+    rows=$(printf '%s' "$rows" | jq -c --rawfile c "$counts" '
+      ($c | split("\n") | map(select(length > 0) | split("\t") | {key: "\(.[0])/\(.[1])", value: .[2]}) | from_entries) as $v
+      | map(.versions = ($v["\(.type)/\(.name)"] // .versions | tostring))')
+  fi
+  if [ "$total" -eq 0 ]; then
+    echo -e "${GREEN}No packages match.${NC}" >&$out
+    print_skips
+    exit 0
+  fi
+
+  # ── Report mode ────────────────────────────────────────────────────────────
+  if [ "$PACKAGES_FORMAT" != "text" ]; then
+    local outfile=""
+    $PACKAGES_SAVE_LIST && outfile="$PACKAGES_OUT"
+    write_output "$outfile" "$(render_rows "$PACKAGES_FORMAT" "$(printf '%s' "$rows" | jq 'map(del(.updated_at))')")"
+    print_skips
+    exit 0
+  fi
+
+  echo ""
+  echo -e "${YELLOW}${total} package(s)${NC}"
+  echo -e "  ${DIM}$(printf '%s' "$rows" | jq -r 'group_by(.status) | map("\(.[0].status): \(length)") | join("   ")')${NC}"
+  echo ""
+  local line
+  printf -v line "  %-10s %-32s %-9s %-9s %-11s %-30s %s" "TYPE" "NAME" "STATUS" "VIS" "UPDATED" "REPOSITORY" "VERSIONS"
+  echo -e "${BOLD}${line}${NC}"
+  local t n s v u r c colour
+  while IFS=$'\t' read -r t n s v u r c; do
+    printf -v line "  %-10s %-32s %-9s %-9s %-11s %-30s %s" "$t" "${n:0:32}" "$s" "$v" "$u" "${r:0:30}" "$c"
+    colour=""
+    case "$s" in orphaned|mismatch) colour="$YELLOW" ;; esac
+    echo -e "${colour}${line}${NC}"
+  done < <(printf '%s' "$rows" | jq -r '.[] | [.type, .name, .status, .visibility, .updated, (if .repository == "" then "-" else .repository end), (.versions | tostring)] | @tsv')
+  echo ""
+
+  if ! $PACKAGES_DELETE; then
+    print_skips
+    exit 0
+  fi
+
+  # ── Deletion path: the list says what each one is, a bare name tells nothing ─
+  local list_file
+  if $DRY_RUN || $PACKAGES_SAVE_LIST; then
+    list_file="$PACKAGES_OUT"
+  else
+    list_file=$(tmp_new)
+  fi
+  printf '%s' "$rows" | cmd_packages_list_lines > "$list_file"
+
+  if $DRY_RUN; then
+    echo -e "${YELLOW}DRY RUN — nothing deleted.${NC} Review ${BOLD}${list_file}${NC}, then:"
+    echo -e "  github-helpers packages --from ${list_file}"
+    print_skips
+    exit 0
+  fi
+
+  print_skips
+  cmd_packages_delete_from "$list_file" "$base"
+}
+
+# =============================================================================
 # COMMAND: collaborator-audit
 # =============================================================================
 
@@ -10014,6 +10392,7 @@ main() {
     bulk-settings)         cmd_bulk_settings_main "$@" ;;
     webhook-audit)         cmd_webhook_audit_main "$@" ;;
     cleanup-packages)      cmd_cleanup_packages_main "$@" ;;
+    packages|pkgs)         cmd_packages_main "$@" ;;
     collaborator-audit)    cmd_collaborator_audit_main "$@" ;;
     repo-template)         cmd_repo_template_main "$@" ;;
     pr-cleanup)            cmd_pr_cleanup_main "$@" ;;

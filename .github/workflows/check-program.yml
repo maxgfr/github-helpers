@@ -93,6 +93,12 @@ jobs:
       - name: Test cleanup-packages help
         run: ./script.sh cleanup-packages --help
 
+      - name: Test packages help
+        run: ./script.sh packages --help
+
+      - name: Test pkgs alias (packages) help
+        run: ./script.sh pkgs --help
+
       - name: Test collaborator-audit help
         run: ./script.sh collaborator-audit --help
 
@@ -222,6 +228,18 @@ jobs:
       - name: Test gist --delete requires a filter
         run: |
           if ./script.sh gist --delete 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test packages --delete requires a filter
+        run: |
+          if ./script.sh packages --delete 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
+      - name: Test packages rejects an unknown --type
+        run: |
+          if ./script.sh packages --type nope 2>/dev/null; then
             echo "Should have failed" && exit 1
           fi
 

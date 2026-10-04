@@ -876,6 +876,70 @@ print_skips 2>/dev/null
 assert_eq "print_skips resyncs the count from the log" "1" "$SKIP_COUNT"
 SKIP_LOG="" SKIP_COUNT=0
 
+# ── 16. packages: classifier, filters, list round trip ──────────────────────
+echo ""
+echo -e "${BOLD}16. packages classifier and --from list${NC}"
+# pkg <name> <type> <repo-name-or-empty> <visibility> <updated_at>
+pkg() {
+  jq -nc --arg n "$1" --arg t "$2" --arg r "$3" --arg v "$4" --arg u "$5" '
+    { name: $n, package_type: $t, visibility: $v, updated_at: $u, html_url: "u",
+      repository: (if $r == "" then null else {name: $r, full_name: "me/\($r)"} end) }'
+}
+PKGS="[$(pkg phone-torrent container swarmdeck public 2026-10-04T00:00:00Z),$(pkg swarmdeck container swarmdeck public 2026-10-04T00:00:00Z),$(pkg swarmdeck-lite container swarmdeck public 2026-10-04T00:00:00Z),$(pkg swarmdeck/server container swarmdeck private 2026-01-01T00:00:00Z),$(pkg lonely npm '' public 2025-01-01T00:00:00Z),$(pkg '@me/Tool' npm tool public 2026-02-01T00:00:00Z)]"
+pstatus() { printf '%s' "$PKGS" | cmd_packages_classify | jq -r --arg n "$1" '.[] | select(.name == $n) | .status'; }
+assert_eq "a package left under a repository's old name is a mismatch" "mismatch" "$(pstatus phone-torrent)"
+assert_eq "a package named as its repository is ok" "ok" "$(pstatus swarmdeck)"
+assert_eq "a variant holding the repository's name is ok" "ok" "$(pstatus swarmdeck-lite)"
+assert_eq "a container under the repository's name is ok" "ok" "$(pstatus swarmdeck/server)"
+assert_eq "no repository is orphaned" "orphaned" "$(pstatus lonely)"
+assert_eq "an npm scope and case are not a mismatch" "ok" "$(pstatus '@me/Tool')"
+assert_eq "rows sorted by type then name" "container/phone-torrent,container/swarmdeck,container/swarmdeck-lite,container/swarmdeck/server,npm/@me/Tool,npm/lonely" \
+  "$(printf '%s' "$PKGS" | cmd_packages_classify | jq -r 'map("\(.type)/\(.name)") | join(",")')"
+psel() { printf '%s' "$PKGS" | cmd_packages_classify | cmd_packages_select "$@" | jq -r 'map(.name) | join(",")'; }
+assert_eq "--mismatch keeps the left-behind one" "phone-torrent" "$(psel false true '' '' '')"
+assert_eq "--orphaned keeps the unlinked one" "lonely" "$(psel true false '' '' '')"
+assert_eq "--untouched keeps the old ones" "swarmdeck/server,lonely" "$(psel false false 2026-02-01T00:00:00Z '' '')"
+assert_eq "--match is a case-insensitive regex" "swarmdeck,swarmdeck-lite,swarmdeck/server" "$(psel false false '' '^SWARM' '')"
+assert_eq "--visibility" "swarmdeck/server" "$(psel false false '' '' private)"
+assert_eq "filters are ANDed" "" "$(psel true true '' '' '')"
+# The list --dry-run writes is the list --from reads back, comments and all.
+list_file=$(mktemp)
+{
+  printf '%s' "$PKGS" | cmd_packages_classify | cmd_packages_select false false '' '^(phone|swarmdeck/)' '' | cmd_packages_list_lines
+  printf '# a comment\n\nnuget/Some.Pkg   # kept by hand\r\nbogus/x\nnoslash\n'
+} > "$list_file"
+assert_match "list lines say what each one is" '^container/phone-torrent  # mismatch · public · me/swarmdeck · 0 version\(s\) · updated 2026-10-04$' "$(head -1 "$list_file")"
+assert_eq "--from reads TYPE/NAME, a slash in the name kept, junk and comments dropped" \
+  "container phone-torrent|container swarmdeck/server|nuget Some.Pkg" \
+  "$(cmd_packages_parse_list "$list_file" | tr '\t' ' ' | paste -sd'|' -)"
+rm -f "$list_file"
+# Parser
+pk_reset() {
+  PACKAGES_TARGET="" PACKAGES_TARGET_TYPE="" PACKAGES_TYPES="" PACKAGES_ORPHANED=false PACKAGES_MISMATCH=false
+  PACKAGES_UNTOUCHED="" PACKAGES_MATCH="" PACKAGES_VISIBILITY="" PACKAGES_DELETE=false PACKAGES_FORMAT="text"
+  PACKAGES_OUT="packages-delete.txt" PACKAGES_SAVE_LIST=false PACKAGES_FROM=""
+}
+pk_reset
+cmd_packages_parse_args --org acme --type container --mismatch --delete
+assert_eq "packages --org/--type/--mismatch/--delete parsed" "acme org container true true" \
+  "${PACKAGES_TARGET} ${PACKAGES_TARGET_TYPE} ${PACKAGES_TYPES} ${PACKAGES_MISMATCH} ${PACKAGES_DELETE}"
+pk_reset
+(cmd_packages_parse_args --delete) &>/dev/null && rc=0 || rc=1
+assert_exit_code "packages --delete refuses to run without a filter" 1 $rc
+(cmd_packages_parse_args --type nope) &>/dev/null && rc=0 || rc=1
+assert_exit_code "packages --type rejects an unknown type" 1 $rc
+(cmd_packages_parse_args --visibility secret) &>/dev/null && rc=0 || rc=1
+assert_exit_code "packages --visibility rejects an unknown one" 1 $rc
+(cmd_packages_parse_args --untouched 0) &>/dev/null && rc=0 || rc=1
+assert_exit_code "packages --untouched rejects 0" 1 $rc
+(cmd_packages_parse_args --match '([') &>/dev/null && rc=0 || rc=1
+assert_exit_code "packages --match rejects an invalid regex" 1 $rc
+(cmd_packages_parse_args --mismatch --format json --delete) &>/dev/null && rc=0 || rc=1
+assert_exit_code "packages --format is for reports, not deletions" 1 $rc
+(cmd_packages_parse_args --from "/tmp/nonexistent-packages-$$") &>/dev/null && rc=0 || rc=1
+assert_exit_code "packages --from rejects a missing file" 1 $rc
+pk_reset
+
 echo ""
 # ── 10. Script syntax check ─────────────────────────────────────────────────
 echo -e "${BOLD}10. Script integrity${NC}"
