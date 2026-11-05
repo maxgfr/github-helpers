@@ -24,6 +24,19 @@ chmod +x /usr/local/bin/github-helpers
 - [gh](https://cli.github.com) — GitHub CLI (authenticated via `gh auth login`)
 - [jq](https://jqlang.github.io/jq/) — JSON processor
 
+### Use it from an AI agent
+
+The repo ships an [agent skill](skills/github-helpers/SKILL.md) that teaches Claude Code,
+Cursor, Codex and other agents how to drive the CLI safely — dry-run first, ask before
+anything destructive, never guess flags:
+
+```bash
+npx skills add maxgfr/github-helpers
+```
+
+Then ask in plain words: *"download all my GitHub repos to ~/github-archive"*, *"which of my
+forks can I delete?"*, *"what is waiting on me on GitHub?"*.
+
 ## Commands
 
 | Command | Description |
@@ -70,6 +83,7 @@ chmod +x /usr/local/bin/github-helpers
 | [`repo-template`](#repo-template--sync-settings-from-a-template-repo) | Sync settings from a template repo |
 | [`bulk-merge`](#bulk-merge--merge-green-dependency-update-prs-in-batch) | Merge green dependency-update PRs |
 | [`backup`](#backup--export-repos-and-their-metadata-locally) | Export repos and metadata locally |
+| [`download`](#download--a-local-copy-of-every-repo-you-can-access) | Local copy of every repo you can access (public + private), kept in sync |
 
 ---
 
@@ -1051,6 +1065,54 @@ sha256 and exits `2` on any missing or mismatched file.
 
 **Not included:** Git LFS objects, release binaries (unless `--assets`), Actions logs,
 Projects, Discussions and Packages.
+
+#### `download` — A local copy of every repo you can access
+
+For the day GitHub is down, gone, or locks you out. By default it takes **everything your
+token can reach** — your own repos, every organization you belong to, and the repos you
+collaborate on, public and private — in one sweep. Rerun it (a nightly cron works) and it
+only fetches what changed.
+
+```bash
+github-helpers download --dry-run                           # what, how many, how big
+github-helpers download --dir ~/github-archive -y           # clone everything; rerun to refresh
+github-helpers download --org my-company --not-archived     # one organization
+github-helpers download --user octocat --source --checkout  # someone else's public repos
+github-helpers dl --mine --wikis                            # only yours, with wikis
+```
+
+| Flag | Description |
+|---|---|
+| `--mine` | Only repos you own |
+| `--org NAME` / `--user NAME` | Only these owners (repeatable). Another user's private repos are never listed |
+| `--repo OWNER/NAME` | A single repo |
+| `--dir PATH` | Destination (default: `./github-repos`) |
+| `--checkout` | Normal clones with a working tree instead of bare mirrors |
+| `--wikis` | Also download wikis that have content |
+| `--archived` / `--not-archived` | Filter by archive status |
+| `--fork` / `--source` | Filter by fork status |
+| `--visibility TYPE` | `public`, `private`, or `internal` |
+| `--limit N` | Max repos (says so when it caps the list) |
+
+```
+DIR/<owner>/<repo>.git         bare mirror: every branch, tag and pull-request ref
+DIR/<owner>/<repo>/            with --checkout
+DIR/<owner>/<repo>.wiki.git    with --wikis
+DIR/index.json                 every repo, its visibility, last sync and status
+```
+
+Restore with `git clone DIR/<owner>/<repo>.git`. Clones and fetches go over HTTPS with your
+`gh` token, so private repos work without `gh auth setup-git` or an SSH key.
+
+**It never deletes anything local.** Branches deleted on GitHub stay in the mirror, and repos
+that disappeared from GitHub (deleted, renamed, access lost) are listed at the end of the run
+and kept — your copy may be the last one. Exits `2` if any repo failed.
+
+`download` vs `backup` vs `clone-org`: `download` is the always-current copy of all your code,
+across every owner; `backup` is a dated snapshot of one owner that also saves issues, PRs and
+releases; `clone-org` is working copies of one owner for day-to-day work.
+
+**Not included:** Git LFS objects, issues/PRs/releases (use `backup`).
 
 ### Common flags
 

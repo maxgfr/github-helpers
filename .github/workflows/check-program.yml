@@ -147,6 +147,11 @@ jobs:
       - name: Test backup help
         run: ./script.sh backup --help
 
+      - name: Test download help
+        run: |
+          ./script.sh download --help
+          ./script.sh dl --help
+
       - name: Test inbox help
         run: ./script.sh inbox --help
 
@@ -266,6 +271,15 @@ jobs:
           if ./script.sh backup --no-git --no-metadata 2>/dev/null; then
             echo "Should have failed" && exit 1
           fi
+
+      - name: Test download rejects invalid arguments
+        run: |
+          for args in "--repo nope" "--repo a/b --org c" "--mine --user c" "--visibility secret" "--limit x" "--org ../x"; do
+            # shellcheck disable=SC2086
+            if ./script.sh download $args 2>/dev/null; then
+              echo "download $args should have failed" && exit 1
+            fi
+          done
 
       - name: Test inbox rejects invalid arguments
         run: |

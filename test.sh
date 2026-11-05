@@ -941,6 +941,75 @@ assert_exit_code "packages --from rejects a missing file" 1 $rc
 pk_reset
 
 echo ""
+# ── 17. download: normalisers, selection, paths, orphans ───────────────────
+echo -e "${BOLD}17. download normalisers, selection and orphans${NC}"
+REST='[{"full_name":"acme/api","visibility":"private","private":true,"archived":false,"fork":false,"size":760,"pushed_at":"2026-01-01T00:00:00Z","has_wiki":true},
+       {"full_name":"me/old","private":false,"archived":true,"fork":false,"size":2},
+       {"full_name":"me/fork","visibility":"public","archived":false,"fork":true,"size":9},
+       {"full_name":"evil/..","visibility":"public","archived":false,"fork":false,"size":1},
+       {"full_name":"evil/../x","visibility":"public","archived":false,"fork":false,"size":1}]'
+GHL='[{"nameWithOwner":"ACME/api","visibility":"PRIVATE","isArchived":false,"isFork":false,"diskUsage":760,"pushedAt":"2026-01-01T00:00:00Z","hasWikiEnabled":true},
+      {"nameWithOwner":"acme/web","visibility":"INTERNAL","isArchived":false,"isFork":false,"diskUsage":5,"pushedAt":"","hasWikiEnabled":false}]'
+assert_eq "REST rows normalised, visibility derived from .private when absent" \
+  '{"nwo":"me/old","visibility":"public","archived":true,"fork":false,"size_kb":2,"pushed_at":"","has_wiki":false}' \
+  "$(printf '%s' "$REST" | cmd_download_from_rest | jq -c '.[1]')"
+assert_eq "gh rows normalised, visibility lowercased" "internal 5" \
+  "$(printf '%s' "$GHL" | cmd_download_from_gh | jq -r '.[1] | "\(.visibility) \(.size_kb)"')"
+dsel() { { printf '%s' "$REST" | cmd_download_from_rest; printf '%s' "$GHL" | cmd_download_from_gh; } \
+  | cmd_download_select "$1" "$2" "$3" | jq -r '[.[].nwo] | join(",")'; }
+assert_eq "both sources merged, deduped case-insensitively, unsafe names dropped" "acme/api,acme/web,me/fork,me/old" "$(dsel '' '' '')"
+assert_eq "--not-archived" "acme/api,acme/web,me/fork" "$(dsel false '' '')"
+assert_eq "--source" "acme/api,acme/web,me/old" "$(dsel '' false '')"
+assert_eq "--visibility private" "acme/api" "$(dsel '' '' private)"
+assert_eq "empty input selects nothing" "0" "$(printf '' | cmd_download_select '' '' '' | jq 'length')"
+assert_eq "mirror path" "d/acme/api.git" "$(cmd_download_path d acme/api false)"
+assert_eq "checkout path" "d/acme/api" "$(cmd_download_path d acme/api true)"
+assert_eq "SAML clone error is named" "SAML SSO not authorized for this org" \
+  "$(cmd_download_git_reason "remote: The 'acme' organization has enabled or enforced SAML SSO.")"
+assert_eq "missing repo is named" "not found or no access" "$(cmd_download_git_reason "remote: Repository not found.")"
+assert_eq "prompt refused is an auth failure" "authentication failed" \
+  "$(cmd_download_git_reason "fatal: could not read Username for 'https://github.com': terminal prompts disabled")"
+# Orphans: what is on disk but no longer listed, never .part or wikis.
+odir=$(mktemp -d)
+mkdir -p "$odir/acme/api.git" "$odir/acme/Gone.git" "$odir/acme/half.git.part" "$odir/acme/api.wiki.git" \
+         "$odir/left-org/x.git" "$odir/acme/notarepo"
+olist=$(mktemp); printf 'acme/API\nacme/web\n' > "$olist"
+assert_eq "orphans under listed owners" "acme/Gone" "$(cmd_download_orphans "$odir" false "$olist" false | paste -sd, -)"
+assert_eq "orphans under every owner dir in a full run" "acme/Gone,left-org/x" \
+  "$(cmd_download_orphans "$odir" false "$olist" true | sort | paste -sd, -)"
+mkdir -p "$odir/co/kept/.git" "$odir/co/plain"
+printf 'co/other\n' > "$olist"
+assert_eq "checkout orphans need a .git" "co/kept" "$(cmd_download_orphans "$odir" true "$olist" false | paste -sd, -)"
+rm -rf "$odir" "$olist"
+# Index: merged with the previous one, a failure keeps the last good sync.
+idir=$(mktemp -d); irows=$(mktemp); ires=$(mktemp)
+printf '%s' "$GHL" | cmd_download_from_gh > "$irows"
+printf '%s\n' '{"nwo":"ACME/api","status":"cloned","checked_at":"t1","synced_at":"t1"}' '{"nwo":"other/x","status":"cloned","synced_at":"t0"}' > "$ires"
+printf '{"repos":[{"nwo":"other/x","status":"cloned","synced_at":"t0"}]}' > "$idir/index.json"
+cmd_download_write_index "$idir" "$irows" "$ires"
+printf '%s\n' '{"nwo":"ACME/api","status":"failed","checked_at":"t2"}' > "$ires"
+cmd_download_write_index "$idir" "$irows" "$ires"
+assert_eq "index keeps earlier owners and the last good sync on failure" "ACME/api:failed:t1:t2,other/x:cloned:t0:" \
+  "$(jq -r '[.repos[] | "\(.nwo):\(.status):\(.synced_at):\(.checked_at // "")"] | join(",")' "$idir/index.json")"
+rm -rf "$idir" "$irows" "$ires"
+# Parser
+dl_reset() {
+  DOWNLOAD_DIR="github-repos" DOWNLOAD_OWNERS="" DOWNLOAD_REPO="" DOWNLOAD_MINE=false DOWNLOAD_ARCHIVED=""
+  DOWNLOAD_FORK="" DOWNLOAD_VISIBILITY="" DOWNLOAD_CHECKOUT=false DOWNLOAD_WIKIS=false DOWNLOAD_LIMIT=0 DRY_RUN=false
+}
+dl_reset
+cmd_download_parse_args --org acme --user octocat --source --checkout --dir /x
+assert_eq "download --org/--user accumulate, flags parsed" "acme octocat false true /x" \
+  "${DOWNLOAD_OWNERS} ${DOWNLOAD_FORK} ${DOWNLOAD_CHECKOUT} ${DOWNLOAD_DIR}"
+dl_reset
+for bad in "--repo nope" "--repo a/b --org c" "--mine --org c" "--visibility secret" "--limit x" "--org ../x" "--bogus"; do
+  # shellcheck disable=SC2086
+  (cmd_download_parse_args $bad) &>/dev/null && rc=0 || rc=1
+  assert_exit_code "download rejects: ${bad}" 1 $rc
+done
+dl_reset
+
+echo ""
 # ── 10. Script syntax check ─────────────────────────────────────────────────
 echo -e "${BOLD}10. Script integrity${NC}"
 

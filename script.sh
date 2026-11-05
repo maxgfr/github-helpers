@@ -14,7 +14,7 @@ set -euo pipefail
 #     follow-audit (follow), inbox (recap), branches (branch-status)
 #   Bulk operations: clone-org, bulk-topic, sync-labels, export-stars,
 #     rename-default-branch, dependabot-enable, mirror, bulk-settings,
-#     repo-template, bulk-merge, backup
+#     repo-template, bulk-merge, backup, download (dl)
 # =============================================================================
 
 VERSION="1.7.0"
@@ -473,6 +473,7 @@ ${BOLD}COMMANDS${NC}
   bulk-merge          Merge green dependency-update PRs in batch
   repo-template       Sync settings from a template repo
   backup              Export repos and their metadata locally
+  download            Download every repo you can access, keep it in sync
 
 ${BOLD}FLAGS${NC}
   --no-color    Disable colored output
@@ -9734,6 +9735,491 @@ cmd_backup_main() {
   exit 0
 }
 # =============================================================================
+# COMMAND: download
+# =============================================================================
+# A local copy of every repository you can reach, for the day GitHub is gone.
+# Not backup (a dated snapshot of one owner, with metadata) and not clone-org
+# (working copies of one owner): one sweep across every owner, bare mirrors a
+# rerun refreshes in place, and nothing local is ever deleted.
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+DOWNLOAD_DIR="github-repos"
+DOWNLOAD_OWNERS=""        # space-separated --org/--user names; empty = everything accessible
+DOWNLOAD_REPO=""
+DOWNLOAD_MINE=false
+DOWNLOAD_ARCHIVED=""
+DOWNLOAD_FORK=""
+DOWNLOAD_VISIBILITY=""
+DOWNLOAD_CHECKOUT=false
+DOWNLOAD_WIKIS=false
+DOWNLOAD_LIMIT=0
+DOWNLOAD_RESULT=""
+DOWNLOAD_GH_FIELDS="nameWithOwner,visibility,isArchived,isFork,diskUsage,pushedAt,hasWikiEnabled"
+
+cmd_download_usage() {
+  cat <<EOF
+${BOLD}github-helpers download${NC} ${DIM}v${VERSION}${NC} — Download every repo you can access, and keep it in sync
+
+${BOLD}USAGE${NC}
+  github-helpers download [options]
+
+${BOLD}TARGET${NC} (default: every repo you can access, public and private — yours,
+        your organizations', and the ones you collaborate on)
+  --mine                  Only repos you own
+  --org NAME              Only this organization's repos (repeatable)
+  --user NAME             Only this user's repos (repeatable; private ones
+                          only for your own account)
+  --repo OWNER/NAME       A single repo
+
+${BOLD}OPTIONS${NC}
+  --dir PATH              Destination (default: ./github-repos)
+  --checkout              Normal clones with a working tree, not bare mirrors
+  --wikis                 Also download wikis that have content
+  --archived              Only archived repos
+  --not-archived          Only non-archived repos
+  --fork                  Only forks
+  --source                Only non-fork (source) repos
+  --visibility TYPE       public, private or internal
+  --limit N               Maximum number of repos (default: all)
+  --dry-run               Show what would be cloned or refreshed
+  -y, --yes               Skip confirmation prompt
+  -v, --verbose           Show detailed output
+  -h, --help              Show this help
+
+${BOLD}LAYOUT${NC}
+  DIR/<owner>/<repo>.git          bare mirror: every branch, tag and PR ref
+  DIR/<owner>/<repo>/             with --checkout: a normal clone
+  DIR/<owner>/<repo>.wiki.git     with --wikis
+  DIR/index.json                  every repo, its visibility, last sync and status
+
+${BOLD}RERUNS${NC}
+  Existing repos are fetched, not re-cloned, so a nightly cron stays cheap.
+  Branches deleted on GitHub are kept locally, and repos that vanished from
+  GitHub are reported, never removed: the local copy may be the last one.
+
+${BOLD}RESTORE${NC}
+  git clone DIR/<owner>/<repo>.git my-repo
+
+${BOLD}EXAMPLES${NC}
+  # What would be downloaded
+  github-helpers download --dry-run
+
+  # Everything you can access, into a fixed folder (rerun to refresh)
+  github-helpers download --dir ~/github-archive -y
+
+  # One organization, skip archived repos
+  github-helpers download --org my-company --not-archived
+
+  # Someone else's public source repos, as working copies
+  github-helpers download --user octocat --source --checkout
+EOF
+  exit 0
+}
+
+cmd_download_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)          need_arg "--dir" "${2:-}"; DOWNLOAD_DIR="$2"; shift 2 ;;
+      --org)          need_arg "--org" "${2:-}"; DOWNLOAD_OWNERS="${DOWNLOAD_OWNERS} $2"; shift 2 ;;
+      --user)         need_arg "--user" "${2:-}"; DOWNLOAD_OWNERS="${DOWNLOAD_OWNERS} $2"; shift 2 ;;
+      --repo)         need_arg "--repo" "${2:-}"; DOWNLOAD_REPO="$2"; shift 2 ;;
+      --mine)         DOWNLOAD_MINE=true; shift ;;
+      --checkout)     DOWNLOAD_CHECKOUT=true; shift ;;
+      --wikis)        DOWNLOAD_WIKIS=true; shift ;;
+      --archived)     DOWNLOAD_ARCHIVED="true"; shift ;;
+      --not-archived) DOWNLOAD_ARCHIVED="false"; shift ;;
+      --fork)         DOWNLOAD_FORK="true"; shift ;;
+      --source)       DOWNLOAD_FORK="false"; shift ;;
+      --visibility)   need_arg "--visibility" "${2:-}"; DOWNLOAD_VISIBILITY="$2"; shift 2 ;;
+      --limit)        need_arg "--limit" "${2:-}"; DOWNLOAD_LIMIT="$2"; shift 2 ;;
+      --dry-run)      DRY_RUN=true; shift ;;
+      -y|--yes)       AUTO_YES=true; shift ;;
+      -v|--verbose)   VERBOSE=true; shift ;;
+      -h|--help)      cmd_download_usage ;;
+      *) die "download: unknown option: $1" ;;
+    esac
+  done
+  DOWNLOAD_OWNERS="${DOWNLOAD_OWNERS# }"
+
+  local owner
+  for owner in $DOWNLOAD_OWNERS; do
+    [[ "$owner" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die "download: invalid owner name: ${owner}"
+  done
+  if [ -n "$DOWNLOAD_REPO" ] && ! [[ "$DOWNLOAD_REPO" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$ ]]; then
+    die "download: --repo must be OWNER/NAME"
+  fi
+  if [ -n "$DOWNLOAD_REPO" ] && { [ -n "$DOWNLOAD_OWNERS" ] || $DOWNLOAD_MINE; }; then
+    die "download: --repo cannot be combined with --org, --user or --mine"
+  fi
+  if $DOWNLOAD_MINE && [ -n "$DOWNLOAD_OWNERS" ]; then
+    die "download: --mine cannot be combined with --org or --user"
+  fi
+  case "$DOWNLOAD_VISIBILITY" in
+    ""|public|private|internal) ;;
+    *) die "download: --visibility must be public, private or internal" ;;
+  esac
+  if [ "$DOWNLOAD_LIMIT" != "0" ] && ! [[ "$DOWNLOAD_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+    die "download: --limit must be a positive number"
+  fi
+  return 0
+}
+
+# ── Pure helpers (unit-tested) ───────────────────────────────────────────────
+# Both listing sources are normalised to one row shape:
+#   {nwo, visibility, archived, fork, size_kb, pushed_at, has_wiki}
+
+# REST /user/repos array on stdin -> normalised rows
+cmd_download_from_rest() {
+  jq -c '[.[] | {nwo: .full_name,
+                 visibility: (.visibility // (if .private then "private" else "public" end)),
+                 archived: (.archived // false), fork: (.fork // false),
+                 size_kb: (.size // 0), pushed_at: (.pushed_at // ""),
+                 has_wiki: (.has_wiki // false)}]'
+}
+
+# `gh repo list|view --json $DOWNLOAD_GH_FIELDS` array on stdin -> normalised rows
+cmd_download_from_gh() {
+  jq -c '[.[] | {nwo: .nameWithOwner,
+                 visibility: ((.visibility // "public") | ascii_downcase),
+                 archived: (.isArchived // false), fork: (.isFork // false),
+                 size_kb: (.diskUsage // 0), pushed_at: (.pushedAt // ""),
+                 has_wiki: (.hasWikiEnabled // false)}]'
+}
+
+# cmd_download_select <archived> <fork> <visibility>
+# stdin: one or more normalised arrays -> one array, filtered, deduplicated
+# case-insensitively (an org repo you also collaborate on is listed twice) and
+# sorted. A name that is not a plain OWNER/NAME never reaches a filesystem path.
+cmd_download_select() {
+  jq -sc --arg a "$1" --arg f "$2" --arg v "$3" '
+    (add // [])
+    | map(select(.nwo | test("^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$")))
+    | map(select(.nwo | test("/[.]{1,2}$") | not))
+    | map(select($a == "" or (.archived | tostring) == $a))
+    | map(select($f == "" or (.fork | tostring) == $f))
+    | map(select($v == "" or .visibility == $v))
+    | unique_by(.nwo | ascii_downcase)'
+}
+
+# cmd_download_path <dir> <nwo> <checkout> — where a repo lives locally
+cmd_download_path() {
+  if [ "$3" = true ]; then
+    printf '%s/%s' "$1" "$2"
+  else
+    printf '%s/%s.git' "$1" "$2"
+  fi
+}
+
+# cmd_download_git_reason <git stderr> — one-line reason for skip_note
+cmd_download_git_reason() {
+  case "$1" in
+    *SAML*|*saml*)                       echo "SAML SSO not authorized for this org" ;;
+    *"No space left"*)                   echo "disk full" ;;
+    *"not found"*|*"error: 404"*)        echo "not found or no access" ;;
+    *"error: 403"*)                      echo "forbidden (403)" ;;
+    *"Authentication failed"*|*"could not read Username"*|*"terminal prompts disabled"*|*"error: 401"*)
+                                         echo "authentication failed" ;;
+    *"Could not resolve host"*|*"timed out"*|*"Connection reset"*)
+                                         echo "network error" ;;
+    *)                                   echo "git failed" ;;
+  esac
+}
+
+# cmd_download_orphans <dir> <checkout> <nwo-list-file> <all-owners>
+# Local repos GitHub no longer lists: deleted, renamed or access lost. Looks
+# under every owner directory when <all-owners> is true, otherwise only under
+# the owners present in the list. Reported, never removed.
+cmd_download_orphans() {
+  local dir="$1" checkout="$2" list="$3" all="$4" owner d nwo
+  local owners
+  owners=$(tmp_new)
+  if [ "$all" = true ]; then
+    for d in "$dir"/*/; do
+      [ -d "$d" ] && basename "$d"
+    done > "$owners"
+  else
+    cut -d/ -f1 "$list" | sort -fu > "$owners"
+  fi
+  while IFS= read -r owner; do
+    [ -n "$owner" ] && [ -d "${dir}/${owner}" ] || continue
+    for d in "${dir}/${owner}"/*; do
+      [ -d "$d" ] || continue
+      case "$d" in *.part|*.wiki.git) continue ;; esac
+      if [ "$checkout" = true ]; then
+        [ -e "${d}/.git" ] || continue
+        nwo="${owner}/${d##*/}"
+      else
+        case "$d" in *.git) ;; *) continue ;; esac
+        nwo="${owner}/$(basename "$d" .git)"
+      fi
+      grep -qixF -- "$nwo" "$list" || printf '%s\n' "$nwo"
+    done
+  done < "$owners"
+}
+
+# ── Git ──────────────────────────────────────────────────────────────────────
+# cmd_download_git <git args...> — git with gh as the credential helper.
+# Not git_mirror_clone: `gh repo clone` installs the helper for the clone only,
+# so the next run's fetch would fail on a private repo unless the user ran
+# `gh auth setup-git`, and its origin may be SSH. Here every clone and fetch
+# goes over HTTPS with the gh token. GIT_TERMINAL_PROMPT=0: a missing wiki or a
+# revoked token must fail, not hang a cron run on a password prompt.
+cmd_download_git() {
+  GIT_TERMINAL_PROMPT=0 git \
+    -c credential.https://github.com.helper= \
+    -c 'credential.https://github.com.helper=!gh auth git-credential' "$@"
+}
+
+# Fingerprint of every ref, to tell "updated" from "already current"
+cmd_download_refs() {
+  git -C "$1" for-each-ref --format='%(objectname) %(refname)' 2>/dev/null | cksum
+}
+
+# cmd_download_one <nwo> <path> — clone or refresh one repo. Sets
+# DOWNLOAD_RESULT to cloned, updated, current or failed; a global because
+# $(…) would run it in a subshell and lose skip_note's counter.
+cmd_download_one() {
+  local nwo="$1" path="$2" errfile before part
+  errfile=$(tmp_new)
+  DOWNLOAD_RESULT="failed"
+
+  if [ -d "$path" ]; then
+    before=$(cmd_download_refs "$path")
+    # No --prune: a branch deleted on GitHub stays here. That is the point.
+    if ! cmd_download_git -C "$path" fetch --quiet --tags origin 2>"$errfile"; then
+      skip_note "$nwo" "fetch: $(cmd_download_git_reason "$(cat "$errfile")")"
+      return 0
+    fi
+    if $DOWNLOAD_CHECKOUT; then
+      # Fast-forward only: a local commit or a dirty tree is someone's work.
+      if ! git -C "$path" merge --ff-only --quiet '@{u}' >/dev/null 2>&1; then
+        $VERBOSE && echo -e "      ${DIM}fetched, working tree left as is (not a fast-forward)${NC}" >&2
+      fi
+    fi
+    DOWNLOAD_RESULT="current"
+    [ "$(cmd_download_refs "$path")" != "$before" ] && DOWNLOAD_RESULT="updated"
+    return 0
+  fi
+
+  # Clone into .part and rename on success: a final directory is a complete one.
+  part="${path}.part"
+  rm -rf "$part"
+  mkdir -p "$(dirname "$path")"
+  local -a mode=(--mirror)
+  $DOWNLOAD_CHECKOUT && mode=()
+  if cmd_download_git clone --quiet "${mode[@]+"${mode[@]}"}" "https://github.com/${nwo}.git" "$part" 2>"$errfile" \
+     && mv "$part" "$path"; then
+    DOWNLOAD_RESULT="cloned"
+  else
+    rm -rf "$part"
+    skip_note "$nwo" "clone: $(cmd_download_git_reason "$(cat "$errfile")")"
+  fi
+  return 0
+}
+
+# cmd_download_wiki <nwo> <dir> — returns 0 when a wiki was cloned or refreshed.
+# has_wiki only means the feature is on; most such wikis have no content and
+# GitHub answers "not found", which is not worth a skip.
+cmd_download_wiki() {
+  local nwo="$1" path="${2}/${1}.wiki.git"
+  if [ -d "$path" ]; then
+    cmd_download_git -C "$path" fetch --quiet origin 2>/dev/null && return 0
+    skip_note "${nwo} (wiki)" "wiki fetch failed"
+    return 1
+  fi
+  rm -rf "${path}.part"
+  if cmd_download_git clone --quiet --mirror "https://github.com/${nwo}.wiki.git" "${path}.part" 2>/dev/null \
+     && mv "${path}.part" "$path"; then
+    return 0
+  fi
+  rm -rf "${path}.part"
+  return 1
+}
+
+# cmd_download_write_index <dir> <rows-file> <results-jsonl>
+# Merges into the previous index, so a run scoped to one org keeps the others.
+cmd_download_write_index() {
+  local dir="$1" rows="$2" results="$3"
+  local idx="${dir}/index.json"
+  local old
+  old=$(tmp_new)
+  if [ -f "$idx" ]; then
+    jq -c '.repos // []' "$idx" > "$old" 2>/dev/null || : > "$old"
+  fi
+  jq -n --arg version "$VERSION" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --slurpfile old "$old" --slurpfile rows "$rows" --slurpfile res "$results" '
+    ($res | map({key: .nwo, value: .}) | from_entries) as $r
+    | (($old[0] // []) | map({key: .nwo, value: .}) | from_entries) as $o
+    | $o + ($rows[0] | map(select($r[.nwo]) | {key: .nwo, value: (($o[.nwo] // {}) + . + $r[.nwo])}) | from_entries)
+    | {tool: "github-helpers", version: $version, updated_at: $at,
+       repos: ([.[]] | sort_by(.nwo | ascii_downcase))}' > "${idx}.part" \
+    && mv "${idx}.part" "$idx"
+}
+
+cmd_download_main() {
+  cmd_download_parse_args "$@"
+  preflight_check
+  command -v git &>/dev/null || die "download: git is required"
+  skip_init
+
+  local scope
+  if [ -n "$DOWNLOAD_REPO" ]; then
+    scope="$DOWNLOAD_REPO"
+  elif [ -n "$DOWNLOAD_OWNERS" ]; then
+    scope="$DOWNLOAD_OWNERS"
+  elif $DOWNLOAD_MINE; then
+    scope="repos you own"
+  else
+    scope="everything you can access (owner, collaborator, organization member)"
+  fi
+
+  header "Download"
+  echo -e "  Scope: ${BOLD}${scope}${NC}"
+  echo -e "  Dir:   ${BOLD}${DOWNLOAD_DIR}${NC}"
+  echo -e "  Mode:  ${BOLD}$($DOWNLOAD_CHECKOUT && echo "working copies" || echo "bare mirrors")${NC}$($DOWNLOAD_WIKIS && echo " + wikis")"
+  local -a filters=()
+  [ "$DOWNLOAD_ARCHIVED" = "true" ]  && filters+=("archived")
+  [ "$DOWNLOAD_ARCHIVED" = "false" ] && filters+=("not-archived")
+  [ "$DOWNLOAD_FORK" = "true" ]      && filters+=("forks only")
+  [ "$DOWNLOAD_FORK" = "false" ]     && filters+=("source only")
+  [ -n "$DOWNLOAD_VISIBILITY" ]      && filters+=("$DOWNLOAD_VISIBILITY")
+  if [ ${#filters[@]} -gt 0 ]; then
+    echo -e "  Filters: ${DIM}$(IFS=','; echo "${filters[*]}" | sed 's/,/, /g')${NC}"
+  fi
+  $DRY_RUN && echo -e "  ${YELLOW}DRY RUN${NC} (nothing is downloaded)"
+  echo ""
+
+  # ── List ───────────────────────────────────────────────────────────────────
+  echo -e "${DIM}Listing repositories...${NC}"
+  local raw rows json owner
+  raw=$(tmp_new)
+  rows=$(tmp_new)
+  if [ -n "$DOWNLOAD_REPO" ]; then
+    json=$(gh repo view "$DOWNLOAD_REPO" --json "$DOWNLOAD_GH_FIELDS" 2>/dev/null) \
+      || die "download: cannot read ${DOWNLOAD_REPO} (not found or no access)"
+    printf '%s' "$json" | jq -c '[.]' | cmd_download_from_gh > "$raw"
+  elif [ -n "$DOWNLOAD_OWNERS" ]; then
+    for owner in $DOWNLOAD_OWNERS; do
+      if json=$(gh repo list "$owner" --limit 100000 --json "$DOWNLOAD_GH_FIELDS" 2>/dev/null); then
+        printf '%s' "$json" | cmd_download_from_gh >> "$raw"
+      else
+        skip_note "$owner" "cannot list repos (unknown owner or no access)"
+      fi
+    done
+  else
+    local aff="owner,collaborator,organization_member"
+    $DOWNLOAD_MINE && aff="owner"
+    json=$(gh_paginate "user/repos" "user/repos?affiliation=${aff}&per_page=100") \
+      || die "download: failed to list your repositories"
+    printf '%s' "$json" | cmd_download_from_rest > "$raw"
+  fi
+  cmd_download_select "$DOWNLOAD_ARCHIVED" "$DOWNLOAD_FORK" "$DOWNLOAD_VISIBILITY" < "$raw" > "$rows"
+
+  local total
+  total=$(jq 'length' "$rows")
+  if [ "$DOWNLOAD_LIMIT" -gt 0 ] && [ "$total" -gt "$DOWNLOAD_LIMIT" ]; then
+    warn "download: limited to ${DOWNLOAD_LIMIT} of ${total} repos — raise or drop --limit"
+    jq -c ".[:${DOWNLOAD_LIMIT}]" "$rows" > "${rows}.cut" && mv "${rows}.cut" "$rows"
+    total="$DOWNLOAD_LIMIT"
+  fi
+  if [ "$total" -eq 0 ]; then
+    echo "No repository matches."
+    print_skips
+    exit 0
+  fi
+
+  # ── Plan ───────────────────────────────────────────────────────────────────
+  local plan nwo vis archived has_wiki size_kb path
+  local n_new=0 n_existing=0 new_kb=0 n_private=0
+  plan=$(tmp_new)
+  jq -r '.[] | [.nwo, .visibility, (.archived | tostring), (.has_wiki | tostring), (.size_kb | tostring)] | @tsv' \
+    "$rows" > "$plan"
+  while IFS=$'\t' read -r nwo vis archived has_wiki size_kb; do
+    path=$(cmd_download_path "$DOWNLOAD_DIR" "$nwo" "$DOWNLOAD_CHECKOUT")
+    [ "$vis" = "public" ] || n_private=$((n_private + 1))
+    if [ -d "$path" ]; then
+      n_existing=$((n_existing + 1))
+      $DRY_RUN && echo -e "  ${CYAN}REFRESH${NC}  ${nwo} ${DIM}(${vis})${NC}"
+    else
+      n_new=$((n_new + 1))
+      new_kb=$((new_kb + size_kb))
+      $DRY_RUN && echo -e "  ${GREEN}CLONE${NC}    ${nwo} ${DIM}(${vis}, ~$(human_bytes $((size_kb * 1024))))${NC}"
+    fi
+  done < "$plan"
+
+  local estimate=""
+  [ "$n_new" -gt 0 ] && estimate=" (~$(human_bytes $((new_kb * 1024))), GitHub's estimate)"
+  echo -e "Found ${BOLD}${total}${NC} repo(s), ${n_private} private or internal: ${BOLD}${n_new}${NC} to clone${estimate}, ${BOLD}${n_existing}${NC} to refresh"
+
+  if $DRY_RUN; then
+    echo ""
+    echo -e "${YELLOW}DRY RUN — nothing was downloaded.${NC}"
+    print_skips
+    exit 0
+  fi
+  if ! confirm "Clone ${n_new} and refresh ${n_existing} repo(s) into ${DOWNLOAD_DIR}?"; then
+    echo "Aborted."
+    exit 0
+  fi
+
+  mkdir -p "$DOWNLOAD_DIR" || die "download: cannot create ${DOWNLOAD_DIR}"
+
+  # ── Download ───────────────────────────────────────────────────────────────
+  local results i=0 n_cloned=0 n_updated=0 n_current=0 n_failed=0 n_wikis=0 now
+  results=$(tmp_new)
+  while IFS=$'\t' read -r nwo vis archived has_wiki size_kb; do
+    i=$((i + 1))
+    path=$(cmd_download_path "$DOWNLOAD_DIR" "$nwo" "$DOWNLOAD_CHECKOUT")
+    cmd_download_one "$nwo" "$path"
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    case "$DOWNLOAD_RESULT" in
+      cloned)  n_cloned=$((n_cloned + 1));   echo -e "  ${GREEN}[${i}/${total}] CLONED${NC}   ${nwo}" ;;
+      updated) n_updated=$((n_updated + 1)); echo -e "  ${CYAN}[${i}/${total}] UPDATED${NC}  ${nwo}" ;;
+      current) n_current=$((n_current + 1)); $VERBOSE && echo -e "  ${DIM}[${i}/${total}] CURRENT  ${nwo}${NC}" ;;
+      *)       n_failed=$((n_failed + 1));   echo -e "  ${RED}[${i}/${total}] FAILED${NC}   ${nwo}" ;;
+    esac
+    if [ "$DOWNLOAD_RESULT" = "failed" ]; then
+      jq -nc --arg nwo "$nwo" --arg at "$now" '{nwo: $nwo, status: "failed", checked_at: $at}' >> "$results"
+    else
+      jq -nc --arg nwo "$nwo" --arg at "$now" --arg st "$DOWNLOAD_RESULT" --arg path "${path#"$DOWNLOAD_DIR"/}" \
+        '{nwo: $nwo, status: $st, path: $path, checked_at: $at, synced_at: $at}' >> "$results"
+    fi
+    if $DOWNLOAD_WIKIS && [ "$has_wiki" = "true" ] && [ "$DOWNLOAD_RESULT" != "failed" ]; then
+      cmd_download_wiki "$nwo" "$DOWNLOAD_DIR" && n_wikis=$((n_wikis + 1))
+    fi
+  done < "$plan"
+
+  cmd_download_write_index "$DOWNLOAD_DIR" "$rows" "$results" \
+    || warn "download: could not write ${DOWNLOAD_DIR}/index.json"
+
+  # ── Gone from GitHub ───────────────────────────────────────────────────────
+  # Only meaningful when this run saw an owner's full list.
+  local orphans n_orphans=0
+  if [ -z "$DOWNLOAD_REPO" ] && [ ${#filters[@]} -eq 0 ] && [ "$DOWNLOAD_LIMIT" -eq 0 ]; then
+    local names all_owners=false
+    names=$(tmp_new)
+    jq -r '.[].nwo' "$rows" > "$names"
+    [ -z "$DOWNLOAD_OWNERS" ] && ! $DOWNLOAD_MINE && all_owners=true
+    orphans=$(tmp_new)
+    cmd_download_orphans "$DOWNLOAD_DIR" "$DOWNLOAD_CHECKOUT" "$names" "$all_owners" > "$orphans"
+    n_orphans=$(count_lines "$orphans")
+  fi
+
+  echo ""
+  echo -e "${GREEN}Done!${NC} Cloned: ${BOLD}${n_cloned}${NC}, Updated: ${BOLD}${n_updated}${NC}, Already current: ${BOLD}${n_current}${NC}, Failed: ${BOLD}${n_failed}${NC}"
+  $DOWNLOAD_WIKIS && echo -e "Wikis: ${BOLD}${n_wikis}${NC}"
+  echo -e "Index: ${BOLD}${DOWNLOAD_DIR}/index.json${NC}"
+  if [ "$n_orphans" -gt 0 ]; then
+    echo -e "${YELLOW}${n_orphans} local repo(s) no longer listed on GitHub${NC} ${DIM}(deleted, renamed or access lost — kept)${NC}:"
+    sed 's/^/    /' "$orphans"
+  fi
+  print_skips
+
+  [ "$n_failed" -gt 0 ] && exit 2
+  exit 0
+}
+
+# =============================================================================
 # COMMAND: inbox
 # =============================================================================
 
@@ -10372,6 +10858,7 @@ main() {
     follow-audit|follow)   cmd_follow_audit_main "$@" ;;
     bulk-merge)            cmd_bulk_merge_main "$@" ;;
     backup)                cmd_backup_main "$@" ;;
+    download|dl)           cmd_download_main "$@" ;;
     cleanup-branches)      cmd_cleanup_branches_main "$@" ;;
     archive-repos)         cmd_archive_repos_main "$@" ;;
     repo-audit|audit)      cmd_repo_audit_main "$@" ;;
