@@ -1010,6 +1010,68 @@ done
 dl_reset
 
 echo ""
+# ── 18. auth failure diagnosis ──────────────────────────────────────────────
+echo -e "${BOLD}18. auth failure diagnosis${NC}"
+
+# Each scenario stubs gh in a subshell: GH_TOKEN_OK says whether a token is
+# stored, GH_RESET is what the rate_limit jq filter prints (empty = quota left).
+auth_scenario() {
+  (
+    GH_TOKEN_OK="$1" GH_RESET="$2"
+    gh() {
+      case "$1 $2" in
+        "auth token")     [ "$GH_TOKEN_OK" = true ] ;;
+        "api rate_limit") [ -n "$GH_RESET" ] && echo "$GH_RESET"; return 0 ;;
+        "api user")       return 1 ;;
+        *)                return 1 ;;
+      esac
+    }
+    "$3" 2>&1
+  )
+}
+
+output=$(auth_scenario false "" auth_failure_die) && rc=0 || rc=$?
+assert_exit_code "no token: auth_failure_die exits" 1 $rc
+assert_match "no token: asks for gh auth login" "not logged in" "$output"
+
+output=$(auth_scenario true "22:30" auth_failure_die) && rc=0 || rc=$?
+assert_exit_code "rate limited: auth_failure_die exits" 1 $rc
+assert_match "rate limited: names the limit and reset time" "rate limit exhausted \(resets at 22:30\)" "$output"
+
+output=$(auth_scenario true "" auth_failure_die) && rc=0 || rc=$?
+assert_match "rejected token: points at gh auth status" "could not validate its token" "$output"
+
+output=$(auth_scenario true "22:30" get_username) && rc=0 || rc=$?
+assert_match "get_username: explains an exhausted rate limit" "rate limit exhausted" "$output"
+
+output=$(auth_scenario true "" get_username) && rc=0 || rc=$?
+assert_match "get_username: generic failure otherwise" "could not detect authenticated user" "$output"
+
+# ── status: token state and rate-limit rows ──
+assert_eq "status: success is valid" "valid" "$(cmd_status_token_state success "")"
+assert_eq "status: a rate-limit error is not a bad token" "rate-limited" \
+  "$(cmd_status_token_state error "HTTP 403: API rate limit exceeded for user ID 1.")"
+assert_eq "status: any other error is a rejected token" "rejected" "$(cmd_status_token_state error "HTTP 401: Bad credentials")"
+assert_eq "status: no host is logged out" "logged-out" "$(cmd_status_token_state logged-out "")"
+
+rl='{"resources":{
+  "scim":{"limit":15000,"used":0,"remaining":15000,"reset":1000},
+  "search":{"limit":30,"used":0,"remaining":30,"reset":1000},
+  "graphql":{"limit":5000,"used":12,"remaining":4988,"reset":3000},
+  "audit_log":{"limit":1750,"used":3,"remaining":1747,"reset":1000},
+  "core":{"limit":5000,"used":5000,"remaining":0,"reset":1090}}}'
+assert_eq "status: main buckets first, then used ones" "core graphql search audit_log" \
+  "$(cmd_status_rows "$rl" 1000 false | jq -r 'map(.bucket) | join(" ")')"
+assert_eq "status: --all keeps untouched buckets" "5" "$(cmd_status_rows "$rl" 1000 true | jq 'length')"
+assert_eq "status: reset rounded up to the minute" "2" \
+  "$(cmd_status_rows "$rl" 1000 false | jq '.[0].reset_in_min')"
+assert_eq "status: a past reset never goes negative" "0" \
+  "$(cmd_status_rows "$rl" 5000 false | jq '.[0].reset_in_min')"
+(cmd_status_parse_args --format xml) &>/dev/null && rc=0 || rc=1
+assert_exit_code "status rejects a bad --format" 1 $rc
+STATUS_FORMAT="text"
+
+echo ""
 # ── 10. Script syntax check ─────────────────────────────────────────────────
 echo -e "${BOLD}10. Script integrity${NC}"
 

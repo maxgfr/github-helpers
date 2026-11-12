@@ -11,7 +11,8 @@ set -euo pipefail
 #   Audit & visibility: repo-audit (audit), stats, workflow-status (ci),
 #     secret-audit, license-check, vulnerability-check, branch-protection,
 #     webhook-audit, collaborator-audit, activity-report, traffic, org-audit,
-#     follow-audit (follow), inbox (recap), branches (branch-status)
+#     follow-audit (follow), inbox (recap), branches (branch-status),
+#     status
 #   Bulk operations: clone-org, bulk-topic, sync-labels, export-stars,
 #     rename-default-branch, dependabot-enable, mirror, bulk-settings,
 #     repo-template, bulk-merge, backup, download (dl)
@@ -56,22 +57,56 @@ need_arg() {
   [ -n "${2:-}" ] || die "$1 requires a value"
 }
 
-preflight_check() {
+preflight_tools() {
   if ! command -v gh &>/dev/null; then
     die "gh CLI is required (https://cli.github.com)"
   fi
   if ! command -v jq &>/dev/null; then
     die "jq is required (brew install jq)"
   fi
+}
+
+preflight_check() {
+  preflight_tools
   if ! gh auth status &>/dev/null; then
-    die "not logged in. Run 'gh auth login' first."
+    auth_failure_die
   fi
 }
 
+# rate_limit_note — a sentence when the REST core quota is exhausted, nothing
+# otherwise. GET /rate_limit does not count against the quota, so asking is free.
+rate_limit_note() {
+  local reset
+  reset=$(gh api rate_limit --jq \
+    'select(.resources.core.remaining == 0) | .resources.core.reset | strflocaltime("%H:%M")' \
+    2>/dev/null) || return 0
+  [ -n "$reset" ] || return 0
+  echo "GitHub API rate limit exhausted (resets at ${reset}). Your login is fine: wait for the reset."
+}
+
+# gh auth status fails for three different reasons: no token, an exhausted rate
+# limit (GitHub answers 403 and gh reports the token as invalid), or a token
+# that is really rejected. Telling them apart saves a pointless re-login.
+auth_failure_die() {
+  local note
+  if ! gh auth token &>/dev/null; then
+    die "not logged in. Run 'gh auth login' first."
+  fi
+  note=$(rate_limit_note)
+  if [ -n "$note" ]; then
+    die "$note"
+  fi
+  die "gh could not validate its token (rejected, or GitHub unreachable). Run 'gh auth status' for details."
+}
+
 get_username() {
-  local user
+  local user note
   user=$(gh api user -q '.login' 2>/dev/null)
   if [ -z "$user" ]; then
+    note=$(rate_limit_note)
+    if [ -n "$note" ]; then
+      die "$note"
+    fi
     die "could not detect authenticated user"
   fi
   echo "$user"
@@ -323,12 +358,18 @@ resolve_repo_list() {
   printf '%s' "$f"
 }
 
+# token_scopes — the token's comma-separated OAuth scopes; empty when GitHub
+# does not say (fine-grained PAT / GitHub App). Costs one core request.
+token_scopes() {
+  gh api user -i 2>/dev/null | tr -d '\r' \
+    | awk 'tolower($1) == "x-oauth-scopes:" { sub(/^[^:]*:[ ]*/, ""); print; exit }'
+}
+
 # require_scope <scope> — 0 if the token carries it, or if scopes are
 # unknowable (fine-grained PAT / GitHub App emit no X-Oauth-Scopes header).
 require_scope() {
   local want="$1" scopes
-  scopes=$(gh api user -i 2>/dev/null | tr -d '\r' \
-    | awk 'tolower($1) == "x-oauth-scopes:" { sub(/^[^:]*:[ ]*/, ""); print; exit }') || scopes=""
+  scopes=$(token_scopes) || scopes=""
   [ -z "$scopes" ] && return 0
   case ",${scopes// /}," in
     *",${want},"*) return 0 ;;
@@ -460,6 +501,7 @@ ${BOLD}COMMANDS${NC}
   traffic             Snapshot repo views and clones (14-day window)
   inbox               What is waiting on you: replies, reviews, new issues
   branches            Open branches, ahead/behind the default branch
+  status              Login, token scopes and API rate limits (free to run)
 
   ${BOLD}Bulk operations${NC}
   clone-org           Clone all repos from a GitHub org or user
@@ -10819,6 +10861,167 @@ cmd_inbox_main() {
   fi
   return 0
 }
+
+# =============================================================================
+# COMMAND: status — who you are logged in as, and what is left of each quota
+# =============================================================================
+
+STATUS_FORMAT="text"
+STATUS_ALL=false
+# Shown even when untouched; other buckets only once something used them.
+STATUS_MAIN_BUCKETS="core graphql search code_search"
+
+cmd_status_usage() {
+  cat <<EOF
+${BOLD}github-helpers status${NC} ${DIM}v${VERSION}${NC} — Login, token and API rate limits
+
+${BOLD}USAGE${NC}
+  github-helpers status [options]
+
+${BOLD}OPTIONS${NC}
+  --all                   Show every rate-limit bucket, not only the used ones
+  --format FORMAT         text, json, csv or md (default: text; csv/md list the buckets)
+  -h, --help              Show this help
+
+${BOLD}EXAMPLES${NC}
+  github-helpers status
+  github-helpers status --format json | jq '.rate_limits[] | select(.remaining == 0)'
+
+${BOLD}NOTE${NC}
+  Reading the rate limits is free: GET /rate_limit does not count against any
+  quota, so this works even when every other command is blocked. Listing the
+  token scopes costs one core request and is skipped when the core quota is 0.
+
+  The REST quota (core, 5000/h) is shared by everything that uses your account:
+  gh, scripts, agents, editors. github-helpers sweeps spend about one request
+  per repo and per page, so a large sweep can use it up.
+EOF
+  exit 0
+}
+
+cmd_status_parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)        STATUS_ALL=true; shift ;;
+      --format)     need_arg "--format" "${2:-}"; STATUS_FORMAT="$2"; shift 2 ;;
+      -h|--help)    cmd_status_usage ;;
+      *) die "status: unknown option: $1" ;;
+    esac
+  done
+  case "$STATUS_FORMAT" in text|json|csv|md) ;; *) die "status: invalid --format '${STATUS_FORMAT}' (use text, json, csv or md)" ;; esac
+  return 0
+}
+
+# cmd_status_token_state <gh-state> <gh-error> -> valid|rate-limited|rejected|logged-out
+# gh reports an exhausted quota as an "error" state: the token itself is fine.
+cmd_status_token_state() {
+  case "$1" in
+    success) echo "valid" ;;
+    logged-out|"") echo "logged-out" ;;
+    *)
+      if [[ "$2" =~ [Rr]ate\ limit ]]; then echo "rate-limited"; else echo "rejected"; fi ;;
+  esac
+}
+
+# cmd_status_rows <rate_limit-json> <now-epoch> <all:true|false> -> JSON array,
+# main buckets first in STATUS_MAIN_BUCKETS order, then the rest by name.
+cmd_status_rows() {
+  jq -c --argjson now "$2" --argjson all "$3" --arg main "$STATUS_MAIN_BUCKETS" '
+    ($main | split(" ")) as $m
+    | .resources | to_entries
+    | map(.key as $k | select($all or ($m | index($k)) != null or .value.used > 0))
+    | sort_by((.key as $k | $m | index($k)) // 99, .key)
+    | map({bucket: .key, used: .value.used, remaining: .value.remaining,
+           limit: .value.limit, reset_at: (.value.reset | todate),
+           reset_in_min: ([((.value.reset - $now) / 60 | ceil), 0] | max)})' <<<"$1"
+}
+
+# cmd_status_account -> {login, token_source, gh_state, error} for github.com
+cmd_status_account() {
+  local auth
+  auth=$(gh auth status --hostname github.com --json hosts 2>/dev/null) || auth='{"hosts":{}}'
+  jq -c '[.hosts[]?[]? | select(.active)][0] // {}
+    | {login: (.login // null), token_source: (.tokenSource // null),
+       gh_state: (.state // "logged-out"), error: (.error // null)}' <<<"$auth"
+}
+
+cmd_status_main() {
+  cmd_status_parse_args "$@"
+  preflight_tools
+
+  local account state limits rows now core_left scopes=""
+  account=$(cmd_status_account)
+  state=$(cmd_status_token_state "$(jq -r '.gh_state' <<<"$account")" "$(jq -r '.error // ""' <<<"$account")")
+  if [ "$state" = "logged-out" ]; then
+    die "not logged in. Run 'gh auth login' first."
+  fi
+
+  limits=$(gh api rate_limit 2>/dev/null) \
+    || die "could not read rate limits: token rejected or GitHub unreachable. Run 'gh auth status' for details."
+  now=$(date +%s)
+  rows=$(cmd_status_rows "$limits" "$now" "$STATUS_ALL")
+  core_left=$(jq -r '.resources.core.remaining' <<<"$limits")
+  # gh flags a token as invalid on any failed check; /rate_limit answering
+  # proves it works, so only the quota can be the problem.
+  if [ "$state" = "rejected" ]; then
+    state="valid"
+  fi
+  if [ "$core_left" = "0" ]; then
+    state="rate-limited"
+  else
+    scopes=$(token_scopes) || scopes=""
+  fi
+
+  case "$STATUS_FORMAT" in
+    json)
+      jq -n --argjson a "$account" --arg state "$state" --arg scopes "$scopes" --argjson rows "$rows" '
+        {account: ($a | del(.gh_state, .error) + {token: $state,
+           scopes: (if $scopes == "" then null else ($scopes | split(", ")) end)}),
+         rate_limits: $rows}'
+      return 0 ;;
+    csv|md)
+      render_rows "$STATUS_FORMAT" "$rows"
+      return 0 ;;
+  esac
+
+  header "Status" >&2
+  local login source state_txt scopes_txt
+  login=$(jq -r '.login // "?"' <<<"$account")
+  source=$(jq -r '.token_source // "?"' <<<"$account")
+  case "$state" in
+    valid)        state_txt="${GREEN}valid${NC}" ;;
+    rate-limited) state_txt="${YELLOW}valid, but the core quota is exhausted${NC}" ;;
+  esac
+  if [ -n "$scopes" ]; then
+    scopes_txt="$scopes"
+  elif [ "$core_left" = "0" ]; then
+    scopes_txt="${DIM}not checked (core quota exhausted)${NC}"
+  else
+    scopes_txt="${DIM}not reported (fine-grained token or GitHub App)${NC}"
+  fi
+  echo -e "  Account: ${BOLD}${login}${NC} ${DIM}(token from ${source})${NC}"
+  echo -e "  Token:   ${state_txt}"
+  echo -e "  Scopes:  ${scopes_txt}"
+  echo ""
+
+  local line bucket used remaining limit reset_at reset_in colour cell
+  printf -v line '  %-22s %7s %9s %7s  %s' "BUCKET" "USED" "REMAINING" "LIMIT" "RESETS"
+  echo -e "${BOLD}${line}${NC}"
+  while IFS=$'\t' read -r bucket used remaining limit reset_at reset_in; do
+    if [ "$remaining" -eq 0 ]; then colour="$RED"
+    elif [ $((remaining * 10)) -lt "$limit" ]; then colour="$YELLOW"
+    else colour="$GREEN"; fi
+    printf -v cell '%9s' "$remaining"
+    printf -v line '  %-22s %7s %s %7s' "$bucket" "$used" "${colour}${cell}${NC}" "$limit"
+    if [ "$used" -eq 0 ]; then
+      echo -e "${line}  ${DIM}-${NC}"
+    else
+      echo -e "${line}  $(jq -rn --arg t "$reset_at" '$t | fromdate | strflocaltime("%H:%M")') ${DIM}(in ${reset_in} min)${NC}"
+    fi
+  done < <(jq -r '.[] | [.bucket, .used, .remaining, .limit, .reset_at, .reset_in_min] | @tsv' <<<"$rows")
+  return 0
+}
+
 # =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
@@ -10886,6 +11089,7 @@ main() {
     activity-report)       cmd_activity_report_main "$@" ;;
     inbox|recap)           cmd_inbox_main "$@" ;;
     branches|branch-status) cmd_branches_main "$@" ;;
+    status)                cmd_status_main "$@" ;;
     version|-V|--version)  echo "github-helpers v${VERSION}" ;;
     help|-h|--help)        usage ;;
     *)

@@ -164,6 +164,15 @@ jobs:
       - name: Test branch-status alias (branches) help
         run: ./script.sh branch-status --help
 
+      - name: Test status help
+        run: ./script.sh status --help
+
+      - name: Test status rejects a bad --format
+        run: |
+          if ./script.sh status --format xml 2>/dev/null; then
+            echo "Should have failed" && exit 1
+          fi
+
       - name: Test forks alias (cleanup-forks) help
         run: ./script.sh forks --help
 

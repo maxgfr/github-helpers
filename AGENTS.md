@@ -22,7 +22,9 @@ Defined at the top of `script.sh`. **Use them — do not re-implement.**
 |---|---|
 | `die "msg"` / `warn "msg"` | Fatal / non-fatal, both to stderr |
 | `need_arg "--flag" "$2"` | Required on every valued flag (enforced by `test.sh`) |
-| `preflight_check` | `gh`, `jq`, `gh auth status` |
+| `preflight_check` | `gh`, `jq`, `gh auth status` (explains an exhausted rate limit) |
+| `preflight_tools` | `gh` and `jq` only, for commands that must run without a working quota |
+| `rate_limit_note` / `token_scopes` | Free quota check; OAuth scopes (one core request) |
 | `get_username` | Authenticated login |
 | `confirm "prompt"` | Returns 0/1, honours `--yes` and `--dry-run` |
 | `cutoff_date N days\|months\|years` | ISO-8601 UTC, cross-platform |
@@ -95,10 +97,10 @@ bash -n script.sh
 ./script.sh <command> --dry-run [required-flags]
 ```
 
-## Commands (43 total)
+## Commands (44 total)
 
 **Cleanup & maintenance**: `unstar`, `cleanup-forks` (alias `forks`), `sync-forks`, `cleanup-branches`, `archive-repos`, `release-cleanup`, `pr-cleanup`, `cleanup-packages`, `packages` (alias `pkgs`), `stale-issues`, `cache-cleanup`, `artifact-cleanup`, `run-cleanup`, `gist` (alias `gists`), `notifications` (alias `notifs`), `invite-cleanup`
-**Audit & visibility**: `repo-audit` (alias `audit`), `stats`, `workflow-status` (alias `ci`), `secret-audit`, `license-check`, `vulnerability-check`, `branch-protection`, `webhook-audit`, `collaborator-audit`, `activity-report`, `traffic`, `org-audit`, `follow-audit` (alias `follow`), `inbox` (alias `recap`), `branches` (alias `branch-status`)
+**Audit & visibility**: `repo-audit` (alias `audit`), `stats`, `workflow-status` (alias `ci`), `secret-audit`, `license-check`, `vulnerability-check`, `branch-protection`, `webhook-audit`, `collaborator-audit`, `activity-report`, `traffic`, `org-audit`, `follow-audit` (alias `follow`), `inbox` (alias `recap`), `branches` (alias `branch-status`), `status`
 **Bulk operations**: `clone-org`, `bulk-topic`, `sync-labels`, `export-stars`, `rename-default-branch`, `dependabot-enable`, `mirror`, `bulk-settings`, `repo-template`, `bulk-merge`, `backup`, `download` (alias `dl`)
 
 ## Dependencies
