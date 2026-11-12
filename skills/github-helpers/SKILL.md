@@ -19,7 +19,8 @@ for bulk GitHub maintenance. This skill tells you how to run it safely.
      ```
 2. It needs `gh` (authenticated: `gh auth status`), `jq`, `git` and bash 4+.
    If `gh` is not logged in, ask the user to run `gh auth login` themselves —
-   it is interactive.
+   it is interactive. If the error says the rate limit is exhausted, the login
+   is fine: do not ask for a re-login, wait for the reset time it prints.
 3. Some commands need extra token scopes and print a hint on their first 403,
    e.g. `gh auth refresh -h github.com -s delete_repo`. Relay the hint to the
    user; do not run `gh auth refresh` without asking, it opens a browser flow.

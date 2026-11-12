@@ -64,14 +64,44 @@ preflight_check() {
     die "jq is required (brew install jq)"
   fi
   if ! gh auth status &>/dev/null; then
-    die "not logged in. Run 'gh auth login' first."
+    auth_failure_die
   fi
 }
 
+# rate_limit_note — a sentence when the REST core quota is exhausted, nothing
+# otherwise. GET /rate_limit does not count against the quota, so asking is free.
+rate_limit_note() {
+  local reset
+  reset=$(gh api rate_limit --jq \
+    'select(.resources.core.remaining == 0) | .resources.core.reset | strflocaltime("%H:%M")' \
+    2>/dev/null) || return 0
+  [ -n "$reset" ] || return 0
+  echo "GitHub API rate limit exhausted (resets at ${reset}). Your login is fine: wait for the reset."
+}
+
+# gh auth status fails for three different reasons: no token, an exhausted rate
+# limit (GitHub answers 403 and gh reports the token as invalid), or a token
+# that is really rejected. Telling them apart saves a pointless re-login.
+auth_failure_die() {
+  local note
+  if ! gh auth token &>/dev/null; then
+    die "not logged in. Run 'gh auth login' first."
+  fi
+  note=$(rate_limit_note)
+  if [ -n "$note" ]; then
+    die "$note"
+  fi
+  die "gh could not validate its token (rejected, or GitHub unreachable). Run 'gh auth status' for details."
+}
+
 get_username() {
-  local user
+  local user note
   user=$(gh api user -q '.login' 2>/dev/null)
   if [ -z "$user" ]; then
+    note=$(rate_limit_note)
+    if [ -n "$note" ]; then
+      die "$note"
+    fi
     die "could not detect authenticated user"
   fi
   echo "$user"
