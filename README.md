@@ -72,6 +72,7 @@ forks can I delete?"*, *"what is waiting on me on GitHub?"*.
 | [`follow-audit`](#follow-audit--who-follows-you-back-and-who-does-not) | Who follows you back, and who does not |
 | [`inbox`](#inbox--what-is-waiting-on-you-across-every-repo) | What is waiting on you: replies, reviews, new issues |
 | [`branches`](#branches--track-open-branches-across-your-repos) | Open branches, commits ahead/behind the default branch |
+| [`status`](#status--login-token-and-api-rate-limits) | Login, token scopes and API rate limits (free to run) |
 | [`clone-org`](#clone-org--clone-all-repos-from-a-github-org-or-user) | Clone/pull all repos from an org or user |
 | [`bulk-topic`](#bulk-topic--add-or-remove-topics-in-batch) | Add/remove topics in batch |
 | [`sync-labels`](#sync-labels--sync-issue-labels-from-a-template-repo) | Sync issue labels across repos |
@@ -847,6 +848,39 @@ maxgfr/github-helpers  (main)
 
 One GraphQL request covers 10 repositories: branches, comparisons and PRs together. Only the
 first 100 branches of a repo are listed, and the command says so when that happens.
+
+#### `status` — Login, token and API rate limits
+
+Read-only. Who `gh` is logged in as, whether the token works, its scopes, and what is left of
+each API quota with its reset time. It reads `GET /rate_limit`, which does not count against any
+quota, so it still answers when every other command is blocked.
+
+```bash
+github-helpers status
+github-helpers status --all
+github-helpers status --format json | jq '.rate_limits[] | select(.remaining == 0)'
+```
+
+```
+  Account: maxgfr (token from keyring)
+  Token:   valid, but the core quota is exhausted
+  Scopes:  not checked (core quota exhausted)
+
+  BUCKET                    USED REMAINING   LIMIT  RESETS
+  core                      5000         0    5000  22:30 (in 14 min)
+  graphql                     13      4987    5000  23:05 (in 49 min)
+  search                       0        30      30  -
+  code_search                  0        10      10  -
+```
+
+| Flag | Description |
+|---|---|
+| `--all` | Every bucket, not only `core`, `graphql`, `search`, `code_search` and the used ones |
+| `--format text\|json\|csv\|md` | Export (`csv` and `md` list the buckets) |
+
+The REST quota (`core`, 5000 requests an hour) is shared by everything that uses your account:
+`gh`, scripts, agents, editors. When it runs out, every command stops with the reset time instead
+of a misleading "not logged in".
 
 ### Bulk operations
 

@@ -5,7 +5,7 @@ description: Drive the github-helpers CLI to maintain a GitHub account or organi
 
 # github-helpers
 
-`github-helpers` is a single bash CLI (wrapping `gh` and `jq`) with 43 subcommands
+`github-helpers` is a single bash CLI (wrapping `gh` and `jq`) with 44 subcommands
 for bulk GitHub maintenance. This skill tells you how to run it safely.
 
 ## Setup
@@ -21,6 +21,7 @@ for bulk GitHub maintenance. This skill tells you how to run it safely.
    If `gh` is not logged in, ask the user to run `gh auth login` themselves —
    it is interactive. If the error says the rate limit is exhausted, the login
    is fine: do not ask for a re-login, wait for the reset time it prints.
+   `github-helpers status` shows every quota and costs nothing to run.
 3. Some commands need extra token scopes and print a hint on their first 403,
    e.g. `gh auth refresh -h github.com -s delete_repo`. Relay the hint to the
    user; do not run `gh auth refresh` without asking, it opens a browser flow.
@@ -91,6 +92,7 @@ Audit & visibility (read-only):
 | `traffic` | Views and clones (14-day window) |
 | `inbox` (`recap`) | What is waiting on the user: replies, reviews, new issues |
 | `branches` (`branch-status`) | Open branches, ahead/behind the default branch |
+| `status` | Login, token scopes and API rate limits; free, works at quota 0 |
 
 Bulk operations:
 
