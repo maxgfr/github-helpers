@@ -488,7 +488,7 @@ ${BOLD}COMMANDS${NC}
   ${BOLD}Audit & visibility${NC}
   repo-audit          Scan repos for missing LICENSE, README, description, topics
   stats               Quick GitHub profile stats dashboard
-  workflow-status     Red CI across your repos (latest runs per workflow)
+  workflow-status     Red CI across your repos (head-commit checks)
   secret-audit        List secrets and env vars across repos
   license-check       Check and add LICENSE files
   vulnerability-check Audit Dependabot vulnerability alerts
@@ -3167,12 +3167,12 @@ def ws_active: map(if type == "object" then . else {id: ., name: null} end);
 
 # Trimmed runs payload: the runs API returns ~5 KB per run, we keep ~300 bytes.
 WORKFLOW_STATUS_RUNS_JQ='{total_count, workflow_runs: [.workflow_runs[] | {id, workflow_id, name, path,
-  head_branch, event, status, conclusion, created_at, html_url,
+  head_branch, head_sha, event, status, conclusion, created_at, html_url,
   head_repository: {full_name: .head_repository.full_name}}]}'
 
 cmd_workflow_status_usage() {
   cat <<EOF
-${BOLD}github-helpers workflow-status${NC} ${DIM}v${VERSION}${NC} — Red CI across your repos (latest runs per workflow)
+${BOLD}github-helpers workflow-status${NC} ${DIM}v${VERSION}${NC} — Red CI across your repos (head-commit checks)
                                         ${DIM}(alias: github-helpers ci)${NC}
 
 ${BOLD}USAGE${NC}
@@ -3184,7 +3184,7 @@ ${BOLD}SCOPE${NC} ${DIM}(default: your non-archived source repos)${NC}
   --repo OWNER/NAME       Only this repository
   --include-forks         Include forks ${DIM}(excluded by default)${NC}
   --limit N               Max repos to scan (default: ${WORKFLOW_STATUS_LIMIT})
-  --all-branches          Latest run per workflow AND branch, instead of the
+  --all-branches          Head-commit checks of every branch, instead of the
                           default branch only
   --include-dynamic       Also count GitHub-managed workflows (Dependabot
                           Updates, CodeQL default setup, Pages builds...)
@@ -3213,9 +3213,12 @@ ${BOLD}EXAMPLES${NC}
   github-helpers ci --exit-code >/dev/null 2>&1 || echo "some CI is red"
 
 ${BOLD}NOTE${NC}
-  Costs ~2 core requests per repo with CI (workflows + runs), 1 without. A
-  repo with 100+ runs on its default branch costs 1 more per active workflow
-  missing from the latest 100, so the default-branch verdict stays exact.
+  A repo is judged on the checks of its head commit, like the check mark on
+  GitHub's commit list: the newest commit of the branch that has runs (a
+  [skip ci] commit has none and is passed over), latest run per workflow on
+  it. A workflow that no longer runs on the branch (trigger changed,
+  branches-ignore, paths filter) cannot keep an old failure alive.
+  Costs ~2 core requests per repo with CI (workflows + runs), 1 without.
   Disabled workflows are ignored, so an old failure of one never counts.
   GitHub-managed "dynamic" workflows (Dependabot Updates, CodeQL default setup,
   Pages builds) are ignored too: they are not your CI and never show on the
@@ -3274,27 +3277,36 @@ cmd_workflow_status_age() {
   jq -nr --argjson s "$1" "${WORKFLOW_STATUS_JQ}"' $s | ws_age'
 }
 
-# cmd_workflow_status_rows <repo> <mode> <runs-json> <active-workflows-json>
-# Latest run per key as flat rows. <mode> is "default" (key: workflow) or
-# "all" (key: workflow + branch). <runs-json> is a runs API payload (object
-# with .workflow_runs, or a bare array). <active-workflows-json> lists the
-# active workflows, as ids or as {id, name} objects; the name, when given,
-# wins over the run's own (a Dependabot run is named after its update, not
-# "Dependabot Updates"). Runs whose head repository is another one (fork PRs)
-# and runs of workflows not in the list are dropped.
+# cmd_workflow_status_rows <repo> <runs-json> <active-workflows-json>
+# The checks of each branch's head commit, as flat rows: per branch, the
+# newest commit that has runs (a [skip ci] commit has none and is passed
+# over), then the newest run per workflow on that commit. This is what the
+# check mark on GitHub's commit list shows: a workflow that no longer runs on
+# the branch (trigger changed, branches-ignore) cannot keep an old failure.
+# <runs-json> is a runs API payload (object with .workflow_runs, or a bare
+# array), newest first or not. <active-workflows-json> lists the workflows to
+# judge, as ids or as {id, name} objects; the name, when given, wins over the
+# run's own (a Dependabot run is named after its update). Runs whose head
+# repository is another one (fork PRs) and runs of workflows not in the list
+# are dropped before the head commit is chosen.
 cmd_workflow_status_rows() {
-  local repo="$1" mode="$2" runs="$3" active="$4"
-  printf '%s' "$runs" | jq -c --arg repo "$repo" --arg mode "$mode" --argjson active "$active" \
+  local repo="$1" runs="$2" active="$3"
+  printf '%s' "$runs" | jq -c --arg repo "$repo" --argjson active "$active" \
     "${WORKFLOW_STATUS_JQ}"'
     ($active | ws_active) as $wf
     | ws_own($repo)
     | map(.workflow_id as $w | ($wf | map(select(.id == $w)) | first) as $d
           | select($d != null) | . + {wf_name: $d.name})
-    | group_by(if $mode == "all" then [.workflow_id, (.head_branch // "")] else .workflow_id end)
-    | map(max_by([.created_at, .id]))
+    | group_by(.head_branch // "")
+    | map((max_by([.created_at, .id]).head_sha) as $head
+          | map(select(.head_sha == $head))
+          | group_by(.workflow_id)
+          | map(max_by([.created_at, .id])))
+    | add // []
     | map({repo: $repo,
            workflow: (.wf_name // .name // .path // "?"),
            branch: (.head_branch // ""),
+           sha: ((.head_sha // "")[0:7]),
            event: (.event // ""),
            status: (.status // ""),
            conclusion: (.conclusion // ""),
@@ -3311,14 +3323,6 @@ cmd_workflow_status_rows() {
 cmd_workflow_status_active() {
   printf '%s' "$1" | jq -c --argjson dyn "$2" '[.[] | select(.state == "active")
     | select($dyn or ((.path // "") | startswith("dynamic/") | not)) | {id, name}]'
-}
-
-# cmd_workflow_status_missing <repo> <runs-json> <active-workflows-json> ->
-# ids, one per line: the active workflows that have no own run in <runs-json>.
-cmd_workflow_status_missing() {
-  printf '%s' "$2" | jq -r --arg repo "$1" --argjson active "$3" "${WORKFLOW_STATUS_JQ}"'
-    (ws_own($repo) | map(.workflow_id)) as $seen
-    | ($active | ws_active)[] | .id as $w | select($seen | any(. == $w) | not) | $w'
 }
 
 # cmd_workflow_status_sort <rows-json> <verdicts-json> — rows ordered like the
@@ -3360,7 +3364,7 @@ cmd_workflow_status_lookup_repo() {
 # skip and leaves both files untouched.
 cmd_workflow_status_scan_repo() {
   local nwo="$1" def="$2" rows_out="$3" verdicts_out="$4"
-  local workflows active runs rows mode="default" id extra branch_q branch one
+  local workflows active runs rows branch_q branch
   if [ -z "$def" ]; then
     printf '%s\t\tno-ci\n' "$nwo" >> "$verdicts_out"
     return 0
@@ -3372,34 +3376,20 @@ cmd_workflow_status_scan_repo() {
     return 0
   fi
 
+  # The newest runs come first, so the head commit's runs are on this page.
   if $WORKFLOW_STATUS_ALL_BRANCHES; then
-    mode="all"
     runs=$(gh_api_try "$nwo" "repos/${nwo}/actions/runs?per_page=100" \
              --jq "$WORKFLOW_STATUS_RUNS_JQ" </dev/null) || return 0
-    rows=$(cmd_workflow_status_rows "$nwo" all "$runs" "$active")
+    branch="*"
   else
     branch_q=$(jq -rn --arg b "$def" '$b | @uri')
     runs=$(gh_api_try "$nwo" "repos/${nwo}/actions/runs?branch=${branch_q}&per_page=100" \
              --jq "$WORKFLOW_STATUS_RUNS_JQ" </dev/null) || return 0
-    rows=$(cmd_workflow_status_rows "$nwo" default "$runs" "$active")
-    # A page that holds every run of the branch is exhaustive: an active
-    # workflow absent from it never ran there. Only a full page needs a
-    # per-workflow lookup, which stays exact for busy repos.
-    if [ "$(printf '%s' "$runs" | jq '(.total_count // 0) > (.workflow_runs | length)')" = "true" ]; then
-      while IFS= read -r id; do
-        [ -z "$id" ] && continue
-        extra=$(gh_api_try "$nwo" "repos/${nwo}/actions/workflows/${id}/runs?branch=${branch_q}&per_page=10" \
-                  --jq "$WORKFLOW_STATUS_RUNS_JQ" </dev/null) || continue
-        one=$(printf '%s' "$active" | jq -c --argjson id "$id" 'map(select(.id == $id))')
-        rows=$(jq -cn --argjson a "$rows" --argjson b "$(cmd_workflow_status_rows "$nwo" default "$extra" "$one")" \
-                 '$a + $b | sort_by(.workflow, .branch)')
-      done < <(cmd_workflow_status_missing "$nwo" "$runs" "$active")
-    fi
+    branch="$def"
   fi
+  rows=$(cmd_workflow_status_rows "$nwo" "$runs" "$active")
 
   printf '%s\n' "$rows" >> "$rows_out"
-  branch="$def"
-  [ "$mode" = "all" ] && branch="*"
   printf '%s\t%s\t%s\n' "$nwo" "$branch" "$(cmd_workflow_status_repo_verdict "$rows")" >> "$verdicts_out"
 }
 
@@ -3471,7 +3461,10 @@ cmd_workflow_status_render_text() {
     | $repos[] as $r
     | ($by[$r.repo] // []) as $rs
     | ($byall[$r.repo] // []) as $ra
-    | (["R", $r.repo, $r.branch, $r.verdict,
+    | (["R", $r.repo,
+        ($r.branch + (if $r.branch != "*" and ($ra | length) > 0 and ($ra[0].sha // "") != ""
+                      then " @ " + $ra[0].sha else "" end)),
+        $r.verdict,
         ([$ra[] | select(.verdict == "red")] | length | tostring),
         ($ra | length | tostring), "", ""] | join("\u001f")),
       ($rs[] | select($all or .verdict == "red")
@@ -3493,7 +3486,7 @@ cmd_workflow_status_main() {
   if [ -z "$WORKFLOW_STATUS_REPO" ]; then
     if [ -n "$WORKFLOW_STATUS_TARGET" ]; then owner="$WORKFLOW_STATUS_TARGET"; else owner=$(get_username); fi
   fi
-  if $WORKFLOW_STATUS_ALL_BRANCHES; then scope="latest run per workflow and branch"; else scope="latest run per workflow on the default branch"; fi
+  if $WORKFLOW_STATUS_ALL_BRANCHES; then scope="head-commit checks of every branch"; else scope="head-commit checks of the default branch"; fi
 
   {
     header "Workflow Status"

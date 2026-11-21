@@ -79,7 +79,7 @@ Audit & visibility (read-only):
 |---|---|
 | `repo-audit` (`audit`) | Missing LICENSE, README, description, topics |
 | `stats` | Profile/org dashboard: repos, stars, languages |
-| `workflow-status` (`ci`) | Red CI across your repos: latest run per workflow on the default branch (`--all-branches` for every branch) |
+| `workflow-status` (`ci`) | Red CI across your repos: checks of the default branch's head commit (`--all-branches` for every branch) |
 | `secret-audit` | Actions secrets and variables across repos |
 | `license-check` | Check (and optionally add) LICENSE files |
 | `vulnerability-check` | Dependabot alerts across repos |

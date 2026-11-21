@@ -1101,45 +1101,47 @@ assert_eq "ws age: hours" "3h ago" "$(cmd_workflow_status_age 10800)"
 assert_eq "ws age: days" "2d ago" "$(cmd_workflow_status_age 172800)"
 assert_eq "ws age: clock skew never goes negative" "0m ago" "$(cmd_workflow_status_age -30)"
 
-# Workflow 1 (CI): an older red and a newer green run on main, plus a red run
-# on a feature branch. Workflow 2 (Lint): one red run on main. Workflow 3 is
-# disabled. Run 99 comes from a fork whose branch is also called main.
+# Commit aaa (older) and bbb (head) on main, ccc on a feature branch.
+# On aaa: CI and Lint failed. On bbb: CI failed then passed on a later run,
+# Release failed; Lint no longer runs on main (trigger changed), so its old
+# failure must not count. Workflow 3 is disabled. Run 99 comes from a fork
+# whose branch is also called main, and is the newest run of all.
 own='{"full_name":"acme/app"}'
-runs=$(jq -nc --argjson own "$own" '{total_count: 6, workflow_runs: [
-  {id: 10, workflow_id: 1, name: "CI",   head_branch: "main",    event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-01T00:00:00Z", html_url: "u10", head_repository: $own},
-  {id: 11, workflow_id: 1, name: "CI",   head_branch: "main",    event: "push", status: "completed", conclusion: "success", created_at: "2026-01-02T00:00:00Z", html_url: "u11", head_repository: $own},
-  {id: 12, workflow_id: 1, name: "CI",   head_branch: "feature", event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-03T00:00:00Z", html_url: "u12", head_repository: $own},
-  {id: 20, workflow_id: 2, name: "Lint", head_branch: "main",    event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-01T00:00:00Z", html_url: "u20", head_repository: $own},
-  {id: 30, workflow_id: 3, name: "Old",  head_branch: "main",    event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-04T00:00:00Z", html_url: "u30", head_repository: $own},
-  {id: 99, workflow_id: 1, name: "CI",   head_branch: "main",    event: "pull_request", status: "completed", conclusion: "failure", created_at: "2026-01-05T00:00:00Z", html_url: "u99", head_repository: {full_name: "evil/app"}}
+runs=$(jq -nc --argjson own "$own" '{total_count: 8, workflow_runs: [
+  {id: 10, workflow_id: 1, name: "CI",      head_branch: "main",    head_sha: "aaaaaaaaaa", event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-01T00:00:00Z", html_url: "u10", head_repository: $own},
+  {id: 20, workflow_id: 2, name: "Lint",    head_branch: "main",    head_sha: "aaaaaaaaaa", event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-01T00:00:00Z", html_url: "u20", head_repository: $own},
+  {id: 11, workflow_id: 1, name: "CI",      head_branch: "main",    head_sha: "bbbbbbbbbb", event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-02T00:00:00Z", html_url: "u11", head_repository: $own},
+  {id: 14, workflow_id: 1, name: "CI",      head_branch: "main",    head_sha: "bbbbbbbbbb", event: "workflow_dispatch", status: "completed", conclusion: "success", created_at: "2026-01-02T01:00:00Z", html_url: "u14", head_repository: $own},
+  {id: 40, workflow_id: 4, name: "Release", head_branch: "main",    head_sha: "bbbbbbbbbb", event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-02T00:00:00Z", html_url: "u40", head_repository: $own},
+  {id: 30, workflow_id: 3, name: "Old",     head_branch: "main",    head_sha: "dddddddddd", event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-04T00:00:00Z", html_url: "u30", head_repository: $own},
+  {id: 12, workflow_id: 1, name: "CI",      head_branch: "feature", head_sha: "cccccccccc", event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-03T00:00:00Z", html_url: "u12", head_repository: $own},
+  {id: 99, workflow_id: 1, name: "CI",      head_branch: "main",    head_sha: "eeeeeeeeee", event: "pull_request", status: "completed", conclusion: "failure", created_at: "2026-01-05T00:00:00Z", html_url: "u99", head_repository: {full_name: "evil/app"}}
 ]}')
 main_runs=$(printf '%s' "$runs" | jq -c '.workflow_runs |= map(select(.head_branch == "main"))')
 
-rows=$(cmd_workflow_status_rows acme/app default "$main_runs" '[1,2]')
-assert_eq "ws rows: one row per workflow on the default branch" "2" "$(printf '%s' "$rows" | jq 'length')"
-assert_eq "ws rows: newest own run wins (fork run ignored)" "u11 u20" "$(printf '%s' "$rows" | jq -r 'map(.url) | join(" ")')"
+rows=$(cmd_workflow_status_rows acme/app "$main_runs" '[1,2,4]')
+assert_eq "ws rows: only the head commit's checks count" "CI Release" "$(printf '%s' "$rows" | jq -r 'map(.workflow) | join(" ")')"
+assert_eq "ws rows: newest run per workflow on the head commit" "u14 u40" "$(printf '%s' "$rows" | jq -r 'map(.url) | join(" ")')"
 assert_eq "ws rows: verdicts" "green red" "$(printf '%s' "$rows" | jq -r 'map(.verdict) | join(" ")')"
-assert_eq "ws rows: key order for render_rows" "repo,workflow,branch,event,status,conclusion,verdict,created_at,url" \
+assert_eq "ws rows: short head sha" "bbbbbbb" "$(printf '%s' "$rows" | jq -r '.[0].sha')"
+assert_eq "ws rows: key order for render_rows" "repo,workflow,branch,sha,event,status,conclusion,verdict,created_at,url" \
   "$(printf '%s' "$rows" | jq -r '.[0] | keys_unsorted | join(",")')"
-assert_eq "ws rows: disabled workflow dropped" "0" \
-  "$(cmd_workflow_status_rows acme/app default "$main_runs" '[1,2]' | jq '[.[] | select(.workflow == "Old")] | length')"
+assert_eq "ws rows: a workflow that stopped running on the branch keeps no old failure" "0" \
+  "$(printf '%s' "$rows" | jq '[.[] | select(.workflow == "Lint")] | length')"
+assert_eq "ws rows: disabled workflow and fork run do not pick the head commit" "bbbbbbb" \
+  "$(cmd_workflow_status_rows acme/app "$main_runs" '[1,2,4]' | jq -r 'map(.sha) | unique | join(" ")')"
 assert_eq "ws rows: repo name compared case-insensitively" "2" \
-  "$(cmd_workflow_status_rows Acme/App default "$main_runs" '[1,2]' | jq 'length')"
-assert_eq "ws rows: workflow name from the workflow list wins" "Dependabot Updates" \
-  "$(cmd_workflow_status_rows acme/app default "$main_runs" '[{"id":2,"name":"Dependabot Updates"}]' | jq -r '.[0].workflow')"
+  "$(cmd_workflow_status_rows Acme/App "$main_runs" '[1,2,4]' | jq 'length')"
+assert_eq "ws rows: workflow name from the workflow list wins" "Ship" \
+  "$(cmd_workflow_status_rows acme/app "$main_runs" '[{"id":4,"name":"Ship"}]' | jq -r '.[0].workflow')"
 assert_eq "ws rows: a bare runs array is accepted" "2" \
-  "$(cmd_workflow_status_rows acme/app default "$(printf '%s' "$main_runs" | jq -c '.workflow_runs')" '[1,2]' | jq 'length')"
+  "$(cmd_workflow_status_rows acme/app "$(printf '%s' "$main_runs" | jq -c '.workflow_runs')" '[1,2,4]' | jq 'length')"
 assert_eq "ws rows: a lone fork run yields nothing" "0" \
-  "$(cmd_workflow_status_rows acme/app default "$(printf '%s' "$runs" | jq -c '.workflow_runs |= map(select(.id == 99))')" '[1]' | jq 'length')"
+  "$(cmd_workflow_status_rows acme/app "$(printf '%s' "$runs" | jq -c '.workflow_runs |= map(select(.id == 99))')" '[1]' | jq 'length')"
 
-rows=$(cmd_workflow_status_rows acme/app all "$runs" '[1,2]')
-assert_eq "ws rows --all-branches: keyed by workflow and branch" "CI/feature/red CI/main/green Lint/main/red" \
+rows=$(cmd_workflow_status_rows acme/app "$runs" '[1,2,4]')
+assert_eq "ws rows --all-branches: head-commit checks per branch" "CI/feature/red CI/main/green Release/main/red" \
   "$(printf '%s' "$rows" | jq -r 'map("\(.workflow)/\(.branch)/\(.verdict)") | join(" ")')"
-
-assert_eq "ws missing: active workflows without an own run" "4 5" \
-  "$(cmd_workflow_status_missing acme/app "$main_runs" '[1,2,4,5]' | paste -sd' ' -)"
-assert_eq "ws missing: a fork run does not count as seen" "1" \
-  "$(cmd_workflow_status_missing acme/app "$(printf '%s' "$runs" | jq -c '.workflow_runs |= map(select(.id == 99))')" '[{"id":1,"name":"CI"}]')"
 
 wfs='[{"id":1,"name":"CI","path":".github/workflows/ci.yml","state":"active"},
   {"id":2,"name":"Old","path":".github/workflows/old.yml","state":"disabled_manually"},

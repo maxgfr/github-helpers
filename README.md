@@ -59,7 +59,7 @@ forks can I delete?"*, *"what is waiting on me on GitHub?"*.
 | [`invite-cleanup`](#invite-cleanup--pending-repository-and-org-invitations) | List, accept or decline pending invitations |
 | [`repo-audit`](#repo-audit--scan-repos-for-common-issues) | Check for missing LICENSE, README, etc. |
 | [`stats`](#stats--github-profile-stats) | Dashboard: repos, stars, languages |
-| [`workflow-status`](#workflow-status--red-ci-across-your-repos) | Red CI across your repos (latest run per workflow) |
+| [`workflow-status`](#workflow-status--red-ci-across-your-repos) | Red CI across your repos (head-commit checks) |
 | [`secret-audit`](#secret-audit--list-secrets-and-env-vars) | List Actions secrets & variables |
 | [`license-check`](#license-check--check-and-add-license-files) | Check/add LICENSE files |
 | [`vulnerability-check`](#vulnerability-check--audit-dependabot-alerts) | Audit Dependabot vulnerability alerts |
@@ -530,7 +530,7 @@ github-helpers stats --org my-company
 
 #### `workflow-status` — Red CI across your repos
 
-Alias: `ci`. Scans every non-archived source repo you own and reports which ones have red CI. By default it looks at the latest run of each active workflow on the repo's **default branch**; `--all-branches` shows the latest run of each workflow on every branch instead. Red repos come first, each with its failing workflows and a link to the run.
+Alias: `ci`. Scans every non-archived source repo you own and reports which ones have red CI. By default it judges the checks of the **head commit of the default branch**, like the check mark on GitHub's commit list: the newest commit that has runs (a `[skip ci]` commit has none and is passed over), latest run per workflow on it. A workflow that no longer runs on the branch (trigger changed, `branches-ignore`, `paths` filter) cannot keep an old failure alive. `--all-branches` does the same for every branch. Red repos come first, each with its failing workflows and a link to the run.
 
 ```bash
 github-helpers ci
@@ -549,15 +549,15 @@ A run is **red** on `failure`, `timed_out` or `startup_failure`, **green** on `s
 | `--repo OWNER/REPO` | Single repo |
 | `--include-forks` | Include forks (excluded by default; archived repos always are) |
 | `--limit N` | Max repos to scan (default: 1000; warns when the cap is hit) |
-| `--all-branches` | Latest run per workflow and branch, from the 100 most recent runs of each repo |
+| `--all-branches` | Head-commit checks of every branch, from the 100 most recent runs of each repo |
 | `--include-dynamic` | Also count GitHub-managed workflows (Dependabot Updates, CodeQL default setup, Pages builds) |
 | `--failed` | Only red repos (text) or red runs (json/csv/md) |
-| `--format text\|json\|csv\|md` | Output format (default: text). Rows: repo, workflow, branch, event, status, conclusion, verdict, created_at, url |
+| `--format text\|json\|csv\|md` | Output format (default: text). Rows: repo, workflow, branch, sha, event, status, conclusion, verdict, created_at, url |
 | `--output FILE` | Write the report to a file |
 | `--exit-code` | Exit 1 when at least one repo is red |
 | `-v`, `--verbose` | Also list green, pending and other workflows under each repo |
 
-Cost: about 2 core API requests per repo with CI (workflow list + runs), 1 per repo without; a repo with 100+ runs on its default branch costs 1 more per active workflow missing from the latest 100. Progress, the summary and skipped repos go to stderr, so `--format json | jq` stays clean.
+Cost: about 2 core API requests per repo with CI (workflow list + runs), 1 per repo without. Progress, the summary and skipped repos go to stderr, so `--format json | jq` stays clean.
 
 ---
 
