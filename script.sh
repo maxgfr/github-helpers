@@ -488,7 +488,7 @@ ${BOLD}COMMANDS${NC}
   ${BOLD}Audit & visibility${NC}
   repo-audit          Scan repos for missing LICENSE, README, description, topics
   stats               Quick GitHub profile stats dashboard
-  workflow-status     Overview of latest CI workflow runs
+  workflow-status     Red CI across your repos (latest runs per workflow)
   secret-audit        List secrets and env vars across repos
   license-check       Check and add LICENSE files
   vulnerability-check Audit Dependabot vulnerability alerts
@@ -3118,105 +3118,454 @@ cmd_cleanup_branches_main() {
 }
 
 # =============================================================================
-# COMMAND: workflow-status
+# COMMAND: workflow-status — red CI across your repos
 # =============================================================================
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+WORKFLOW_STATUS_TARGET=""
+WORKFLOW_STATUS_REPO=""
+WORKFLOW_STATUS_LIMIT=1000
+WORKFLOW_STATUS_INCLUDE_FORKS=false
+WORKFLOW_STATUS_ALL_BRANCHES=false
+WORKFLOW_STATUS_FAILED=false
+WORKFLOW_STATUS_FORMAT="text"
+WORKFLOW_STATUS_OUTPUT=""
+WORKFLOW_STATUS_EXIT_CODE=false
+
+# jq definitions shared by every filter below, so the classification lives in
+# exactly one place.
+#   ws_verdict      run object -> red | green | pending | other
+#   ws_rank         verdict    -> sort rank (red first, no-ci last)
+#   ws_repo_verdict row array  -> the repo's verdict (no-ci when empty)
+#   ws_age          seconds    -> "12m ago", "5h ago", "3d ago"
+WORKFLOW_STATUS_JQ='
+def ws_verdict:
+  (.status // "") as $s | (.conclusion // "") as $c
+  | if ($c == "failure" or $c == "timed_out" or $c == "startup_failure") then "red"
+    elif $c == "success" then "green"
+    elif ($s != "" and $s != "completed") then "pending"
+    else "other" end;
+def ws_rank: {"red": 0, "pending": 1, "green": 2, "other": 3, "no-ci": 4}[.] // 5;
+def ws_repo_verdict:
+  map(.verdict) as $v
+  | if ($v | length) == 0 then "no-ci"
+    elif ($v | any(. == "red")) then "red"
+    elif ($v | any(. == "pending")) then "pending"
+    elif ($v | any(. == "green")) then "green"
+    else "other" end;
+def ws_age:
+  (if . < 0 then 0 else . end) as $s
+  | if $s < 3600 then "\($s / 60 | floor)m ago"
+    elif $s < 86400 then "\($s / 3600 | floor)h ago"
+    else "\($s / 86400 | floor)d ago" end;
+def ws_own($repo):
+  (if type == "object" then (.workflow_runs // []) else . end)
+  | map(select(((.head_repository.full_name // "") | ascii_downcase) == ($repo | ascii_downcase)));
+def ws_active: map(if type == "object" then . else {id: ., name: null} end);
+'
+
+# Trimmed runs payload: the runs API returns ~5 KB per run, we keep ~300 bytes.
+WORKFLOW_STATUS_RUNS_JQ='{total_count, workflow_runs: [.workflow_runs[] | {id, workflow_id, name, path,
+  head_branch, event, status, conclusion, created_at, html_url,
+  head_repository: {full_name: .head_repository.full_name}}]}'
 
 cmd_workflow_status_usage() {
   cat <<EOF
-${BOLD}github-helpers workflow-status${NC} ${DIM}v${VERSION}${NC} — Overview of CI workflow runs
+${BOLD}github-helpers workflow-status${NC} ${DIM}v${VERSION}${NC} — Red CI across your repos (latest runs per workflow)
+                                        ${DIM}(alias: github-helpers ci)${NC}
 
 ${BOLD}USAGE${NC}
   github-helpers workflow-status [options]
 
-${BOLD}OPTIONS${NC}
-  --user NAME             Target user (default: authenticated user)
-  --org NAME              Target organization
-  --limit N               Max repos to scan (default: 30)
-  --failed                Show only repos with failed workflows
-  -v, --verbose           Show all workflows, not just latest
+${BOLD}SCOPE${NC} ${DIM}(default: your non-archived source repos)${NC}
+  --user NAME             Scan this user's repos instead of yours
+  --org NAME              Scan an organization's repos
+  --repo OWNER/NAME       Only this repository
+  --include-forks         Include forks ${DIM}(excluded by default)${NC}
+  --limit N               Max repos to scan (default: ${WORKFLOW_STATUS_LIMIT})
+  --all-branches          Latest run per workflow AND branch, instead of the
+                          default branch only
+
+${BOLD}VERDICTS${NC} ${DIM}(per run; a repo takes its worst one, in this order)${NC}
+  red                     failure, timed_out or startup_failure
+  pending                 queued, in progress, waiting or requested
+  green                   success
+  other                   cancelled, skipped, neutral, action_required, stale
+  no-ci                   No active workflow, or none ever ran on the branch
+
+${BOLD}OUTPUT${NC}
+  --failed                Keep only red repos (text) or red runs (json/csv/md)
+  --format FORMAT         text, json, csv or md (default: text)
+  --output FILE           Write the report to FILE
+  --exit-code             Exit 1 when at least one repo is red ${DIM}(cron, CI)${NC}
+  -v, --verbose           Also list green, pending and other workflows
   -h, --help              Show this help
 
 ${BOLD}EXAMPLES${NC}
-  github-helpers workflow-status
+  github-helpers ci
   github-helpers workflow-status --org my-company --failed
-  github-helpers workflow-status --limit 50 -v
+  github-helpers ci --all-branches -v
+  github-helpers ci --repo maxgfr/github-helpers --all-branches
+  github-helpers ci --failed --format json | jq -r '.[].url'
+  github-helpers ci --exit-code >/dev/null 2>&1 || echo "some CI is red"
+
+${BOLD}NOTE${NC}
+  Costs ~2 core requests per repo with CI (workflows + runs), 1 without. A
+  repo with 100+ runs on its default branch costs 1 more per active workflow
+  missing from the latest 100, so the default-branch verdict stays exact.
+  Disabled workflows are ignored, so an old failure of one never counts.
+  Runs triggered from forks (a fork PR whose branch is also "main") are ignored.
+  --all-branches looks at the 100 most recent runs of each repo.
 EOF
   exit 0
 }
 
-cmd_workflow_status_main() {
-  local target="" target_type="" limit=30 failed_only=false
-
+cmd_workflow_status_parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --user)      need_arg "--user" "${2:-}"; target="$2"; target_type="user"; shift 2 ;;
-      --org)       need_arg "--org" "${2:-}"; target="$2"; target_type="org"; shift 2 ;;
-      --limit)     need_arg "--limit" "${2:-}"; limit="$2"; shift 2 ;;
-      --failed)    failed_only=true; shift ;;
-      -v|--verbose) VERBOSE=true; shift ;;
-      -h|--help)   cmd_workflow_status_usage ;;
+      --user)          need_arg "--user" "${2:-}"; WORKFLOW_STATUS_TARGET="$2"; shift 2 ;;
+      --org)           need_arg "--org" "${2:-}"; WORKFLOW_STATUS_TARGET="$2"; shift 2 ;;
+      --repo)          need_arg "--repo" "${2:-}"; WORKFLOW_STATUS_REPO="$2"; shift 2 ;;
+      --limit)         need_arg "--limit" "${2:-}"; WORKFLOW_STATUS_LIMIT="$2"; shift 2 ;;
+      --format)        need_arg "--format" "${2:-}"; WORKFLOW_STATUS_FORMAT="$2"; shift 2 ;;
+      --output)        need_arg "--output" "${2:-}"; WORKFLOW_STATUS_OUTPUT="$2"; shift 2 ;;
+      --include-forks) WORKFLOW_STATUS_INCLUDE_FORKS=true; shift ;;
+      --all-branches)  WORKFLOW_STATUS_ALL_BRANCHES=true; shift ;;
+      --failed)        WORKFLOW_STATUS_FAILED=true; shift ;;
+      --exit-code)     WORKFLOW_STATUS_EXIT_CODE=true; shift ;;
+      -v|--verbose)    VERBOSE=true; shift ;;
+      -h|--help)       cmd_workflow_status_usage ;;
       *) die "workflow-status: unknown option: $1" ;;
     esac
   done
+  case "$WORKFLOW_STATUS_FORMAT" in
+    text|json|csv|md) ;;
+    *) die "workflow-status: invalid --format '${WORKFLOW_STATUS_FORMAT}' (use text, json, csv or md)" ;;
+  esac
+  if ! [[ "$WORKFLOW_STATUS_LIMIT" =~ ^[0-9]+$ ]] || [ "$WORKFLOW_STATUS_LIMIT" -eq 0 ]; then
+    die "workflow-status: --limit must be a positive whole number"
+  fi
+  if [ -n "$WORKFLOW_STATUS_REPO" ] && ! [[ "$WORKFLOW_STATUS_REPO" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]]; then
+    die "workflow-status: --repo must be OWNER/NAME"
+  fi
+  return 0
+}
 
-  preflight_check
+# ── Pure helpers ─────────────────────────────────────────────────────────────
+# cmd_workflow_status_classify <status> <conclusion> -> red|green|pending|other
+cmd_workflow_status_classify() {
+  jq -nr --arg s "${1:-}" --arg c "${2:-}" "${WORKFLOW_STATUS_JQ}"' {status: $s, conclusion: $c} | ws_verdict'
+}
 
-  if [ -z "$target" ]; then
-    target=$(get_username)
-    target_type="user"
+# cmd_workflow_status_repo_verdict <rows-json> -> red|pending|green|other|no-ci
+cmd_workflow_status_repo_verdict() {
+  printf '%s' "$1" | jq -r "${WORKFLOW_STATUS_JQ}"' ws_repo_verdict'
+}
+
+# cmd_workflow_status_age <seconds> -> "3d ago"
+cmd_workflow_status_age() {
+  jq -nr --argjson s "$1" "${WORKFLOW_STATUS_JQ}"' $s | ws_age'
+}
+
+# cmd_workflow_status_rows <repo> <mode> <runs-json> <active-workflows-json>
+# Latest run per key as flat rows. <mode> is "default" (key: workflow) or
+# "all" (key: workflow + branch). <runs-json> is a runs API payload (object
+# with .workflow_runs, or a bare array). <active-workflows-json> lists the
+# active workflows, as ids or as {id, name} objects; the name, when given,
+# wins over the run's own (a Dependabot run is named after its update, not
+# "Dependabot Updates"). Runs whose head repository is another one (fork PRs)
+# and runs of workflows not in the list are dropped.
+cmd_workflow_status_rows() {
+  local repo="$1" mode="$2" runs="$3" active="$4"
+  printf '%s' "$runs" | jq -c --arg repo "$repo" --arg mode "$mode" --argjson active "$active" \
+    "${WORKFLOW_STATUS_JQ}"'
+    ($active | ws_active) as $wf
+    | ws_own($repo)
+    | map(.workflow_id as $w | ($wf | map(select(.id == $w)) | first) as $d
+          | select($d != null) | . + {wf_name: $d.name})
+    | group_by(if $mode == "all" then [.workflow_id, (.head_branch // "")] else .workflow_id end)
+    | map(max_by([.created_at, .id]))
+    | map({repo: $repo,
+           workflow: (.wf_name // .name // .path // "?"),
+           branch: (.head_branch // ""),
+           event: (.event // ""),
+           status: (.status // ""),
+           conclusion: (.conclusion // ""),
+           verdict: ws_verdict,
+           created_at: (.created_at // ""),
+           url: (.html_url // "")})
+    | sort_by(.workflow, .branch)'
+}
+
+# cmd_workflow_status_missing <repo> <runs-json> <active-workflows-json> ->
+# ids, one per line: the active workflows that have no own run in <runs-json>.
+cmd_workflow_status_missing() {
+  printf '%s' "$2" | jq -r --arg repo "$1" --argjson active "$3" "${WORKFLOW_STATUS_JQ}"'
+    (ws_own($repo) | map(.workflow_id)) as $seen
+    | ($active | ws_active)[] | .id as $w | select($seen | any(. == $w) | not) | $w'
+}
+
+# cmd_workflow_status_sort <rows-json> <verdicts-json> — rows ordered like the
+# repos (red first), then red rows first inside a repo.
+cmd_workflow_status_sort() {
+  printf '%s' "$1" | jq -c --argjson repos "$2" "${WORKFLOW_STATUS_JQ}"'
+    ($repos | map({key: .repo, value: (.verdict | ws_rank)}) | from_entries) as $r
+    | sort_by(($r[.repo] // 9), .repo, (.verdict | ws_rank), .workflow, .branch)'
+}
+
+# ── Repositories ─────────────────────────────────────────────────────────────
+# cmd_workflow_status_list_repos <owner> <limit> <out> — "nwo<TAB>default"
+# lines; the default branch comes free with the listing. An empty repository
+# has no default branch and an empty second field.
+cmd_workflow_status_list_repos() {
+  local owner="$1" limit="$2" out="$3" json
+  local -a extra=(--no-archived)
+  $WORKFLOW_STATUS_INCLUDE_FORKS || extra+=(--source)
+  json=$(gh repo list "$owner" --json nameWithOwner,defaultBranchRef \
+           "${extra[@]}" --limit "$limit" 2>/dev/null) \
+    || die "workflow-status: failed to list repos for ${owner}"
+  if [ "$(printf '%s' "$json" | jq 'length')" -ge "$limit" ]; then
+    warn "workflow-status: limited to ${limit} repos — raise it with --limit"
+  fi
+  printf '%s' "$json" | jq -r '.[] | [.nameWithOwner, (.defaultBranchRef.name // "")] | @tsv' >> "$out"
+}
+
+# cmd_workflow_status_lookup_repo <nwo> <out> — one repository (--repo).
+cmd_workflow_status_lookup_repo() {
+  local info
+  info=$(gh_api_try "$1" "repos/$1" --jq '[.full_name, (.default_branch // "")] | @tsv' </dev/null) || return 0
+  printf '%s\n' "$info" >> "$2"
+}
+
+# ── Scan ─────────────────────────────────────────────────────────────────────
+# cmd_workflow_status_scan_repo <nwo> <default-branch> <rows-out> <verdicts-out>
+# Appends the repo's rows (one JSON array) to <rows-out> and
+# "nwo<TAB>branch<TAB>verdict" to <verdicts-out>. A failed request records a
+# skip and leaves both files untouched.
+cmd_workflow_status_scan_repo() {
+  local nwo="$1" def="$2" rows_out="$3" verdicts_out="$4"
+  local workflows active runs rows mode="default" id extra branch_q branch one
+  if [ -z "$def" ]; then
+    printf '%s\t\tno-ci\n' "$nwo" >> "$verdicts_out"
+    return 0
+  fi
+  workflows=$(gh_paginate "$nwo" "repos/${nwo}/actions/workflows?per_page=100" '.workflows[]' </dev/null) || return 0
+  active=$(printf '%s' "$workflows" | jq -c '[.[] | select(.state == "active") | {id, name}]')
+  if [ "$active" = "[]" ]; then
+    printf '%s\t%s\tno-ci\n' "$nwo" "$def" >> "$verdicts_out"
+    return 0
   fi
 
-  echo -e "${BOLD}${CYAN}Workflow Status${NC} ${DIM}v${VERSION}${NC}"
-  echo -e "${DIM}─────────────────────────────────────────────${NC}"
-  echo -e "  Target: ${BOLD}${target}${NC}"
-  echo ""
+  if $WORKFLOW_STATUS_ALL_BRANCHES; then
+    mode="all"
+    runs=$(gh_api_try "$nwo" "repos/${nwo}/actions/runs?per_page=100" \
+             --jq "$WORKFLOW_STATUS_RUNS_JQ" </dev/null) || return 0
+    rows=$(cmd_workflow_status_rows "$nwo" all "$runs" "$active")
+  else
+    branch_q=$(jq -rn --arg b "$def" '$b | @uri')
+    runs=$(gh_api_try "$nwo" "repos/${nwo}/actions/runs?branch=${branch_q}&per_page=100" \
+             --jq "$WORKFLOW_STATUS_RUNS_JQ" </dev/null) || return 0
+    rows=$(cmd_workflow_status_rows "$nwo" default "$runs" "$active")
+    # A page that holds every run of the branch is exhaustive: an active
+    # workflow absent from it never ran there. Only a full page needs a
+    # per-workflow lookup, which stays exact for busy repos.
+    if [ "$(printf '%s' "$runs" | jq '(.total_count // 0) > (.workflow_runs | length)')" = "true" ]; then
+      while IFS= read -r id; do
+        [ -z "$id" ] && continue
+        extra=$(gh_api_try "$nwo" "repos/${nwo}/actions/workflows/${id}/runs?branch=${branch_q}&per_page=10" \
+                  --jq "$WORKFLOW_STATUS_RUNS_JQ" </dev/null) || continue
+        one=$(printf '%s' "$active" | jq -c --argjson id "$id" 'map(select(.id == $id))')
+        rows=$(jq -cn --argjson a "$rows" --argjson b "$(cmd_workflow_status_rows "$nwo" default "$extra" "$one")" \
+                 '$a + $b | sort_by(.workflow, .branch)')
+      done < <(cmd_workflow_status_missing "$nwo" "$runs" "$active")
+    fi
+  fi
 
-  local repos_json
-  repos_json=$(gh repo list "$target" --json nameWithOwner --source --no-archived --limit "$limit" 2>/dev/null) || die "Failed to list repos"
+  printf '%s\n' "$rows" >> "$rows_out"
+  branch="$def"
+  [ "$mode" = "all" ] && branch="*"
+  printf '%s\t%s\t%s\n' "$nwo" "$branch" "$(cmd_workflow_status_repo_verdict "$rows")" >> "$verdicts_out"
+}
 
-  local total
-  total=$(echo "$repos_json" | jq 'length')
-  echo -e "${DIM}Checking ${total} repos...${NC}"
-  echo ""
+# ── Rendering ────────────────────────────────────────────────────────────────
+# cmd_workflow_status_render_text <repos-json> <rows-json> [<all-rows-json>] —
+# one line per repo, red workflows (every workflow with -v) listed under it.
+# The "N/M red" counts come from <all-rows-json> (defaults to <rows-json>), so
+# --failed still reports how many workflows each repo has.
+cmd_workflow_status_render_text() {
+  local repos="$1" rows="$2" all_rows="${3:-$2}" width
+  if [ "$(printf '%s' "$repos" | jq 'length')" -eq 0 ]; then
+    if $WORKFLOW_STATUS_FAILED; then
+      echo -e "${GREEN}No red CI.${NC}"
+    else
+      echo -e "${GREEN}No repositories scanned.${NC}"
+    fi
+    return 0
+  fi
+  width=$(printf '%s' "$repos" | jq '[.[].repo | length] | (max // 10) | if . > 50 then 50 else . end')
 
-  printf "  ${BOLD}%-40s %-12s %-12s %s${NC}\n" "Repository" "Status" "Branch" "Workflow"
-  printf "  %-40s %-12s %-12s %s\n" "────────────────────────────────────────" "────────────" "────────────" "────────────────"
-
-  echo "$repos_json" | jq -r '.[].nameWithOwner' | while IFS= read -r nwo; do
-    # Get latest workflow run
-    local run_json
-    run_json=$(gh api "repos/${nwo}/actions/runs?per_page=1" --jq '.workflow_runs[0] // empty' 2>/dev/null || echo "")
-
-    if [ -z "$run_json" ]; then
-      if ! $failed_only; then
-        printf "  %-40s ${DIM}%-12s${NC}\n" "$nwo" "no workflows"
+  # Fields are joined with US (0x1f), not a tab: tab is IFS whitespace, so
+  # an empty field (an empty repo has no branch) would shift the others.
+  local kind a b c d e f url icon color label_pad repo_pad wf_pad res_pad age_pad detail unit
+  while IFS=$'\x1f' read -r kind a b c d e f url; do
+    if [ "$kind" = "R" ]; then
+      # a=repo b=branch c=verdict d=red e=total
+      case "$c" in
+        red)     icon="✗"; color="$RED" ;;
+        pending) icon="◌"; color="$YELLOW" ;;
+        green)   icon="✓"; color="$GREEN" ;;
+        other)   icon="○"; color="$DIM" ;;
+        *)       icon="·"; color="$DIM" ;;
+      esac
+      # Pad first, colour after: a colour code inside %-Ns breaks the column.
+      printf -v label_pad '%-9s' "$c"
+      printf -v repo_pad "%-${width}s" "$a"
+      [ "$b" = "*" ] && b="all branches"
+      unit="workflow(s)"
+      $WORKFLOW_STATUS_ALL_BRANCHES && unit="workflow/branch pair(s)"
+      detail=""
+      if [ "$c" = "red" ]; then
+        detail="${d}/${e} red"
+      elif [ "$e" -gt 0 ]; then
+        detail="${e} ${unit}"
       fi
-      continue
+      echo -e "  ${color}${icon} ${label_pad}${NC} ${BOLD}${repo_pad}${NC}  ${DIM}${b}${detail:+  ${detail}}${NC}"
+    else
+      # a=workflow b=branch c=result d=verdict e=age f=date
+      case "$d" in
+        red)     icon="✗"; color="$RED" ;;
+        pending) icon="◌"; color="$YELLOW" ;;
+        green)   icon="✓"; color="$GREEN" ;;
+        *)       icon="○"; color="$DIM" ;;
+      esac
+      # Branch last and unpadded: Dependabot branch names run past 60 chars.
+      [ "${#a}" -gt 40 ] && a="${a:0:39}…"
+      printf -v wf_pad  '%-40s' "$a"
+      printf -v res_pad '%-16s' "$c"
+      printf -v age_pad '%-9s'  "$e"
+      echo -e "      ${color}${icon}${NC} ${wf_pad} ${color}${res_pad}${NC} ${DIM}${age_pad} ${f}${NC}  ${b}"
+      if [ "$d" = "red" ]; then
+        echo -e "        ${DIM}${url}${NC}"
+      fi
     fi
+  done < <(jq -rn --argjson repos "$repos" --argjson rows "$rows" --argjson allrows "$all_rows" \
+             --argjson all "$VERBOSE" "${WORKFLOW_STATUS_JQ}"'
+    ($rows | group_by(.repo) | map({key: .[0].repo, value: .}) | from_entries) as $by
+    | ($allrows | group_by(.repo) | map({key: .[0].repo, value: .}) | from_entries) as $byall
+    | $repos[] as $r
+    | ($by[$r.repo] // []) as $rs
+    | ($byall[$r.repo] // []) as $ra
+    | (["R", $r.repo, $r.branch, $r.verdict,
+        ([$ra[] | select(.verdict == "red")] | length | tostring),
+        ($ra | length | tostring), "", ""] | join("\u001f")),
+      ($rs[] | select($all or .verdict == "red")
+       | ["W", .workflow, .branch,
+          (if .status == "completed" then .conclusion else .status end),
+          .verdict,
+          (if .created_at == "" then "?" else (now - (.created_at | fromdateiso8601)) | ws_age end),
+          (.created_at | split("T")[0]),
+          .url] | join("\u001f"))')
+  return 0
+}
 
-    local status conclusion branch workflow_name
-    status=$(echo "$run_json" | jq -r '.status')
-    conclusion=$(echo "$run_json" | jq -r '.conclusion // "pending"')
-    branch=$(echo "$run_json" | jq -r '.head_branch')
-    workflow_name=$(echo "$run_json" | jq -r '.name')
+cmd_workflow_status_main() {
+  cmd_workflow_status_parse_args "$@"
+  preflight_check
+  skip_init
 
-    local status_display=""
-    case "$conclusion" in
-      success)    status_display="${GREEN}✓ success${NC}" ;;
-      failure)    status_display="${RED}✗ failure${NC}" ;;
-      cancelled)  status_display="${YELLOW}○ cancelled${NC}" ;;
-      pending)    status_display="${CYAN}◌ pending${NC}" ;;
-      *)          status_display="${DIM}? ${conclusion}${NC}" ;;
-    esac
+  local owner="" scope
+  if [ -z "$WORKFLOW_STATUS_REPO" ]; then
+    if [ -n "$WORKFLOW_STATUS_TARGET" ]; then owner="$WORKFLOW_STATUS_TARGET"; else owner=$(get_username); fi
+  fi
+  if $WORKFLOW_STATUS_ALL_BRANCHES; then scope="latest run per workflow and branch"; else scope="latest run per workflow on the default branch"; fi
 
-    if $failed_only && [ "$conclusion" != "failure" ]; then
-      continue
+  {
+    header "Workflow Status"
+    if [ -n "$WORKFLOW_STATUS_REPO" ]; then
+      echo -e "  Repo:   ${BOLD}${WORKFLOW_STATUS_REPO}${NC}"
+    elif $WORKFLOW_STATUS_INCLUDE_FORKS; then
+      echo -e "  Owner:  ${BOLD}${owner}${NC} ${DIM}(non-archived repos, forks included)${NC}"
+    else
+      echo -e "  Owner:  ${BOLD}${owner}${NC} ${DIM}(non-archived source repos)${NC}"
     fi
+    echo -e "  Scope:  ${BOLD}${scope}${NC}"
+    echo ""
+  } >&2
 
-    printf "  %-40s $(echo -e "$status_display")%-3s %-12s %s\n" "$nwo" "" "$branch" "$workflow_name"
-  done
+  local repos rows_file verdicts_file n i=0 nwo def
+  repos=$(tmp_new); rows_file=$(tmp_new); verdicts_file=$(tmp_new)
+  if [ -n "$WORKFLOW_STATUS_REPO" ]; then
+    cmd_workflow_status_lookup_repo "$WORKFLOW_STATUS_REPO" "$repos"
+  else
+    cmd_workflow_status_list_repos "$owner" "$WORKFLOW_STATUS_LIMIT" "$repos"
+  fi
+  n=$(count_lines "$repos")
+  if [ "$n" -eq 0 ]; then
+    echo -e "${GREEN}No repositories to scan.${NC}" >&2
+    print_skips
+    return 0
+  fi
 
-  echo ""
+  echo -e "  ${DIM}Scanning ${n} repo(s), ~2 requests each...${NC}" >&2
+  while IFS=$'\t' read -r nwo def; do
+    [ -z "$nwo" ] && continue
+    i=$((i + 1))
+    if $VERBOSE; then
+      echo -e "  ${DIM}[${i}/${n}] ${nwo}${NC}" >&2
+    elif [ -t 2 ]; then
+      printf '\r  %s[%d/%d] %s%s\033[K' "$DIM" "$i" "$n" "$nwo" "$NC" >&2
+    fi
+    cmd_workflow_status_scan_repo "$nwo" "$def" "$rows_file" "$verdicts_file"
+  done < "$repos"
+  if ! $VERBOSE && [ -t 2 ]; then printf '\r\033[K' >&2; fi
+  echo "" >&2
+
+  local verdicts rows all_rows shown_repos
+  verdicts=$(jq -Rn "${WORKFLOW_STATUS_JQ}"'
+    [inputs | select(length > 0) | split("\t") | {repo: .[0], branch: .[1], verdict: .[2]}]
+    | sort_by((.verdict | ws_rank), .repo)' < "$verdicts_file")
+  rows=$(jq -s 'add // []' "$rows_file")
+  rows=$(cmd_workflow_status_sort "$rows" "$verdicts")
+  all_rows="$rows"
+  shown_repos="$verdicts"
+  if $WORKFLOW_STATUS_FAILED; then
+    rows=$(printf '%s' "$rows" | jq -c 'map(select(.verdict == "red"))')
+    shown_repos=$(printf '%s' "$verdicts" | jq -c 'map(select(.verdict == "red"))')
+  fi
+
+  if [ "$WORKFLOW_STATUS_FORMAT" = "text" ]; then
+    local report
+    report=$(cmd_workflow_status_render_text "$shown_repos" "$rows" "$all_rows")
+    if [ -n "$WORKFLOW_STATUS_OUTPUT" ]; then
+      # Plain text in a file: strip the colour codes.
+      write_output "$WORKFLOW_STATUS_OUTPUT" "$(printf '%s\n' "$report" | sed $'s/\033\\[[0-9;]*m//g')"
+    else
+      printf '%s\n' "$report"
+    fi
+  elif [ "$(printf '%s' "$rows" | jq 'length')" -eq 0 ] && [ "$WORKFLOW_STATUS_FORMAT" != "json" ]; then
+    echo -e "${GREEN}No workflow runs to report.${NC}" >&2
+  else
+    write_output "$WORKFLOW_STATUS_OUTPUT" "$(render_rows "$WORKFLOW_STATUS_FORMAT" "$rows")"
+  fi
+
+  local scanned red pending green other noci summary
+  read -r scanned red pending green other noci < <(printf '%s' "$verdicts" | jq -r '
+    [length] + ([ "red", "pending", "green", "other", "no-ci" ] as $k
+                | [ $k[] as $v | [.[] | select(.verdict == $v)] | length ]) | @tsv')
+  summary="${BOLD}${scanned}${NC} repos scanned · ${RED}${red} red${NC} · ${YELLOW}${pending} pending${NC} · ${GREEN}${green} green${NC}"
+  [ "$other" -gt 0 ] && summary="${summary} · ${other} other"
+  summary="${summary} · ${noci} without CI"
+  {
+    echo ""
+    hr
+    echo -e "  ${summary}"
+  } >&2
+  print_skips
+
+  if $WORKFLOW_STATUS_EXIT_CODE && [ "$red" -gt 0 ]; then
+    exit 1
+  fi
+  return 0
 }
 
 # =============================================================================

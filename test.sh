@@ -1072,6 +1072,95 @@ assert_exit_code "status rejects a bad --format" 1 $rc
 STATUS_FORMAT="text"
 
 echo ""
+
+# ── 19. workflow-status: classifier, latest-run rows, parser ────────────────
+echo -e "${BOLD}19. workflow-status classifier and latest-run rows${NC}"
+
+ws() { cmd_workflow_status_classify "$1" "$2"; }
+assert_eq "ws: failure is red" "red" "$(ws completed failure)"
+assert_eq "ws: timed_out is red" "red" "$(ws completed timed_out)"
+assert_eq "ws: startup_failure is red" "red" "$(ws completed startup_failure)"
+assert_eq "ws: success is green" "green" "$(ws completed success)"
+for s in queued in_progress waiting requested pending; do
+  assert_eq "ws: status ${s} is pending" "pending" "$(ws "$s" "")"
+done
+for c in cancelled skipped neutral action_required stale; do
+  assert_eq "ws: ${c} is other" "other" "$(ws completed "$c")"
+done
+assert_eq "ws: no status, no conclusion is other" "other" "$(ws "" "")"
+
+rv() { cmd_workflow_status_repo_verdict "$(printf '%s\n' "$@" | jq -R '{verdict: .}' | jq -sc '.')"; }
+assert_eq "ws repo: any red wins" "red" "$(rv green pending red other)"
+assert_eq "ws repo: pending beats green" "pending" "$(rv green pending other)"
+assert_eq "ws repo: green beats other" "green" "$(rv other green)"
+assert_eq "ws repo: only other" "other" "$(rv other other)"
+assert_eq "ws repo: no rows is no-ci" "no-ci" "$(cmd_workflow_status_repo_verdict '[]')"
+
+assert_eq "ws age: minutes" "5m ago" "$(cmd_workflow_status_age 300)"
+assert_eq "ws age: hours" "3h ago" "$(cmd_workflow_status_age 10800)"
+assert_eq "ws age: days" "2d ago" "$(cmd_workflow_status_age 172800)"
+assert_eq "ws age: clock skew never goes negative" "0m ago" "$(cmd_workflow_status_age -30)"
+
+# Workflow 1 (CI): an older red and a newer green run on main, plus a red run
+# on a feature branch. Workflow 2 (Lint): one red run on main. Workflow 3 is
+# disabled. Run 99 comes from a fork whose branch is also called main.
+own='{"full_name":"acme/app"}'
+runs=$(jq -nc --argjson own "$own" '{total_count: 6, workflow_runs: [
+  {id: 10, workflow_id: 1, name: "CI",   head_branch: "main",    event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-01T00:00:00Z", html_url: "u10", head_repository: $own},
+  {id: 11, workflow_id: 1, name: "CI",   head_branch: "main",    event: "push", status: "completed", conclusion: "success", created_at: "2026-01-02T00:00:00Z", html_url: "u11", head_repository: $own},
+  {id: 12, workflow_id: 1, name: "CI",   head_branch: "feature", event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-03T00:00:00Z", html_url: "u12", head_repository: $own},
+  {id: 20, workflow_id: 2, name: "Lint", head_branch: "main",    event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-01T00:00:00Z", html_url: "u20", head_repository: $own},
+  {id: 30, workflow_id: 3, name: "Old",  head_branch: "main",    event: "push", status: "completed", conclusion: "failure", created_at: "2026-01-04T00:00:00Z", html_url: "u30", head_repository: $own},
+  {id: 99, workflow_id: 1, name: "CI",   head_branch: "main",    event: "pull_request", status: "completed", conclusion: "failure", created_at: "2026-01-05T00:00:00Z", html_url: "u99", head_repository: {full_name: "evil/app"}}
+]}')
+main_runs=$(printf '%s' "$runs" | jq -c '.workflow_runs |= map(select(.head_branch == "main"))')
+
+rows=$(cmd_workflow_status_rows acme/app default "$main_runs" '[1,2]')
+assert_eq "ws rows: one row per workflow on the default branch" "2" "$(printf '%s' "$rows" | jq 'length')"
+assert_eq "ws rows: newest own run wins (fork run ignored)" "u11 u20" "$(printf '%s' "$rows" | jq -r 'map(.url) | join(" ")')"
+assert_eq "ws rows: verdicts" "green red" "$(printf '%s' "$rows" | jq -r 'map(.verdict) | join(" ")')"
+assert_eq "ws rows: key order for render_rows" "repo,workflow,branch,event,status,conclusion,verdict,created_at,url" \
+  "$(printf '%s' "$rows" | jq -r '.[0] | keys_unsorted | join(",")')"
+assert_eq "ws rows: disabled workflow dropped" "0" \
+  "$(cmd_workflow_status_rows acme/app default "$main_runs" '[1,2]' | jq '[.[] | select(.workflow == "Old")] | length')"
+assert_eq "ws rows: repo name compared case-insensitively" "2" \
+  "$(cmd_workflow_status_rows Acme/App default "$main_runs" '[1,2]' | jq 'length')"
+assert_eq "ws rows: workflow name from the workflow list wins" "Dependabot Updates" \
+  "$(cmd_workflow_status_rows acme/app default "$main_runs" '[{"id":2,"name":"Dependabot Updates"}]' | jq -r '.[0].workflow')"
+assert_eq "ws rows: a bare runs array is accepted" "2" \
+  "$(cmd_workflow_status_rows acme/app default "$(printf '%s' "$main_runs" | jq -c '.workflow_runs')" '[1,2]' | jq 'length')"
+assert_eq "ws rows: a lone fork run yields nothing" "0" \
+  "$(cmd_workflow_status_rows acme/app default "$(printf '%s' "$runs" | jq -c '.workflow_runs |= map(select(.id == 99))')" '[1]' | jq 'length')"
+
+rows=$(cmd_workflow_status_rows acme/app all "$runs" '[1,2]')
+assert_eq "ws rows --all-branches: keyed by workflow and branch" "CI/feature/red CI/main/green Lint/main/red" \
+  "$(printf '%s' "$rows" | jq -r 'map("\(.workflow)/\(.branch)/\(.verdict)") | join(" ")')"
+
+assert_eq "ws missing: active workflows without an own run" "4 5" \
+  "$(cmd_workflow_status_missing acme/app "$main_runs" '[1,2,4,5]' | paste -sd' ' -)"
+assert_eq "ws missing: a fork run does not count as seen" "1" \
+  "$(cmd_workflow_status_missing acme/app "$(printf '%s' "$runs" | jq -c '.workflow_runs |= map(select(.id == 99))')" '[{"id":1,"name":"CI"}]')"
+
+verdicts='[{"repo":"b/green","verdict":"green"},{"repo":"a/red","verdict":"red"}]'
+sorted=$(cmd_workflow_status_sort '[{"repo":"b/green","verdict":"green","workflow":"x","branch":"main"},
+  {"repo":"a/red","verdict":"green","workflow":"a","branch":"main"},
+  {"repo":"a/red","verdict":"red","workflow":"z","branch":"main"}]' "$verdicts")
+assert_eq "ws sort: red repos first, red rows first" "a/red:z a/red:a b/green:x" \
+  "$(printf '%s' "$sorted" | jq -r 'map("\(.repo):\(.workflow)") | join(" ")')"
+
+cmd_workflow_status_parse_args --org acme --all-branches --include-forks --failed --format json --exit-code --limit 5
+assert_eq "ws parse: flags land in globals" "acme true true true json true 5" \
+  "${WORKFLOW_STATUS_TARGET} ${WORKFLOW_STATUS_ALL_BRANCHES} ${WORKFLOW_STATUS_INCLUDE_FORKS} ${WORKFLOW_STATUS_FAILED} ${WORKFLOW_STATUS_FORMAT} ${WORKFLOW_STATUS_EXIT_CODE} ${WORKFLOW_STATUS_LIMIT}"
+WORKFLOW_STATUS_FORMAT="text" WORKFLOW_STATUS_LIMIT=1000
+for bad in "--format xml" "--limit abc" "--limit 0" "--repo nope" "--bogus"; do
+  # shellcheck disable=SC2086
+  (cmd_workflow_status_parse_args $bad) &>/dev/null && rc=0 || rc=1
+  assert_exit_code "ws parse rejects ${bad}" 1 $rc
+done
+WORKFLOW_STATUS_TARGET="" WORKFLOW_STATUS_ALL_BRANCHES=false WORKFLOW_STATUS_INCLUDE_FORKS=false
+WORKFLOW_STATUS_FAILED=false WORKFLOW_STATUS_EXIT_CODE=false
+
+echo ""
 # ── 10. Script syntax check ─────────────────────────────────────────────────
 echo -e "${BOLD}10. Script integrity${NC}"
 

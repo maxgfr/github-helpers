@@ -308,6 +308,15 @@ jobs:
             fi
           done
 
+      - name: Test workflow-status rejects invalid arguments
+        run: |
+          for args in "--format xml" "--limit abc" "--limit 0" "--repo nope"; do
+            # shellcheck disable=SC2086
+            if ./script.sh workflow-status $args 2>/dev/null; then
+              echo "workflow-status $args should have failed" && exit 1
+            fi
+          done
+
       - name: Test cleanup-branches rejects invalid arguments
         run: |
           for args in "--stale-days abc" "--from /nonexistent" "--repo nope"; do

@@ -59,7 +59,7 @@ forks can I delete?"*, *"what is waiting on me on GitHub?"*.
 | [`invite-cleanup`](#invite-cleanup--pending-repository-and-org-invitations) | List, accept or decline pending invitations |
 | [`repo-audit`](#repo-audit--scan-repos-for-common-issues) | Check for missing LICENSE, README, etc. |
 | [`stats`](#stats--github-profile-stats) | Dashboard: repos, stars, languages |
-| [`workflow-status`](#workflow-status--ci-workflow-overview) | Latest CI status across repos |
+| [`workflow-status`](#workflow-status--red-ci-across-your-repos) | Red CI across your repos (latest run per workflow) |
 | [`secret-audit`](#secret-audit--list-secrets-and-env-vars) | List Actions secrets & variables |
 | [`license-check`](#license-check--check-and-add-license-files) | Check/add LICENSE files |
 | [`vulnerability-check`](#vulnerability-check--audit-dependabot-alerts) | Audit Dependabot vulnerability alerts |
@@ -528,21 +528,35 @@ github-helpers stats
 github-helpers stats --org my-company
 ```
 
-#### `workflow-status` — CI workflow overview
+#### `workflow-status` — Red CI across your repos
 
-See the latest CI run status for all your repos at a glance.
+Alias: `ci`. Scans every non-archived source repo you own and reports which ones have red CI. By default it looks at the latest run of each active workflow on the repo's **default branch**; `--all-branches` shows the latest run of each workflow on every branch instead. Red repos come first, each with its failing workflows and a link to the run.
 
 ```bash
-github-helpers workflow-status
+github-helpers ci
 github-helpers workflow-status --org my-company --failed
-github-helpers workflow-status --limit 50
+github-helpers ci --all-branches -v
+github-helpers ci --repo maxgfr/github-helpers --all-branches
+github-helpers ci --failed --format json | jq -r '.[] | "\(.repo)  \(.workflow)  \(.url)"'
+github-helpers ci --exit-code >/dev/null 2>&1 || echo "some CI is red"   # cron / CI gate
 ```
+
+A run is **red** on `failure`, `timed_out` or `startup_failure`, **green** on `success`, **pending** while queued or in progress, and **other** when cancelled, skipped, neutral or stale. A repo takes its worst verdict (red, then pending, green, other); a repo with no active workflow, or none that ever ran on the branch, is **no-ci**. Disabled workflows are ignored, so an old failure of one never counts, and runs triggered from a fork (a fork PR whose branch is also `main`) are ignored too.
 
 | Flag | Description |
 |---|---|
 | `--user NAME` / `--org NAME` | Target (default: authenticated user) |
-| `--limit N` | Max repos to scan (default: 30) |
-| `--failed` | Show only repos with failed workflows |
+| `--repo OWNER/REPO` | Single repo |
+| `--include-forks` | Include forks (excluded by default; archived repos always are) |
+| `--limit N` | Max repos to scan (default: 1000; warns when the cap is hit) |
+| `--all-branches` | Latest run per workflow and branch, from the 100 most recent runs of each repo |
+| `--failed` | Only red repos (text) or red runs (json/csv/md) |
+| `--format text\|json\|csv\|md` | Output format (default: text). Rows: repo, workflow, branch, event, status, conclusion, verdict, created_at, url |
+| `--output FILE` | Write the report to a file |
+| `--exit-code` | Exit 1 when at least one repo is red |
+| `-v`, `--verbose` | Also list green, pending and other workflows under each repo |
+
+Cost: about 2 core API requests per repo with CI (workflow list + runs), 1 per repo without; a repo with 100+ runs on its default branch costs 1 more per active workflow missing from the latest 100. Progress, the summary and skipped repos go to stderr, so `--format json | jq` stays clean.
 
 ---
 
