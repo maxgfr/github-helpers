@@ -541,7 +541,7 @@ github-helpers ci --failed --format json | jq -r '.[] | "\(.repo)  \(.workflow) 
 github-helpers ci --exit-code >/dev/null 2>&1 || echo "some CI is red"   # cron / CI gate
 ```
 
-A run is **red** on `failure`, `timed_out` or `startup_failure`, **green** on `success`, **pending** while queued or in progress, and **other** when cancelled, skipped, neutral or stale. A repo takes its worst verdict (red, then pending, green, other); a repo with no active workflow, or none that ever ran on the branch, is **no-ci**. Disabled workflows are ignored, so an old failure of one never counts, and runs triggered from a fork (a fork PR whose branch is also `main`) are ignored too.
+A run is **red** on `failure`, `timed_out` or `startup_failure`, **green** on `success`, **pending** while queued or in progress, and **other** when cancelled, skipped, neutral or stale. A repo takes its worst verdict (red, then pending, green, other); a repo with no active workflow, or none that ever ran on the branch, is **no-ci**. Disabled workflows are ignored, so an old failure of one never counts, and runs triggered from a fork (a fork PR whose branch is also `main`) are ignored too. GitHub-managed "dynamic" workflows (Dependabot Updates, CodeQL default setup, Pages builds) are not your CI and never show on the branch's commits, so they are ignored unless you pass `--include-dynamic`.
 
 | Flag | Description |
 |---|---|
@@ -550,6 +550,7 @@ A run is **red** on `failure`, `timed_out` or `startup_failure`, **green** on `s
 | `--include-forks` | Include forks (excluded by default; archived repos always are) |
 | `--limit N` | Max repos to scan (default: 1000; warns when the cap is hit) |
 | `--all-branches` | Latest run per workflow and branch, from the 100 most recent runs of each repo |
+| `--include-dynamic` | Also count GitHub-managed workflows (Dependabot Updates, CodeQL default setup, Pages builds) |
 | `--failed` | Only red repos (text) or red runs (json/csv/md) |
 | `--format text\|json\|csv\|md` | Output format (default: text). Rows: repo, workflow, branch, event, status, conclusion, verdict, created_at, url |
 | `--output FILE` | Write the report to a file |

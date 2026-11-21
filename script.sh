@@ -3131,6 +3131,7 @@ WORKFLOW_STATUS_FAILED=false
 WORKFLOW_STATUS_FORMAT="text"
 WORKFLOW_STATUS_OUTPUT=""
 WORKFLOW_STATUS_EXIT_CODE=false
+WORKFLOW_STATUS_INCLUDE_DYNAMIC=false
 
 # jq definitions shared by every filter below, so the classification lives in
 # exactly one place.
@@ -3185,6 +3186,8 @@ ${BOLD}SCOPE${NC} ${DIM}(default: your non-archived source repos)${NC}
   --limit N               Max repos to scan (default: ${WORKFLOW_STATUS_LIMIT})
   --all-branches          Latest run per workflow AND branch, instead of the
                           default branch only
+  --include-dynamic       Also count GitHub-managed workflows (Dependabot
+                          Updates, CodeQL default setup, Pages builds...)
 
 ${BOLD}VERDICTS${NC} ${DIM}(per run; a repo takes its worst one, in this order)${NC}
   red                     failure, timed_out or startup_failure
@@ -3214,6 +3217,9 @@ ${BOLD}NOTE${NC}
   repo with 100+ runs on its default branch costs 1 more per active workflow
   missing from the latest 100, so the default-branch verdict stays exact.
   Disabled workflows are ignored, so an old failure of one never counts.
+  GitHub-managed "dynamic" workflows (Dependabot Updates, CodeQL default setup,
+  Pages builds) are ignored too: they are not your CI and never show on the
+  commits of the branch. Use --include-dynamic to count them.
   Runs triggered from forks (a fork PR whose branch is also "main") are ignored.
   --all-branches looks at the 100 most recent runs of each repo.
 EOF
@@ -3233,6 +3239,7 @@ cmd_workflow_status_parse_args() {
       --all-branches)  WORKFLOW_STATUS_ALL_BRANCHES=true; shift ;;
       --failed)        WORKFLOW_STATUS_FAILED=true; shift ;;
       --exit-code)     WORKFLOW_STATUS_EXIT_CODE=true; shift ;;
+      --include-dynamic) WORKFLOW_STATUS_INCLUDE_DYNAMIC=true; shift ;;
       -v|--verbose)    VERBOSE=true; shift ;;
       -h|--help)       cmd_workflow_status_usage ;;
       *) die "workflow-status: unknown option: $1" ;;
@@ -3297,6 +3304,15 @@ cmd_workflow_status_rows() {
     | sort_by(.workflow, .branch)'
 }
 
+# cmd_workflow_status_active <workflows-json> <include-dynamic:true|false>
+# -> [{id, name}] of the workflows to judge: active ones, minus GitHub-managed
+# "dynamic" workflows (path dynamic/...: Dependabot Updates, CodeQL default
+# setup, Pages builds) unless <include-dynamic> is true.
+cmd_workflow_status_active() {
+  printf '%s' "$1" | jq -c --argjson dyn "$2" '[.[] | select(.state == "active")
+    | select($dyn or ((.path // "") | startswith("dynamic/") | not)) | {id, name}]'
+}
+
 # cmd_workflow_status_missing <repo> <runs-json> <active-workflows-json> ->
 # ids, one per line: the active workflows that have no own run in <runs-json>.
 cmd_workflow_status_missing() {
@@ -3350,7 +3366,7 @@ cmd_workflow_status_scan_repo() {
     return 0
   fi
   workflows=$(gh_paginate "$nwo" "repos/${nwo}/actions/workflows?per_page=100" '.workflows[]' </dev/null) || return 0
-  active=$(printf '%s' "$workflows" | jq -c '[.[] | select(.state == "active") | {id, name}]')
+  active=$(cmd_workflow_status_active "$workflows" "$WORKFLOW_STATUS_INCLUDE_DYNAMIC")
   if [ "$active" = "[]" ]; then
     printf '%s\t%s\tno-ci\n' "$nwo" "$def" >> "$verdicts_out"
     return 0

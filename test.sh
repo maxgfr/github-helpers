@@ -1141,6 +1141,14 @@ assert_eq "ws missing: active workflows without an own run" "4 5" \
 assert_eq "ws missing: a fork run does not count as seen" "1" \
   "$(cmd_workflow_status_missing acme/app "$(printf '%s' "$runs" | jq -c '.workflow_runs |= map(select(.id == 99))')" '[{"id":1,"name":"CI"}]')"
 
+wfs='[{"id":1,"name":"CI","path":".github/workflows/ci.yml","state":"active"},
+  {"id":2,"name":"Old","path":".github/workflows/old.yml","state":"disabled_manually"},
+  {"id":3,"name":"Dependabot Updates","path":"dynamic/dependabot/dependabot-updates","state":"active"}]'
+assert_eq "ws active: dynamic and disabled workflows dropped by default" "1" \
+  "$(cmd_workflow_status_active "$wfs" false | jq -r 'map(.id) | join(" ")')"
+assert_eq "ws active: --include-dynamic keeps dynamic workflows" "1 3" \
+  "$(cmd_workflow_status_active "$wfs" true | jq -r 'map(.id) | join(" ")')"
+
 verdicts='[{"repo":"b/green","verdict":"green"},{"repo":"a/red","verdict":"red"}]'
 sorted=$(cmd_workflow_status_sort '[{"repo":"b/green","verdict":"green","workflow":"x","branch":"main"},
   {"repo":"a/red","verdict":"green","workflow":"a","branch":"main"},
@@ -1148,9 +1156,9 @@ sorted=$(cmd_workflow_status_sort '[{"repo":"b/green","verdict":"green","workflo
 assert_eq "ws sort: red repos first, red rows first" "a/red:z a/red:a b/green:x" \
   "$(printf '%s' "$sorted" | jq -r 'map("\(.repo):\(.workflow)") | join(" ")')"
 
-cmd_workflow_status_parse_args --org acme --all-branches --include-forks --failed --format json --exit-code --limit 5
-assert_eq "ws parse: flags land in globals" "acme true true true json true 5" \
-  "${WORKFLOW_STATUS_TARGET} ${WORKFLOW_STATUS_ALL_BRANCHES} ${WORKFLOW_STATUS_INCLUDE_FORKS} ${WORKFLOW_STATUS_FAILED} ${WORKFLOW_STATUS_FORMAT} ${WORKFLOW_STATUS_EXIT_CODE} ${WORKFLOW_STATUS_LIMIT}"
+cmd_workflow_status_parse_args --org acme --all-branches --include-forks --failed --format json --exit-code --limit 5 --include-dynamic
+assert_eq "ws parse: flags land in globals" "acme true true true json true 5 true" \
+  "${WORKFLOW_STATUS_TARGET} ${WORKFLOW_STATUS_ALL_BRANCHES} ${WORKFLOW_STATUS_INCLUDE_FORKS} ${WORKFLOW_STATUS_FAILED} ${WORKFLOW_STATUS_FORMAT} ${WORKFLOW_STATUS_EXIT_CODE} ${WORKFLOW_STATUS_LIMIT} ${WORKFLOW_STATUS_INCLUDE_DYNAMIC}"
 WORKFLOW_STATUS_FORMAT="text" WORKFLOW_STATUS_LIMIT=1000
 for bad in "--format xml" "--limit abc" "--limit 0" "--repo nope" "--bogus"; do
   # shellcheck disable=SC2086
@@ -1158,7 +1166,7 @@ for bad in "--format xml" "--limit abc" "--limit 0" "--repo nope" "--bogus"; do
   assert_exit_code "ws parse rejects ${bad}" 1 $rc
 done
 WORKFLOW_STATUS_TARGET="" WORKFLOW_STATUS_ALL_BRANCHES=false WORKFLOW_STATUS_INCLUDE_FORKS=false
-WORKFLOW_STATUS_FAILED=false WORKFLOW_STATUS_EXIT_CODE=false
+WORKFLOW_STATUS_FAILED=false WORKFLOW_STATUS_EXIT_CODE=false WORKFLOW_STATUS_INCLUDE_DYNAMIC=false
 
 echo ""
 # ── 10. Script syntax check ─────────────────────────────────────────────────
